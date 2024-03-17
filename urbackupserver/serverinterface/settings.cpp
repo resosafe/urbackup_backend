@@ -126,7 +126,7 @@ JSON::Array getAlertScripts(IDatabase* db)
 
 JSON::Value addNextArchival(IDatabase* db, int clientid, IQuery* get_next, const JSON::Value& archive_val)
 {
-	if (archive_val.getType() != JSON::Value_type::str_type)
+	if (archive_val.getType() != JSON::str_type)
 		return archive_val;
 
 	std::string archive_str = archive_val.getString();

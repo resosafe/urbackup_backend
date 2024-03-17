@@ -2226,9 +2226,9 @@ std::string fixArchiveMigration(IDatabase* db, const std::string& archive_str)
 		{
 			std::string idx = getafter("backup_types_", it->first);
 
-			auto it_for = archive_settings.find("for_" + idx);
-			auto it_for_unit = archive_settings.find("for_unit_" + idx);
-			auto it_uuid = archive_settings.find("uuid_" + idx);
+			str_map::iterator it_for = archive_settings.find("for_" + idx);
+			str_map::iterator it_for_unit = archive_settings.find("for_unit_" + idx);
+			str_map::iterator it_uuid = archive_settings.find("uuid_" + idx);
 			if (it_uuid != archive_settings.end() &&
 				it_for != archive_settings.end() &&
 				it_for_unit != archive_settings.end() &&

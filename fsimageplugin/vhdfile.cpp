@@ -1179,12 +1179,13 @@ uint64 VHDFile::getRealSize(void)
 
 uint64 VHDFile::usedSize(void)
 {
-	uint64 offset_backup=curr_offset;
+	const uint64 offset_backup=curr_offset;
 
 	uint64 used_size=0;
 
 	for(uint64 i=0;i<dstsize;i+=blocksize)
 	{
+		curr_offset = i;
 		if(has_sector())
 		{
 			used_size+=blocksize;

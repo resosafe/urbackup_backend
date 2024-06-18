@@ -501,7 +501,7 @@ bool LMDBFileIndex::create_env()
 		}
 
 		{
-			std::auto_ptr<IFile> lmdb_f(Server->openFile("urbackup/fileindex/backup_server_files_index.lmdb", MODE_READ));
+			std::unique_ptr<IFile> lmdb_f(Server->openFile("urbackup/fileindex/backup_server_files_index.lmdb", MODE_READ));
 			if(lmdb_f.get()!=NULL)
 			{
 				while(lmdb_f->Size()>static_cast<_i64>(map_size))
@@ -529,7 +529,7 @@ bool LMDBFileIndex::create_env()
 
 		os_create_dir("urbackup/fileindex");
 
-		unsigned int flags = MDB_NOSUBDIR|MDB_NOMETASYNC;
+		unsigned int flags = MDB_NOSUBDIR;
 		if(no_sync)
 		{
 			flags|=MDB_NOSYNC;
@@ -543,7 +543,7 @@ bool LMDBFileIndex::create_env()
 		}
 
 		MDB_txn* l_txn;
-		rc = mdb_txn_begin(env, NULL, flags, &l_txn);
+		rc = mdb_txn_begin(env, NULL, 0, &l_txn);
 
 		if (rc)
 		{

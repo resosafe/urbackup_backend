@@ -54,6 +54,7 @@ extern IServer* Server;
 #include "../cryptoplugin/ICryptoFactory.h"
 #include "../urlplugin/IUrlFactory.h"
 #include "../luaplugin/ILuaInterpreter.h"
+#include "../clouddrive/IClouddriveFactory.h"
 
 #include "database.h"
 #include "actions.h"
@@ -86,6 +87,7 @@ SStartupStatus startup_status;
 #include "DataplanDb.h"
 #include "Alerts.h"
 #include "Mailer.h"
+#include "../urbackupcommon/settingslist.h"
 
 #include <stdlib.h>
 #include "../Interface/DatabaseCursor.h"
@@ -98,6 +100,7 @@ SStartupStatus startup_status;
 #include "FileMetadataDownloadThread.h"
 #include "../urbackupcommon/chunk_hasher.h"
 #include "LogReport.h"
+#include "WebSocketConnector.h"
 
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include "../common/miniz.h"
@@ -124,6 +127,7 @@ namespace
 IPipe *server_exit_pipe=NULL;
 IFSImageFactory *image_fak;
 ICryptoFactory *crypto_fak;
+IClouddriveFactory* clouddrive_fak;
 IUrlFactory *url_fak=NULL;
 IFileServ* fileserv=NULL;
 ILuaInterpreter* lua_interpreter = NULL;
@@ -151,6 +155,7 @@ bool verify_hashes(std::string arg);
 void updateRights(int t_userid, std::string s_rights, IDatabase *db);
 int md5sum_check();
 int blockalign();
+void init_server_pubkey();
 
 std::string lang="en";
 std::string time_format_str="%Y-%m-%d %H:%M";
@@ -381,6 +386,8 @@ void detach_other_dbs(IDatabase* db)
 	db->Write("DETACH DATABASE links_db");
 }
 
+#include "../urbackupcommon/WebSocketPipe.h"
+
 DLLEXPORT void LoadActions(IServer* pServer)
 {
 	Server=pServer;
@@ -400,7 +407,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		Server->Log("Amatch test failed! Stopping.", LL_ERROR);
 		return;
 	}*/
-	
+
 	std::string rmtest=Server->getServerParameter("rmtest");
 	if(!rmtest.empty())
 	{
@@ -507,7 +514,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		}
 		else if (app == "hash")
 		{
-			std::auto_ptr<IFsFile> f(Server->openFile(Server->getServerParameter("hash_file"), MODE_READ_SEQUENTIAL));
+			std::unique_ptr<IFsFile> f(Server->openFile(Server->getServerParameter("hash_file"), MODE_READ_SEQUENTIAL));
 			if (f.get() != NULL)
 			{
 				std::string h = BackupServerPrepareHash::calc_hash(f.get(), Server->getServerParameter("hash_method"));
@@ -547,6 +554,15 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		if( crypto_fak==NULL )
 		{
 			Server->Log("Error loading Cryptoplugin. Internet service will not work.", LL_ERROR);
+		}
+	}
+
+	{
+		str_map params;
+		clouddrive_fak = reinterpret_cast<IClouddriveFactory*>(Server->getPlugin(Server->getThreadID(), Server->StartPlugin("clouddriveplugin", params)));
+		if (clouddrive_fak == nullptr)
+		{
+			Server->Log("Error loading clouddriveplugin", LL_ERROR);
 		}
 	}
 
@@ -602,6 +618,8 @@ DLLEXPORT void LoadActions(IServer* pServer)
 		server_token=token;
 	}
 
+	init_server_pubkey();
+
 	Server->deleteFile("urbackup/shutdown_now");
 
 
@@ -649,6 +667,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 	ClientMain::init_mutex();
 	DataplanDb::init();
 	init_log_report();
+	ServerChannelThread::init_mutex();
 
 	open_settings_database();
 	
@@ -819,6 +838,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 	ADD_ACTION(restore_prepare_wait);
 	ADD_ACTION(scripts);
 	ADD_ACTION(status_check);
+	ADD_ACTION(restore_image);
 
 	if(Server->getServerParameter("allow_shutdown")=="true")
 	{
@@ -856,19 +876,43 @@ DLLEXPORT void LoadActions(IServer* pServer)
 
 	{
 		ServerSettings settings(Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER));
-		if(settings.getSettings()->internet_mode_enabled)
+		if(Server->getServerParameter("internet_mode_disabled")!="1")
 		{
 			std::string tmp=Server->getServerParameter("internet_port", "");
 			unsigned int port;
 			if(!tmp.empty())
 			{
-				port=atoi(tmp.c_str());
+				port = atoi(tmp.c_str());
 			}
 			else
 			{
-				port=settings.getSettings()->internet_server_port;
+				port = 55415;
 			}
-			Server->StartCustomStreamService(new InternetService(backup_server), "InternetService", port);
+
+			std::unique_ptr<ISettingsReader> settings_db(Server->createDBSettingsReader(db, "settings_db.settings",
+				"SELECT value FROM settings_db.settings WHERE key=? AND clientid=0"));
+
+			std::string port_str = settings_db->getValue("internet_server_bind_port", std::string());
+			if (!port_str.empty())
+			{
+				port = watoi(port_str);
+			}
+
+			IServer::BindTarget internet_bind_target = IServer::BindTarget_All;
+
+			if (Server->getServerParameter("internet_localhost_only") == "1")
+			{
+				internet_bind_target = IServer::BindTarget_Localhost;
+			}
+
+			InternetService* internet_service = new InternetService(backup_server);
+			Server->StartCustomStreamService(internet_service, "InternetService", port, internet_bind_target);
+
+			if (Server->getServerParameter("internet_disable_websocket") != "1")
+			{
+				Server->addWebSocket(new WebSocketConnector(internet_service, "socket"));
+				Server->addWebSocket(new WebSocketConnector(internet_service, ""));
+			}
 		}
 	}
 
@@ -1464,7 +1508,7 @@ bool upgrade35_36()
 {
 	IDatabase *db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
 
-	std::auto_ptr<IFile> db_file(Server->openFile("urbackup/backup_server.db", MODE_READ));
+	std::unique_ptr<IFile> db_file(Server->openFile("urbackup/backup_server.db", MODE_READ));
 
 	if(db_file.get() && Server->getServerParameter("override_freespace_check")==std::string())
 	{
@@ -2080,6 +2124,261 @@ bool upgrade58_59()
 	return b;
 }
 
+bool upgrade59_60()
+{
+	IDatabase *db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+
+	bool b = true;
+
+	b &= db->Write("ALTER TABLE settings_db.settings ADD value_client TEXT");
+	b &= db->Write("ALTER TABLE settings_db.settings ADD use INTEGER");
+	b &= db->Write("UPDATE settings_db.settings SET use="+convert(c_use_value));
+
+	IQuery* q_get = db->Prepare("SELECT value FROM settings_db.settings WHERE clientid=? AND key=?");
+	IQuery* q_update_use = db->Prepare("UPDATE settings_db.settings SET use=? WHERE clientid=?");
+	IQuery* q_update_use_key = db->Prepare("UPDATE settings_db.settings SET use=? WHERE clientid=? AND key=?");
+
+	db_results res_clients = db->Read("SELECT id FROM clients");
+	for (size_t i = 0; i < res_clients.size(); ++i)
+	{
+		int clientid = watoi(res_clients[i]["id"]);
+		
+		q_get->Bind(clientid);
+		q_get->Bind("overwrite");
+		db_results res = q_get->Read();
+		q_get->Reset();
+		if (res.empty() || res[0]["value"] != "true")
+		{
+			q_update_use->Bind(c_use_group);
+			q_update_use->Bind(clientid);
+			q_update_use->Write();
+			q_update_use->Reset();
+		}
+
+		q_get->Bind(clientid);
+		q_get->Bind("client_set_settings");
+		res = q_get->Read();
+		q_get->Reset();
+		if (!res.empty() && res[0]["value"] == "true")
+		{
+			std::vector<std::string> settings = getClientConfigurableSettingsList();
+			for (size_t j = 0; j < settings.size(); ++j)
+			{
+				q_update_use_key->Bind(c_use_value_client);
+				q_update_use_key->Bind(clientid);
+				q_update_use_key->Bind(settings[j]);
+				q_update_use_key->Write();
+				q_update_use_key->Reset();
+			}
+		}
+	}
+
+	IQuery* q_update_use_key_only = db->Prepare("UPDATE settings_db.settings SET use=? WHERE key=?");
+	std::vector<std::string> settings = getLocalizedSettingsList();
+	for (size_t i = 0; i < settings.size(); ++i)
+	{
+		q_update_use_key_only->Bind(c_use_value);
+		q_update_use_key_only->Bind(settings[i]);
+	}
+
+	return b;
+}
+
+std::string archiveSettingsParamStr(IDatabase* db, int clientid, std::string prefix)
+{
+	db_results res = db->Read("SELECT id, interval, interval_unit, length, length_unit, backup_types, clientid, archive_window, letters FROM settings_db.automatic_archival WHERE clientid=" + convert(clientid));
+
+	IQuery* q_set_uuid = db->Prepare("UPDATE settings_db.automatic_archival SET uuid=? WHERE id=?");
+
+	std::string ret;
+	for (size_t i = 0; i < res.size(); ++i)
+	{
+		std::string uuid;
+		uuid.resize(16);
+		Server->secureRandomFill(&uuid[0], uuid.size());
+
+		std::string idx = "_" + prefix + convert(i);
+		if (!ret.empty()) ret += "&";
+		ret += "every"+ idx +"=" + res[i]["interval"];
+		ret += "&every_unit" + idx + "=" + res[i]["interval_unit"];
+		ret += "&for" + idx + "=" + res[i]["interval_unit"];
+		ret += "&for_unit" + idx + "=" + res[i]["interval_unit"];
+		ret += "&backup_types" + idx + "=" + ServerAutomaticArchive::getBackupType(watoi(res[i]["backup_types"]));
+		ret += "&archive_window" + idx + "=" + res[i]["archive_window"];
+		ret += "&letters" + idx + "=" + res[i]["letters"];
+		ret += "&uuid"+idx+"=" + bytesToHex(uuid);
+
+		q_set_uuid->Bind(uuid);
+		q_set_uuid->Bind(res[i]["id"]);
+		q_set_uuid->Write();
+		q_set_uuid->Reset();
+	}
+
+	return ret;
+}
+
+bool upgrade60_61()
+{
+	IDatabase *db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+
+	if (!db->Write("ALTER TABLE settings_db.automatic_archival ADD uuid BLOB"))
+	{
+		return false;
+	}
+
+	bool b = true;
+	IQuery* q_insert_setting = db->Prepare("INSERT INTO settings_db.settings (key, value, clientid, use) VALUES (?, ?, ?, ?)");
+
+	db_results res_groups = db->Read("SELECT id FROM settings_db.si_client_groups");
+	db_single_result res_global;
+	res_global["id"] = "0";
+	res_groups.push_back(res_global);
+
+	for (size_t i = 0; i < res_groups.size(); ++i)
+	{
+		int group_id = watoi(res_groups[i]["id"]);
+
+		q_insert_setting->Bind("archive");
+		q_insert_setting->Bind(archiveSettingsParamStr(db, group_id*-1, group_id==0 ? "d" : "g"));
+		q_insert_setting->Bind(group_id*-1);
+		q_insert_setting->Bind(c_use_value);
+		b &= q_insert_setting->Write();
+		q_insert_setting->Reset();
+	}
+
+	IQuery* q_get = db->Prepare("SELECT value FROM settings_db.settings WHERE clientid=? AND key=?");
+	db_results res_clients = db->Read("SELECT id FROM clients");
+	for (size_t i = 0; i < res_clients.size(); ++i)
+	{
+		int clientid = watoi(res_clients[i]["id"]);
+		int r_clientid = clientid;
+		int group_id = 0;
+		q_get->Bind(clientid);
+		q_get->Bind("group_id");
+		db_results res = q_get->Read();
+		q_get->Reset();
+		if (!res.empty())
+		{
+			group_id = watoi(res[0]["value"])*-1;
+		}
+
+		q_get->Bind(clientid);
+		q_get->Bind("overwrite");
+		res = q_get->Read();
+		q_get->Reset();
+		if (res.empty() || res[0]["value"] != "true")
+			r_clientid = group_id;
+
+		q_get->Bind(clientid);
+		q_get->Bind("overwrite_archive_settings");
+		res = q_get->Read();
+		q_get->Reset();
+		if (res.empty() || res[0]["value"] != "true")
+			r_clientid = group_id;
+
+		std::string archive_params;
+		int archive_use = c_use_value;
+		if ( r_clientid <= 0 )
+		{
+			archive_use = c_use_group;
+		}
+		else
+		{
+			archive_params = archiveSettingsParamStr(db, clientid, "c");
+		}
+
+		q_insert_setting->Bind("archive");
+		q_insert_setting->Bind(archive_params);
+		q_insert_setting->Bind(clientid);
+		q_insert_setting->Bind(archive_use);
+		b &= q_insert_setting->Write();
+		q_insert_setting->Reset();
+
+		q_insert_setting->Bind("archive_update");
+		q_insert_setting->Bind("1");
+		q_insert_setting->Bind(clientid);
+		q_insert_setting->Bind(0);
+		b &= q_insert_setting->Write();
+		q_insert_setting->Reset();
+	}
+
+	return b;
+}
+
+bool upgrade61_62()
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+	bool b= db->Write("ALTER TABLE clients ADD capa INTEGER DEFAULT 0");
+	b &= db->Write("UPDATE clients SET capa=0 WHERE capa IS NULL");
+	return b;
+}
+
+bool upgrade62_63()
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+	bool b = db->Write("ALTER TABLE clients ADD with_hashes INTEGER DEFAULT 0");
+	b &= db->Write("UPDATE clients SET with_hashes=0 WHERE with_hashes IS NULL");
+	return b;
+}
+
+bool upgrade63_64()
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+	bool b = db->Write("ALTER TABLE settings_db.settings ADD use_last_modified INTEGER");
+	b &= db->Write("UPDATE settings_db.settings SET use_last_modified=" + convert(Server->getTimeSeconds()));
+	b &= db->Write("UPDATE settings_db.settings SET value_client=value");
+	return b;
+}
+
+bool upgrade64_65()
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+
+	db_results res_port = db->Read("SELECT value FROM settings_db.settings WHERE key='internet_server_port' AND clientid=0");
+
+	bool b = true;
+	if (!res_port.empty()
+		&& res_port[0]["value"] != "55415")
+	{
+		b &= db->Write(std::string("INSERT INTO settings_db.settings (key, value, clientid) VALUES ('internet_server_bind_port', '")+convert(watoi(res_port[0]["value"]))+"', 0)");
+	}
+	
+	return b;
+}
+
+bool upgrade65_66()
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+
+	bool b = true;
+	b &= db->Write("ALTER TABLE backups ADD incremental_ref INTEGER");
+	b &= db->Write("ALTER TABLE backups ADD deletion_protected INTEGER");
+	b &= db->Write("ALTER TABLE backups ADD delete_client_pending INTEGER");
+	b &= db->Write("UPDATE backups SET incremental_ref=0");
+	b &= db->Write("UPDATE backups SET deletion_protected=0");
+	b &= db->Write("UPDATE backups SET delete_client_pending=0");
+	b &= db->Write("ALTER TABLE clients ADD perm_uid BLOB");
+
+	db_results res_clients = db->Read("SELECT id FROM clients");
+
+	IQuery* q_update = db->Prepare("UPDATE clients SET perm_uid=? WHERE id=?");
+	if (q_update == nullptr)
+		return false;
+
+	for (db_single_result res : res_clients)
+	{
+		std::vector<char> uid(16);
+		Server->secureRandomFill(uid.data(), uid.size());
+
+		q_update->Bind(uid.data(), uid.size());
+		q_update->Bind(res["id"]);
+		b &= q_update->Write();
+		q_update->Reset();
+	}
+
+	return b;	
+}
+
 void upgrade(void)
 {
 	Server->destroyAllDatabases();
@@ -2101,7 +2400,7 @@ void upgrade(void)
 	
 	int ver=watoi(res_v[0]["tvalue"]);
 	int old_v;
-	int max_v=59;
+	int max_v=66;
 	{
 		IScopedLock lock(startup_status.mutex);
 		startup_status.target_db_version=max_v;
@@ -2125,8 +2424,15 @@ void upgrade(void)
 		&& ver>15)
 	{
 		cache_res=db->Read("PRAGMA cache_size");
-		ServerSettings server_settings(db);
-		db->Write("PRAGMA cache_size = -"+convert(server_settings.getSettings()->update_stats_cachesize));
+		ServerBackupDao backup_dao(db);
+		size_t update_stats_cachesize = 200 * 1024;
+		ServerBackupDao::CondString setting = backup_dao.getClientSetting("update_stats_cachesize", 0);
+		if (setting.exists
+			&& !setting.value.empty())
+		{
+			update_stats_cachesize = watoi64(setting.value);
+		}
+		db->Write("PRAGMA cache_size = -"+convert(update_stats_cachesize));
 	}
 	
 	IQuery *q_update=db->Prepare("UPDATE misc SET tvalue=? WHERE tkey='db_version'");
@@ -2446,6 +2752,55 @@ void upgrade(void)
 				break;
 			case 58:
 				if (!upgrade58_59())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 59:
+				if (!upgrade59_60())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 60:
+				if (!upgrade60_61())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 61:
+				if (!upgrade61_62())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 62:
+				if (!upgrade62_63())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 63:
+				if (!upgrade63_64())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 64:
+				if (!upgrade64_65())
+				{
+					has_error = true;
+				}
+				++ver;
+				break;
+			case 65:
+				if (!upgrade65_66())
 				{
 					has_error = true;
 				}

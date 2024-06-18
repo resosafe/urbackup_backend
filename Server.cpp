@@ -35,6 +35,7 @@
 #include "Interface/PluginMgr.h"
 #include "Interface/Thread.h"
 #include "Interface/DatabaseFactory.h"
+#include "Interface/WebSocket.h"
 
 #include "Server.h"
 #include "Template.h"
@@ -48,6 +49,7 @@
 #include "StreamPipe.h"
 #include "ThreadPool.h"
 #include "file.h"
+#include "file_memory.h"
 #include "utf8/utf8.h"
 #include "MemoryPipe.h"
 #include "MemorySettingsReader.h"
@@ -92,6 +94,16 @@
 #ifdef __MACH__
 #include <mach/clock.h>
 #include <mach/mach.h>
+#endif
+
+#ifdef HAVE_SYS_RANDOM_H
+#if defined(__FreeBSD__)
+extern "C" {
+#include <sys/random.h>
+}
+#else
+#include <sys/random.h>
+#endif //__FreeBSD__
 #endif
 
 
@@ -165,6 +177,7 @@ CServer::CServer()
 	
 	log_mutex=createMutex();
 	action_mutex=createMutex();
+	web_socket_mutex = createMutex();
 	requests_mutex=createMutex();
 	outputs_mutex=createMutex();
 	db_mutex=createMutex();
@@ -343,6 +356,7 @@ CServer::~CServer()
 	
 	destroy(log_mutex);
 	destroy(action_mutex);
+	destroy(web_socket_mutex);
 	destroy(requests_mutex);
 	destroy(outputs_mutex);
 	destroy(db_mutex);
@@ -456,6 +470,11 @@ void CServer::Log( const std::string &pStr, int LogLevel)
 
 		logToCircularBuffer(pStr, LogLevel);
 	}
+}
+
+void CServer::setLogRotationFiles(size_t n)
+{
+	log_rotation_files = n;
 }
 
 void CServer::rotateLogfile()
@@ -1085,7 +1104,17 @@ IPipe* CServer::ConnectStream(const SLookupBlockingResult& lookup_result, unsign
 	SOCKET s = socket(lookup_result.is_ipv6 ? AF_INET6 : AF_INET, type, 0);
 	if (s == SOCKET_ERROR)
 	{
-		return NULL;
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+		if (errno == EINVAL)
+		{
+			type &= ~SOCK_CLOEXEC;
+			s = socket(lookup_result.is_ipv6 ? AF_INET6 : AF_INET, type, 0);
+		}
+#endif
+		if (s == SOCKET_ERROR)
+		{
+			return NULL;
+		}
 	}
 
 #if !defined(_WIN32) && !defined(SOCK_CLOEXEC)
@@ -1401,25 +1430,8 @@ struct SThreadInfo
 
 void thread_helper_f2(IThread* t)
 {
-#ifndef _DEBUG
-	try
-	{
-#endif
-		(*t)();
-		Server->destroyDatabases(Server->getThreadID());
-#ifndef _DEBUG
-	}
-	catch (std::exception& e)
-	{
-		Server->Log(std::string("Thread exit with unhandled std::exception ") + e.what(), LL_ERROR);
-		throw;
-	}
-	catch (...)
-	{
-		Server->Log(std::string("Thread exit with unhandled C++ exception "), LL_ERROR);
-		throw;
-	}
-#endif
+	(*t)();
+	Server->destroyDatabases(Server->getThreadID());
 }
 
 DWORD WINAPI thread_helper_f(LPVOID param)
@@ -1658,7 +1670,18 @@ void CServer::wait(unsigned int ms)
 #ifdef _WIN32
 	Sleep(ms);
 #else
-	usleep(ms*1000);
+	if (ms > 1000)
+	{
+		sleep(ms / 1000);
+		if (ms % 1000 != 0)
+		{
+			usleep((ms % 1000) * 1000);
+		}
+	}
+	else
+	{
+		usleep(ms * 1000);
+	}
 #endif
 }
 
@@ -1710,10 +1733,9 @@ IFsFile* CServer::openTemporaryFile(void)
 	return file;
 }
 
-IFile* CServer::openMemoryFile(void)
+IMemFile* CServer::openMemoryFile(const std::string& name, bool mlock_mem)
 {
-	//return new CMemoryFile();
-	return openTemporaryFile();
+	return new CMemoryFile(name, mlock_mem);
 }
 
 bool CServer::deleteFile(std::string pFilename)
@@ -2042,61 +2064,39 @@ unsigned int CServer::getSecureRandomNumber(void)
 {
 #ifdef _WIN32
 	unsigned int rnd;
-	errno_t err=rand_s(&rnd);
-	if(err!=0)
+	errno_t err = rand_s(&rnd);
+	if (err != 0)
 	{
 		Log("Error generating secure random number", LL_ERROR);
+		abort();
 		return getRandomNumber();
 	}
 	return rnd;
 #else
 	unsigned int rnd;
-	std::fstream rnd_in("/dev/urandom", std::ios::in | std::ios::binary );
-	if(!rnd_in.is_open())
-	{
-		Log("Error opening /dev/urandom for secure random number", LL_ERROR);
-		return getRandomNumber();
-	}
-	rnd_in.read((char*)&rnd, sizeof(unsigned int));
-	assert(rnd_in.gcount()==sizeof(unsigned int));
-	if(rnd_in.fail() || rnd_in.eof() )
-	{
-		Log("Error reading secure random number", LL_ERROR);
-		return getRandomNumber();
-	}
+	secureRandomFill(reinterpret_cast<char*>(&rnd), sizeof(rnd));
 	return rnd;
 #endif
 }
 
 std::vector<unsigned int> CServer::getSecureRandomNumbers(size_t n)
 {
-#ifndef _WIN32
-	std::fstream rnd_in("/dev/urandom", std::ios::in | std::ios::binary );
-	if(!rnd_in.is_open())
+	if (n == 0)
 	{
-		Log("Error opening /dev/urandom for secure random number", LL_ERROR);
-		return getRandomNumbers(n);
-	}
-#endif
-	std::vector<unsigned int> ret;
-	ret.resize(n);
-	for(size_t i=0;i<n;++i)
-	{
-#ifdef _WIN32
-		ret[i]=getSecureRandomNumber();
-#else
-		unsigned int rnd;
-		rnd_in.read((char*)&rnd, sizeof(unsigned int));
-		ret[i]=rnd;
-#endif		
+		return std::vector<unsigned int>();
 	}
 
-#ifndef _WIN32
-	if(rnd_in.fail() || rnd_in.eof() )
+	std::vector<unsigned int> ret;
+	ret.resize(n);
+#ifdef _WIN32
+	for (size_t i = 0; i < n; ++i)
 	{
-		Log("Error reading secure random numbers", LL_ERROR);
-		return getRandomNumbers(n);
+		ret[i] = getSecureRandomNumber();
 	}
+#else
+	char* buf = reinterpret_cast<char*>(&ret[0]);
+	size_t bsize = sizeof(unsigned int) * n;
+	secureRandomFill(buf, bsize);
 #endif
 	return ret;
 }
@@ -2107,34 +2107,46 @@ void CServer::secureRandomFill(char *buf, size_t blen)
 	char *dptr=buf+blen;
 	while(buf<dptr)
 	{
-		if(dptr-buf>=sizeof(unsigned long))
+		const unsigned int rnd = getSecureRandomNumber();
+		const size_t to_write = (std::min)(sizeof(rnd), static_cast<size_t>(dptr - buf));
+		memcpy(buf, &rnd, to_write);
+		buf += to_write;
+	}
+#elif defined(HAVE_GETRANDOM) && defined(HAVE_SYS_RANDOM_H)
+	while (blen > 0)
+	{
+		ssize_t rc = getrandom(buf, blen, 0);
+		if (rc == -1
+			&& errno == EINTR)
 		{
-			*((unsigned long*)buf)=getSecureRandomNumber();
-			buf+=sizeof(unsigned long);
+			rc = 0;
 		}
-		else
+		else if (rc == -1)
 		{
-			unsigned long rnd=getSecureRandomNumber();
-			memcpy(buf, &rnd, dptr-buf);
-			buf+=dptr-buf;
+			Server->Log("Error filling secure random buffer. Errno " + convert((int64)errno), LL_ERROR);
+			abort();
 		}
+		blen -= rc;
+		buf += rc;
 	}
 #else
-	std::fstream rnd_in("/dev/urandom", std::ios::in | std::ios::binary );
-	if(!rnd_in.is_open())
+	std::fstream rnd_in("/dev/urandom", std::ios::in | std::ios::binary);
+	if (!rnd_in.is_open())
 	{
-		Log("Error opening /dev/urandom for secure random number fill", LL_ERROR);
+		Log("Error opening /dev/urandom for secure random number fill. Errno " + convert((int64)errno), LL_ERROR);
 		randomFill(buf, blen);
 		return;
 	}
 
 	rnd_in.read(buf, blen);
 
-	assert(rnd_in.gcount()==blen);
+	assert(rnd_in.gcount() == blen);
 
-	if(rnd_in.fail() || rnd_in.eof() )
+	if (rnd_in.gcount() != blen
+		|| rnd_in.fail() || rnd_in.eof())
 	{
-		Log("Error reading secure random numbers fill", LL_ERROR);
+		Log("Error reading secure random numbers fill. Errno " + convert((int64)errno), LL_ERROR);
+		abort();
 		randomFill(buf, blen);
 		return;
 	}
@@ -2257,3 +2269,33 @@ int CServer::getRecvWindowSize()
 	return recv_window_size;
 }
 #endif
+
+void CServer::mallocFlushTcache()
+{
+}
+
+void CServer::addWebSocket(IWebSocket* websocket)
+{
+	IScopedLock lock(web_socket_mutex);
+
+	web_sockets[websocket->getName()] = websocket;
+}
+
+THREAD_ID CServer::ExecuteWebSocket(const std::string& name, str_map& GET, str_map& PARAMS, IPipe* pipe, const std::string& endpoint_name)
+{
+	IWebSocket* ws;
+	{
+		IScopedLock lock(web_socket_mutex);
+		std::map<std::string, IWebSocket*>::iterator it = web_sockets.find(name);
+		if (it == web_sockets.end())
+			return ILLEGAL_THREAD_ID;
+
+		ws = it->second;
+	}
+
+	THREAD_ID tid = getThreadID();
+
+	ws->Execute(GET, tid, PARAMS, pipe, endpoint_name);
+
+	return tid;
+}

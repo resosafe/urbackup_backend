@@ -309,9 +309,10 @@ SparseFile::SPosMap SparseFile::nextBackingOffset()
 
 SparseFile::SPosMap SparseFile::lastBackingOffset(int64 offset)
 {
-	std::vector<SPosMap>::iterator it = std::lower_bound(sparse_offsets.begin(), sparse_offsets.end(), SPosMap(offset, -1));
-	if (it != sparse_offsets.end())
+	std::vector<SPosMap>::iterator it = std::upper_bound(sparse_offsets.begin(), sparse_offsets.end(), SPosMap(offset, -1));
+	if (it != sparse_offsets.begin())
 	{
+		--it;
 		return *it;
 	}
 	else
@@ -364,6 +365,16 @@ _u32 SparseFile::mappedOrigOp(IOrigOp * orig_op, _u32 op_size, bool * has_error)
 	return op_size_orig - op_size;
 }
 
+IVdlVolCache* SparseFile::createVdlVolCache()
+{
+	return NULL;
+}
+
+int64 SparseFile::getValidDataLength(IVdlVolCache* vol_cache)
+{
+	return -1;
+}
+
 int64 SparseFile::mapToBackingOffset(int64 offset)
 {
 	SPosMap last = lastBackingOffset(offset);
@@ -392,7 +403,7 @@ bool SparseFile::Resize(int64 new_size, bool set_sparse)
 	return backing_file->Resize(mapToBackingOffset(new_size), set_sparse);
 }
 
-std::vector<IFsFile::SFileExtent> SparseFile::getFileExtents(int64 starting_offset, int64 block_size, bool & more_data)
+std::vector<IFsFile::SFileExtent> SparseFile::getFileExtents(int64 starting_offset, int64 block_size, bool & more_data, unsigned int flags)
 {
 	return std::vector<SFileExtent>();
 }

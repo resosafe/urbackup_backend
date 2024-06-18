@@ -61,8 +61,13 @@
 #define fsblkcnt64_t fsblkcnt_t
 #endif
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 #if defined(__ANDROID__)
 #define fsblkcnt64_t fsblkcnt_t
+#include "android_popen.h"
 #endif
 
 
@@ -115,6 +120,7 @@ std::vector<SFile> getFiles(const std::string &path, bool *has_error, bool ignor
 	upath+=os_file_sep();
 
     errno=0;
+	std::string last_err_fn;
     while ((dirp = readdir64(dp)) != NULL)
 	{
 		SFile f;
@@ -122,6 +128,30 @@ std::vector<SFile> getFiles(const std::string &path, bool *has_error, bool ignor
 		if(f.name=="." || f.name==".." )
 			continue;		
 
+#ifdef __APPLE__
+//        Cannot stat certain locations due to macOS SIP restrictions
+        if(upath+dirp->d_name=="/Library/Caches/com.apple.aned" ||
+            upath+dirp->d_name=="/private/var/db/appinstalld" ||
+            upath+dirp->d_name=="/private/var/db/ConfigurationProfiles/Store" ||
+            upath+dirp->d_name=="/private/var/db/CoreDuet/Knowledge" ||
+            upath+dirp->d_name=="/private/var/db/DifferentialPrivacy" ||
+            upath+dirp->d_name=="/private/var/db/DumpPanic" ||
+            upath+dirp->d_name=="/private/var/db/fpsd/dvp" ||
+            upath+dirp->d_name=="/private/var/db/KernelExtensionManagement/Staging" ||
+            upath+dirp->d_name=="/private/var/db/lockdown" ||
+            upath+dirp->d_name=="/private/var/db/MobileIdentityService" ||
+            upath+dirp->d_name=="/private/var/db/oah" ||
+            upath+dirp->d_name=="/private/var/db/searchparty" ||
+            upath+dirp->d_name=="/private/var/db/sysdiagnose/com.apple.sysdiagnose" ||
+            upath+dirp->d_name=="/private/var/networkd/db" ||
+            upath+dirp->d_name=="/private/var/protected/trustd/private" ||
+            upath+dirp->d_name=="/System/Library/Templates/Data/private/var/db/oah")
+        {
+            Log("[macOS] Skipping \""+upath+dirp->d_name+"\" due to macOS SIP restriction", LL_INFO);
+            continue;
+        }
+#endif
+    
 		f.isdir=(dirp->d_type==DT_DIR);
 		
 		struct stat64 f_info;
@@ -178,8 +208,18 @@ std::vector<SFile> getFiles(const std::string &path, bool *has_error, bool ignor
 			{
 				*has_error=true;
 			}
-			errno=0;
-			continue;
+			if(!last_err_fn.empty() &&
+				last_err_fn==dirp->d_name)
+			{
+				Log("Returned again after error \""+upath+dirp->d_name+"\". Stopping directory iteration.", LL_ERROR);
+				break;
+			}
+			else
+			{
+				errno=0;
+				last_err_fn = dirp->d_name;
+				continue;
+			}
 		}
 		tmp.push_back(f);
 		errno=0;
@@ -365,8 +405,12 @@ int64 os_free_space(const std::string &path)
     int rc=statvfs64((path).c_str(), &buf);
 	if(rc==0)
 	{
+#if defined(__FreeBSD__) || defined(__APPLE__)
+		int64 free = (int64)buf.f_frsize*buf.f_bavail;
+#else
 		fsblkcnt64_t blocksize = buf.f_frsize ? buf.f_frsize : buf.f_bsize;
 		fsblkcnt64_t free = blocksize*buf.f_bavail;
+#endif
 		if(free>LLONG_MAX)
 		{
 			return LLONG_MAX;
@@ -394,7 +438,11 @@ int64 os_total_space(const std::string &path)
 	if(rc==0)
 	{
 		fsblkcnt64_t used=buf.f_blocks-buf.f_bfree;
+#if defined(__FreeBSD__) || defined(__APPLE__)
+		int64 total = (int64)(used+buf.f_bavail)*buf.f_frsize;
+#else
 		fsblkcnt64_t total = (used+buf.f_bavail)*buf.f_bsize;
+#endif
 		if(total>LLONG_MAX)
 		{
 			return LLONG_MAX;
@@ -1040,6 +1088,10 @@ int os_popen(const std::string& cmd, std::string& ret)
 {
 	ret.clear();
 
+#ifdef __ANDROID__
+    POFILE* pin = NULL;
+#endif
+
 	FILE* in = NULL;
 
 #ifndef _WIN32
@@ -1047,7 +1099,10 @@ int os_popen(const std::string& cmd, std::string& ret)
 #define _pclose pclose
 #endif
 
-#ifdef __linux__
+#ifdef __ANDROID__
+    pin = and_popen(cmd.c_str(), "r");
+    if(pin!=NULL) in=pin->fp;
+#elif __linux__
 	in = _popen(cmd.c_str(), "re");
 	if(!in) in = _popen(cmd.c_str(), "r");
 #else
@@ -1071,7 +1126,11 @@ int os_popen(const std::string& cmd, std::string& ret)
 	}
 	while(read==sizeof(buf));
 
-	return _pclose(in);
+#ifdef __ANDROID__
+    return and_pclose(pin);
+#else
+    return _pclose(in);
+#endif
 }
 
 std::string os_last_error_str()
@@ -1263,6 +1322,128 @@ void os_reset_priority()
 	setpriority(PRIO_PROCESS, 0, 0);
 }
 
+#elif defined (__APPLE__)
+
+struct SPrioInfoInt
+{
+	int io_prio;
+	int cpu_prio;
+};
+
+SPrioInfo::SPrioInfo()
+ : prio_info(new SPrioInfoInt)
+{
+}
+
+SPrioInfo::~SPrioInfo()
+{
+	delete prio_info;
+}
+
+bool os_enable_background_priority(SPrioInfo& prio_info)
+{
+	if(prio_info.prio_info==NULL)
+	{
+		return false;
+	}
+
+	uint64 thread_id;
+	if(pthread_threadid_np(NULL, &thread_id) == 0
+		&& (uint64)getpid() == thread_id )
+	{
+		//This would set it for the whole process
+		return false;
+	}
+	
+	prio_info.prio_info->io_prio = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD);
+	prio_info.prio_info->cpu_prio = getpriority(PRIO_DARWIN_THREAD, 0);
+
+	if(setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE)==-1)
+	{
+		return false;
+	}
+	int cpuprio = 19;
+	if(setpriority(PRIO_DARWIN_THREAD, 0, cpuprio)==-1)
+	{
+		os_disable_background_priority(prio_info);
+		return false;
+	}
+	
+	return true;
+}
+
+bool os_disable_background_priority(SPrioInfo& prio_info)
+{
+	if(prio_info.prio_info==NULL)
+	{
+		return false;
+	}
+		
+	bool success = (setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, prio_info.prio_info->io_prio)==0);
+	success &= (setpriority(PRIO_DARWIN_THREAD, 0, prio_info.prio_info->cpu_prio)==0);
+	return success;
+}
+
+bool os_enable_prioritize(SPrioInfo& prio_info, EPrio prio)
+{
+	if(prio_info.prio_info==NULL)
+	{
+		return false;
+	}
+
+	uint64 thread_id;
+	if(pthread_threadid_np(NULL, &thread_id) == 0
+		&& (uint64)getpid() == thread_id )
+	{
+		//This would set it for the whole process
+		return false;
+	}
+
+	prio_info.prio_info->io_prio = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD);
+	prio_info.prio_info->cpu_prio = getpriority(PRIO_DARWIN_THREAD, 0);
+	
+	int ioprio = IOPOL_STANDARD;
+	int cpuprio = -10;
+	
+	if(prio==Prio_SlightPrioritize)
+	{
+		ioprio=IOPOL_IMPORTANT;
+		cpuprio=-3;
+	}
+	else if(prio==Prio_SlightBackground)
+	{
+		ioprio=IOPOL_UTILITY;
+		cpuprio=5;
+	}
+	
+	if(setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, ioprio)==-1)
+	{
+		return false;
+	}	
+	if(setpriority(PRIO_DARWIN_THREAD, 0, cpuprio)==-1)
+	{
+		os_disable_prioritize(prio_info);
+		return false;
+	}
+	
+	return true;
+}
+
+bool os_disable_prioritize(SPrioInfo& prio_info)
+{
+	return os_disable_background_priority(prio_info);
+}
+
+void assert_process_priority()
+{
+}
+
+void os_reset_priority()
+{
+	setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_STANDARD);
+	setpriority(PRIO_PROCESS, 0, 0);
+}
+
 #else //__NR_ioprio_set
 
 SPrioInfo::SPrioInfo()
@@ -1314,7 +1495,8 @@ bool os_sync(const std::string & path)
 	{
 		if(ioctl(fd, BTRFS_IOC_SYNC, NULL)==-1)
 		{
-			if(errno!=ENOTTY && errno!=ENOSYS)
+			if(errno!=ENOTTY && errno!=ENOSYS 
+				&& errno!=EINVAL)
 			{
 				close(fd);
 				return false;
@@ -1329,12 +1511,13 @@ bool os_sync(const std::string & path)
 #if defined(HAVE_SYNCFS)
 		if(syncfs(fd)!=0)
 		{
-			close(fd);
 			if(errno==ENOSYS)
 			{
+				close(fd);
 				sync();
 				return true;
 			}
+			close(fd);
 			return false;
 		}
 		else
@@ -1362,4 +1545,13 @@ bool os_sync(const std::string & path)
 size_t os_get_num_cpus()
 {
 	return sysconf(_SC_NPROCESSORS_ONLN);
+}
+
+int os_system(const std::string& cmd)
+{
+#ifdef __ANDROID__
+	return and_system(cmd.c_str());
+#else
+	return system(cmd.c_str());
+#endif
 }

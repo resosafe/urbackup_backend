@@ -31,11 +31,13 @@
 #include "map_buffer.h"
 
 volatile bool PipeSessions::do_stop = false;
-IMutex* PipeSessions::mutex = NULL;
+IMutex* PipeSessions::mutex = nullptr;
+IMutex* PipeSessions::active_shares_mutex = nullptr;
 std::map<std::string, SPipeSession> PipeSessions::pipe_files;
 std::map<std::string, SExitInformation> PipeSessions::exit_information;
 std::map<std::pair<std::string, std::string>, IFileServ::IMetadataCallback*> PipeSessions::metadata_callbacks;
-std::map<std::string, size_t> PipeSessions::active_shares;
+std::map<std::pair<std::string, size_t>, size_t> PipeSessions::active_shares;
+size_t PipeSessions::active_shares_gen = 0;
 
 const int64 pipe_file_timeout = 1*60*60*1000;
 const int64 pipe_file_read_timeout = 30 * 60 * 1000;
@@ -47,7 +49,7 @@ IFile* PipeSessions::getFile(const std::string& cmd, ScopedPipeFileUser& pipe_fi
 {
 	if(cmd.empty())
 	{
-		return NULL;
+		return nullptr;
 	}
 
 	IScopedLock lock(mutex);
@@ -71,18 +73,18 @@ IFile* PipeSessions::getFile(const std::string& cmd, ScopedPipeFileUser& pipe_fi
 			it->second.metadata.clear();
 		}
 
-		if (it->second.file == NULL)
+		if (it->second.file == nullptr)
 		{
-			if (sent_metadata != NULL)
+			if (sent_metadata != nullptr)
 			{
 				*sent_metadata = true;
 			}
-			return NULL;
+			return nullptr;
 		}
 
-		if (tar_file != NULL)
+		if (tar_file != nullptr)
 		{
-			*tar_file = dynamic_cast<PipeFileTar*>(it->second.file)!=NULL;
+			*tar_file = dynamic_cast<PipeFileTar*>(it->second.file)!=nullptr;
 		}
 
 		pipe_file_user.reset(it->second.file);
@@ -110,19 +112,19 @@ IFile* PipeSessions::getFile(const std::string& cmd, ScopedPipeFileUser& pipe_fi
 			script_cmd.erase(script_cmd.size()-output_filename.size(), output_filename.size());
 
 			bool l_tar_file = false;
-			IPipeFile* pipe_file = NULL;
+			IPipeFile* pipe_file = nullptr;
 			std::string script_filename = FileServ::mapScriptOutputNameToScript(output_filename, l_tar_file, pipe_file);
 
 			script_cmd = "\"" + script_cmd + script_filename +
 				"\" \"" + output_filename + "\" "+convert(backupnum);
 
-			if (tar_file != NULL)
+			if (tar_file != nullptr)
 			{
 				*tar_file = l_tar_file;
 			}
 
 			IPipeFile* nf;
-			if (pipe_file != NULL)
+			if (pipe_file != nullptr)
 			{
 				nf = pipe_file;
 			}
@@ -138,17 +140,17 @@ IFile* PipeSessions::getFile(const std::string& cmd, ScopedPipeFileUser& pipe_fi
 			if(nf->getHasError())
 			{
 				delete nf;
-				return NULL;
+				return nullptr;
 			}
 
-			pipe_files.insert(std::make_pair(session_key, SPipeSession(nf, NULL, backupnum, std::string())));
+			pipe_files.insert(std::make_pair(session_key, SPipeSession(nf, nullptr, backupnum, std::string())));
 
 			pipe_file_user.reset(nf);
 			return nf;
 		}		
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 void PipeSessions::injectPipeSession(const std::string & session_key, int backupnum, IPipeFile * pipe_file, const std::string& metadata)
@@ -167,12 +169,13 @@ void PipeSessions::injectPipeSession(const std::string & session_key, int backup
 		return;
 	}
 
-	pipe_files.insert(std::make_pair(session_key, SPipeSession(pipe_file, NULL, backupnum, metadata)));
+	pipe_files.insert(std::make_pair(session_key, SPipeSession(pipe_file, nullptr, backupnum, metadata)));
 }
 
 void PipeSessions::init()
 {
 	mutex = Server->createMutex();
+	active_shares_mutex = Server->createMutex();
 
 	Server->getThreadPool()->execute(new PipeSessions, "PipeSession: timeout");
 }
@@ -180,6 +183,7 @@ void PipeSessions::init()
 void PipeSessions::destroy()
 {
 	delete mutex;
+	delete active_shares_mutex;
 
 	do_stop=true;
 }
@@ -204,7 +208,7 @@ void PipeSessions::removeFile(const std::string& cmd)
 
 		while (it->second.retrieving_exit_info)
 		{
-			if (it->second.retrieval_cond == NULL)
+			if (it->second.retrieval_cond == nullptr)
 			{
 				it->second.retrieval_cond = Server->createCondition();
 			}
@@ -212,7 +216,7 @@ void PipeSessions::removeFile(const std::string& cmd)
 		}
 
 		if(!it->second.retrieved_exit_info
-			&& it->second.file!=NULL)
+			&& it->second.file!=nullptr)
 		{
 			int exit_code = -1;
 			it->second.file->getExitCode(exit_code);
@@ -226,7 +230,7 @@ void PipeSessions::removeFile(const std::string& cmd)
 			Server->Log("Pipe file has exit code "+convert(exit_code), LL_DEBUG);
 		}		
 
-		if(it->second.file!=NULL)
+		if(it->second.file!=nullptr)
 		{ 
 			it->second.file->forceExitWait();
 
@@ -262,7 +266,7 @@ SExitInformation PipeSessions::getExitInformation(const std::string& cmd)
 	{
 		while (it->second.retrieving_exit_info)
 		{
-			if (it->second.retrieval_cond== NULL)
+			if (it->second.retrieval_cond== nullptr)
 			{
 				it->second.retrieval_cond = Server->createCondition();
 			}
@@ -290,14 +294,15 @@ SExitInformation PipeSessions::getExitInformation(const std::string& cmd)
 			int exit_code = -1;
 			IPipeFile* f = it->second.file;
 
-			lock.relock(NULL);
+			lock.relock(nullptr);
 
+			f->waitForStderr(10000);
 			std::string stderr_output = f->getStdErr();
 
 			lock.relock(mutex);
 
 			it->second.retrieving_exit_info = false;
-			if (it->second.retrieval_cond!= NULL)
+			if (it->second.retrieval_cond!= nullptr)
 			{
 				it->second.retrieval_cond->notify_all();
 			}
@@ -338,10 +343,10 @@ void PipeSessions::operator()()
 			it!=pipe_files.end();)
 		{
 			if( !it->second.retrieving_exit_info
-				 && (it->second.file!=NULL && currtime - it->second.file->getLastRead() > pipe_file_read_timeout)
-					 || (it->second.file==NULL && currtime - it->second.addtime > pipe_file_timeout) )
+				 && (it->second.file!=nullptr && currtime - it->second.file->getLastRead() > pipe_file_read_timeout)
+					 || (it->second.file==nullptr && currtime - it->second.addtime > pipe_file_timeout) )
 			{
-				if (it->second.file != NULL)
+				if (it->second.file != nullptr)
 				{
 					it->second.file->forceExitWait();
 
@@ -386,7 +391,7 @@ IFileServ::IMetadataCallback* PipeSessions::transmitFileMetadata( const std::str
 {
 	if(public_fn.empty() || next(public_fn, 0, "urbackup/"))
 	{
-		return NULL;
+		return nullptr;
 	}
 
 	std::string sharename = getuntil("/", public_fn);
@@ -405,21 +410,26 @@ IFileServ::IMetadataCallback* PipeSessions::transmitFileMetadata( const std::str
 
 	IScopedLock lock(mutex);
 
-	std::map<std::pair<std::string, std::string>, IFileServ::IMetadataCallback*>::iterator iter_cb = 
-		metadata_callbacks.find(std::make_pair(sharename, identity));
-
-	IFileServ::IMetadataCallback* ret = NULL;
-	if(iter_cb!=metadata_callbacks.end())
-	{
-		data.addVoidPtr(iter_cb->second);
-		ret = iter_cb->second;
-	}
+	IFileServ::IMetadataCallback* ret = nullptr;
 
 	std::map<std::string, SPipeSession>::iterator it = pipe_files.find("urbackup/FILE_METADATA|"+server_token);
 
-	if(it!=pipe_files.end() && it->second.input_pipe!=NULL)
+	if(it!=pipe_files.end() && it->second.input_pipe!=nullptr)
 	{
-		++active_shares[sharename + "|" + server_token];
+		{
+			IScopedLock alock(active_shares_mutex);
+			++active_shares[std::make_pair(sharename + "|" + server_token, active_shares_gen)];
+			data.addUInt64(active_shares_gen);
+		}
+
+		std::map<std::pair<std::string, std::string>, IFileServ::IMetadataCallback*>::iterator iter_cb =
+			metadata_callbacks.find(std::make_pair(sharename, identity));
+
+		if(iter_cb!=metadata_callbacks.end())
+		{
+			data.addVoidPtr(iter_cb->second);
+			ret = iter_cb->second;
+		}
 
 		it->second.input_pipe->Write(data.getDataPtr(), data.getDataSize());
 	}
@@ -454,9 +464,13 @@ void PipeSessions::transmitFileMetadata(const std::string & public_fn, const std
 
 	std::map<std::string, SPipeSession>::iterator it = pipe_files.find("urbackup/FILE_METADATA|" + server_token);
 
-	if (it != pipe_files.end() && it->second.input_pipe != NULL)
+	if (it != pipe_files.end() && it->second.input_pipe != nullptr)
 	{
-		++active_shares[sharename + "|" + server_token];
+		{
+			IScopedLock alock(active_shares_mutex);
+			++active_shares[std::make_pair(sharename + "|" + server_token, active_shares_gen)];
+			data.addUInt64(active_shares_gen);
+		}
 
 		it->second.input_pipe->Write(data.getDataPtr(), data.getDataSize());
 	}
@@ -489,7 +503,7 @@ void PipeSessions::transmitFileMetadataAndFiledataWait(const std::string & publi
 	datamsg.addChar(METADATA_PIPE_SEND_RAW_FILEDATA);
 	datamsg.addString("f" + public_fn);
 	datamsg.addVoidPtr(file);
-	std::auto_ptr<IPipe> waitpipe(Server->createMemoryPipe());
+	std::unique_ptr<IPipe> waitpipe(Server->createMemoryPipe());
 	datamsg.addVoidPtr(waitpipe.get());
 	datamsg.addString(server_token);
 
@@ -497,17 +511,20 @@ void PipeSessions::transmitFileMetadataAndFiledataWait(const std::string & publi
 
 	std::map<std::string, SPipeSession>::iterator it = pipe_files.find("urbackup/FILE_METADATA|" + server_token);
 
-	if (it != pipe_files.end() && it->second.input_pipe != NULL)
+	if (it != pipe_files.end() && it->second.input_pipe != nullptr)
 	{
-		++active_shares[sharename + "|" + server_token];
+		{
+			IScopedLock alock(active_shares_mutex);
+			active_shares[std::make_pair(sharename + "|" + server_token, active_shares_gen)]+=2;
+			metadatamsg.addUInt(active_shares_gen);
+			datamsg.addUInt(active_shares_gen);
+		}	
 
 		it->second.input_pipe->Write(datamsg.getDataPtr(), datamsg.getDataSize());
 
-		++active_shares[sharename + "|" + server_token];
-
 		it->second.input_pipe->Write(metadatamsg.getDataPtr(), metadatamsg.getDataSize());
 
-		lock.relock(NULL);
+		lock.relock(nullptr);
 		std::string read_ret;
 		waitpipe->Read(&read_ret);
 	}
@@ -519,7 +536,7 @@ void PipeSessions::transmitFileMetadataAndFiledataWait(const std::string & publi
 
 
 
-void PipeSessions::fileMetadataDone(const std::string & public_fn, const std::string& server_token)
+void PipeSessions::fileMetadataDone(const std::string & public_fn, const std::string& server_token, size_t active_gen)
 {
 	std::string sharename = getuntil("/", public_fn);
 	if (sharename.empty())
@@ -527,9 +544,9 @@ void PipeSessions::fileMetadataDone(const std::string & public_fn, const std::st
 		sharename = public_fn;
 	}
 
-	IScopedLock lock(mutex);
+	IScopedLock lock(active_shares_mutex);
 
-	std::map<std::string, size_t>::iterator it = active_shares.find(sharename + "|" + server_token);
+	std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.find(std::make_pair(sharename + "|" + server_token, active_gen));
 
 	if (it != active_shares.end())
 	{
@@ -543,11 +560,37 @@ void PipeSessions::fileMetadataDone(const std::string & public_fn, const std::st
 
 bool PipeSessions::isShareActive(const std::string & sharename, const std::string& server_token)
 {
-	IScopedLock lock(mutex);
+	IScopedLock lock(active_shares_mutex);
 
-	std::map<std::string, size_t>::iterator it = active_shares.find(sharename + "|" + server_token);
+	for (std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.begin();
+		it != active_shares.end(); ++it)
+	{
+		if (it->first.first == sharename + "|" + server_token)
+			return true;
+	}
 
-	return it != active_shares.end();
+	return false;
+}
+
+bool PipeSessions::isShareActiveGen(const std::string& sharename, const std::string& server_token, size_t gen)
+{
+	IScopedLock lock(active_shares_mutex);
+
+	for (std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.begin();
+		it != active_shares.end(); ++it)
+	{
+		if (it->first.first == sharename + "|" + server_token &&
+			it->first.second<=gen)
+			return true;
+	}
+
+	return false;
+}
+
+void PipeSessions::setActiveSharesGen(size_t gen)
+{
+	IScopedLock lock(active_shares_mutex);
+	active_shares_gen = gen;
 }
 
 void PipeSessions::metadataStreamEnd( const std::string& server_token )
@@ -556,7 +599,7 @@ void PipeSessions::metadataStreamEnd( const std::string& server_token )
 
 	std::map<std::string, SPipeSession>::iterator it = pipe_files.find("urbackup/FILE_METADATA|"+server_token);
 
-	if(it!=pipe_files.end() && it->second.input_pipe!=NULL)
+	if(it!=pipe_files.end() && it->second.input_pipe!=nullptr)
 	{
 		CWData data;
 		data.addChar(METADATA_PIPE_EXIT);
@@ -570,7 +613,7 @@ void PipeSessions::phashEnd(const std::string & server_token, const std::string 
 	IScopedLock lock(mutex);
 
 	bool allow_exec;
-	std::string fn = map_file("phash_{9c28ff72-5a74-487b-b5e1-8f1c96cd0cf4}/phash_" + phash_fn, std::string(), allow_exec, NULL);
+	std::string fn = map_file("phash_{9c28ff72-5a74-487b-b5e1-8f1c96cd0cf4}/phash_" + phash_fn, std::string(), allow_exec, nullptr);
 
 	if (fn.empty())
 		return;
@@ -580,7 +623,7 @@ void PipeSessions::phashEnd(const std::string & server_token, const std::string 
 	if (it != pipe_files.end())
 	{
 		PipeFileExt* pext = dynamic_cast<PipeFileExt*>(it->second.file);
-		if(pext!=NULL)
+		if(pext!=nullptr)
 			pext->forceExit();
 	}
 }

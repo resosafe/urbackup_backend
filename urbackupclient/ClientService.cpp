@@ -29,6 +29,7 @@
 #include "database.h"
 #include "../common/data.h"
 #include "../fsimageplugin/IFilesystem.h"
+#include "../fsimageplugin/IFSImageFactory.h"
 #include "../cryptoplugin/ICryptoFactory.h"
 #include "../urbackupcommon/sha2/sha2.h"
 #include "ServerIdentityMgr.h"
@@ -37,6 +38,15 @@
 #include "InternetClient.h"
 #include "../urbackupcommon/settingslist.h"
 #include "../urbackupcommon/capa_bits.h"
+#include "../urbackupcommon/os_functions.h"
+#include "../urbackupcommon/CompressedPipe2.h"
+#include "../urbackupcommon/CompressedPipeZstd.h"
+#include "../urbackupcommon/InternetServicePipe2.h"
+#include "RansomwareCanary.h"
+#include "FilesystemManager.h"
+#include "LocalFullFileBackup.h"
+#include "LocalIncrFileBackup.h"
+#include "file_permissions.h"
 
 #include <memory.h>
 #include <stdlib.h>
@@ -60,6 +70,7 @@
 #endif
 
 extern ICryptoFactory *crypto_fak;
+extern IFSImageFactory* image_fak;
 extern std::string time_format_str;
 
 ICustomClient* ClientService::createClient()
@@ -75,23 +86,23 @@ void ClientService::destroyClient( ICustomClient * pClient)
 std::vector<SRunningProcess> ClientConnector::running_processes;
 std::vector<SFinishedProcess> ClientConnector::finished_processes;
 int64 ClientConnector::curr_backup_running_id = 0;
-IMutex *ClientConnector::backup_mutex=NULL;
-IMutex *ClientConnector::process_mutex = NULL;
+IMutex *ClientConnector::backup_mutex=nullptr;
+IMutex *ClientConnector::process_mutex = nullptr;
 int ClientConnector::backup_interval=6*60*60;
 int ClientConnector::backup_alert_delay=5*60;
 std::vector<SChannel> ClientConnector::channel_pipes;
 db_results ClientConnector::cached_status;
 std::map<std::string, int64> ClientConnector::last_token_times;
 int ClientConnector::last_capa=0;
-IMutex *ClientConnector::ident_mutex=NULL;
+IMutex *ClientConnector::ident_mutex=nullptr;
 std::vector<std::string> ClientConnector::new_server_idents;
 bool ClientConnector::end_to_end_file_backup_verification_enabled=false;
-std::map<std::pair<std::string, std::string>, std::string> ClientConnector::challenges;
+std::map<std::pair<std::string, std::string>, ClientConnector::SChallenge> ClientConnector::challenges;
 bool ClientConnector::has_file_changes = false;
 std::vector < ClientConnector::SFilesrvConnection > ClientConnector::fileserv_connections;
 RestoreOkStatus ClientConnector::restore_ok_status = RestoreOk_None;
 bool ClientConnector::status_updated= false;
-RestoreFiles* ClientConnector::restore_files = NULL;
+RestoreFiles* ClientConnector::restore_files = nullptr;
 size_t ClientConnector::needs_restore_restart = 0;
 size_t ClientConnector::ask_restore_ok = 0;
 int64 ClientConnector::service_starttime = 0;
@@ -99,6 +110,8 @@ SRestoreToken ClientConnector::restore_token;
 std::map<std::string, SAsyncFileList> ClientConnector::async_file_index;
 std::deque<std::pair<std::string, std::string> > ClientConnector::finished_async_file_index;
 bool ClientConnector::last_metered = false;
+bool ClientConnector::last_locked = false;
+int64 ClientConnector::startup_timestamp = 0;
 
 
 #ifdef _WIN32
@@ -139,7 +152,7 @@ namespace
 				CloseHandle(pi.hThread);
 			}
 #else
-			system("/bin/sh urbackup/UrBackupUpdate.sh -- silent");
+			os_system("/bin/sh urbackup/UrBackupUpdate.sh -- silent");
 #endif
 
 			delete this;
@@ -186,11 +199,35 @@ namespace
 			}
 		}
 	};
+
+	class FileservClientThread : public IThread
+	{
+	public:
+		FileservClientThread(IPipe* pipe, const char* p_extra_buffer, size_t extra_buffer_size)
+			: pipe(pipe)
+		{
+			if (extra_buffer_size > 0)
+			{
+				extra_buffer.assign(p_extra_buffer, p_extra_buffer + extra_buffer_size);
+			}
+		}
+
+		void operator()()
+		{
+			IndexThread::getFileSrv()->runClient(pipe, &extra_buffer);
+			delete pipe;
+			delete this;
+		}
+
+	private:
+		IPipe* pipe;
+		std::vector<char> extra_buffer;
+	};
 }
 
 void ClientConnector::init_mutex(void)
 {
-	if(backup_mutex==NULL)
+	if(backup_mutex==nullptr)
 	{
 		backup_mutex=Server->createMutex();
 		ident_mutex=Server->createMutex();
@@ -229,6 +266,8 @@ void ClientConnector::init_mutex(void)
 	}
 
 	service_starttime = Server->getTimeMS();
+
+	startup_timestamp = Server->getTimeSeconds();
 }
 
 void ClientConnector::destroy_mutex(void)
@@ -253,7 +292,7 @@ void ClientConnector::Init(THREAD_ID pTID, IPipe *pPipe, const std::string& pEnd
 	pipe=pPipe;
 	state=CCSTATE_NORMAL;
 	image_inf.thread_action=TA_NONE;
-	image_inf.image_thread=NULL;
+	image_inf.image_thread=nullptr;
 	image_inf.clientsubname.clear();
 	lasttime=Server->getTimeMS();
 	do_quit=false;
@@ -267,12 +306,13 @@ void ClientConnector::Init(THREAD_ID pTID, IPipe *pPipe, const std::string& pEnd
 	endpoint_name = pEndpointName;
 	make_fileserv=false;
 	local_backup_running_id = 0;
-	run_other = NULL;
+	run_other = nullptr;
 	idle_timeout = 10000;
-	bitmapfile = NULL;
+	bitmapfile = nullptr;
 	retrieved_has_components=false;
 	status_has_components=false;
 	curr_result_id = 0;
+	is_encrypted = false;
 }
 
 ClientConnector::~ClientConnector(void)
@@ -309,7 +349,7 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 		IndexThread::unrefResult(curr_result_id);
 		curr_result_id = 0;
 		delete image_inf.image_thread;
-		image_inf.image_thread=NULL;
+		image_inf.image_thread=nullptr;
 		return false;
 	}
 
@@ -333,7 +373,20 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 	case CCSTATE_START_FILEBACKUP:
 		{
 			std::string msg;
-			bool has_result = IndexThread::getResult(curr_result_id, 0, msg);
+			bool has_result = false;
+
+			if (curr_result_id != 0)
+			{
+				has_result = IndexThread::getResult(curr_result_id, 0, msg);
+			}
+			else if (curr_backup_tt != ILLEGAL_THREADPOOL_TICKET)
+			{
+				has_result = true;
+				if (Server->getThreadPool()->waitFor(curr_backup_tt, 0))
+				{
+					msg = "done";
+				}
+			}
 
 			if (state == CCSTATE_START_FILEBACKUP_ASYNC)
 			{
@@ -363,7 +416,6 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 
 			if(msg=="exit" || !has_result)
 			{
-				assert(false);
 				if(waitForThread())
 				{
 					do_quit=true;
@@ -455,7 +507,7 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 				want_receive = true;
 			}
 
-			bool has_ping = chan != NULL && chan->state == SChannel::EChannelState_Pinging;
+			bool has_ping = chan != nullptr && chan->state == SChannel::EChannelState_Pinging;
 
 			int64 timeout_interval = 180000;
 
@@ -488,7 +540,7 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 				}
 				return false;
 			}
-			if(chan!=NULL && chan->state==SChannel::EChannelState_Exit)
+			if(chan!=nullptr && chan->state==SChannel::EChannelState_Exit)
 			{
 				do_quit=true;
 				break;
@@ -532,7 +584,7 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 			if(!Server->getThreadPool()->isRunning(image_inf.thread_ticket))
 			{
 				delete image_inf.image_thread;
-				image_inf.image_thread=NULL;
+				image_inf.image_thread=nullptr;
 				IndexThread::unrefResult(curr_result_id);
 				curr_result_id = 0;
 				return false;
@@ -565,13 +617,19 @@ bool ClientConnector::Run(IRunOtherCallback* p_run_other)
 					Server->destroy(hashdatafile);
 					Server->deleteFile(hashdatafile_fn);
 
-					if(crypto_fak!=NULL)
+					if(crypto_fak!=nullptr)
 					{
-						if (crypto_fak->verifyFile(UPDATE_SIGNATURE_PREFIX "urbackup_ecdsa409k1.pub",
+#if defined(__APPLE__)
+						// ./UrBackup\ Client.app/Contents/MacOS/sbin/../share/urbackup/urbackup_ecdsa409k1.pub
+						std::string pubkey = ExtractFilePath(Server->getServerWorkingDir()) + "/share/urbackup/urbackup_ecdsa409k1.pub";
+#else
+						std::string pubkey = UPDATE_SIGNATURE_PREFIX "urbackup_ecdsa409k1.pub";
+#endif
+						if (crypto_fak->verifyFile(pubkey,
 							UPDATE_FILE_PREFIX "UrBackupUpdate_untested.dat", UPDATE_FILE_PREFIX "UrBackupUpdate.sig2"))
 						{
-							std::auto_ptr<IFile> updatefile(Server->openFile(UPDATE_FILE_PREFIX "UrBackupUpdate_untested.dat"));
-							if(updatefile.get()!=NULL)
+							std::unique_ptr<IFile> updatefile(Server->openFile(UPDATE_FILE_PREFIX "UrBackupUpdate_untested.dat"));
+							if(updatefile.get()!=nullptr)
 							{
 								if(checkHash(getSha512Hash(updatefile.get()))
 									&& checkVersion(updatefile.get()) )
@@ -743,7 +801,7 @@ bool ClientConnector::writeUpdateFile(IFile *datafile, std::string outfn)
 		return false;
 
 	IFile *out=Server->openFile(outfn, MODE_WRITE);
-	if(out==NULL)
+	if(out==nullptr)
 		return false;
 
 	size_t read=0;
@@ -782,7 +840,7 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 		return;
 	}
 
-	IMutex *l_mutex=NULL;
+	IMutex *l_mutex=nullptr;
 	if(is_channel)
 	{
 		l_mutex=backup_mutex;
@@ -792,7 +850,7 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 	if (is_channel)
 	{
 		SChannel* chan = getCurrChannel();
-		if (chan != NULL
+		if (chan != nullptr
 			&& chan->state == SChannel::EChannelState_Used)
 		{
 			want_receive = false;
@@ -865,7 +923,7 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 			if (state == CCSTATE_IMAGE_HASHDATA
 				|| state == CCSTATE_UPDATE_DATA)
 			{
-				if (bitmapfile == NULL)
+				if (bitmapfile == nullptr)
 				{
 					hashdataok = true;
 					if (state == CCSTATE_IMAGE_HASHDATA)
@@ -910,10 +968,24 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 		}
 	}
 
-	tcpstack.AddData((char*)cmd.c_str(), cmd.size());
+	tcpstack.AddData(cmd.data(), cmd.size());
 
-	while( tcpstack.getPacket(cmd) && !cmd.empty())
+	while(true)
 	{
+		if (!tcpstack.getPacket(cmd) || cmd.empty())
+		{
+			size_t rc = pipe->Read(&cmd, 0);
+			if (rc > 0)
+			{
+				tcpstack.AddData(cmd.data(), cmd.size());
+				continue;
+			}
+			else
+			{
+				break;
+			}
+		}
+
 		Server->Log("ClientService cmd: "+cmd, LL_DEBUG);
 
 		bool pw_ok=false;
@@ -951,13 +1023,14 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 			}
 		}
 
-		if(!identity.empty() && ServerIdentityMgr::checkServerSessionIdentity(identity, endpoint_name))
+		std::string secret_session_key;
+		if(!identity.empty() && ServerIdentityMgr::checkServerSessionIdentity(identity, endpoint_name, secret_session_key))
 		{
 			ident_ok=true;
 		}
 		else if(!identity.empty() && ServerIdentityMgr::checkServerIdentity(identity))
 		{
-			if(!ServerIdentityMgr::hasPublicKey(identity) || crypto_fak==NULL)
+			if(!ServerIdentityMgr::hasPublicKey(identity, true) || crypto_fak==nullptr)
 			{
 				ident_ok=true;
 			}
@@ -991,13 +1064,89 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 
 		if(ident_ok) //Commands from Server
 		{
+			if (next(cmd, 0, "ENC?"))
+			{
+				str_map params;
+				ParseParamStrHttp(cmd.substr(4), &params);
+
+				std::string resp = "ok=1";
+
+				std::string client_keyadd;
+				std::string server_keyadd;
+				if (!secret_session_key.empty())
+				{
+					server_keyadd = base64_decode_dash(params["keyadd"]);
+					if (server_keyadd.empty())
+					{
+						Server->Log("Server keyadd is empty", LL_WARNING);
+						return;
+					}
+					client_keyadd.resize(16);
+					Server->randomFill(&client_keyadd[0], client_keyadd.size());
+					resp += "&keyadd=" + base64_encode_dash(client_keyadd);
+				}
+
+				tcpstack.Send(pipe, resp);
+
+				if (!secret_session_key.empty())
+				{	
+					Server->Log("Encrypting with key " + base64_encode_dash(secret_session_key + server_keyadd + client_keyadd) + " (client)");
+					InternetServicePipe2* isp = new InternetServicePipe2(pipe, secret_session_key + server_keyadd + client_keyadd);
+					isp->destroyBackendPipeOnDelete(true);
+					pipe = isp;
+					is_encrypted = true;
+				}
+
+				std::string compress = params["compress"];
+				int compression_level = watoi(params["compress_level"]);
+
+				if (compress == "zlib")
+				{
+					CompressedPipe2* comp_pipe = new CompressedPipe2(pipe, compression_level);
+					comp_pipe->destroyBackendPipeOnDelete(true);
+					pipe = comp_pipe;
+				}
+#ifndef NO_ZSTD_COMPRESSION
+				else if (compress == "zstd")
+				{
+					CompressedPipeZstd* comp_pipe = new CompressedPipeZstd(pipe, compression_level, -1);
+					comp_pipe->destroyBackendPipeOnDelete(true);
+					pipe = comp_pipe;
+
+				}
+#endif
+				else
+				{
+					Server->Log("Unknown compression method from server: \"" + compress + "\"", LL_ERROR);
+				}
+
+				continue;
+			}
+
+			if (!secret_session_key.empty()
+				&& !is_encrypted)
+			{
+				tcpstack.Send(pipe, "ERR REQUIRE ENC");
+				return;
+			}
+
 			if( cmd=="START BACKUP" || cmd=="2START BACKUP" || next(cmd, 0, "3START BACKUP") )
 			{
-				CMD_START_INCR_FILEBACKUP(cmd); continue;
+				CMD_START_INCR_FILEBACKUP(cmd, identity); continue;
 			}
 			else if( cmd=="START FULL BACKUP" || cmd=="2START FULL BACKUP" || next(cmd, 0, "3START FULL BACKUP") )
 			{
-				CMD_START_FULL_FILEBACKUP(cmd); continue;
+				CMD_START_FULL_FILEBACKUP(cmd, identity); continue;
+			}
+			else if (cmd == "FILESRV")
+			{
+				Server->Log("Start FILESRV thread");
+				Server->getThreadPool()->execute(new FileservClientThread(pipe, 
+					tcpstack.getBuffer(), tcpstack.getBuffersize()), "tfileserver");
+				state = CCSTATE_FILESERV;
+				do_quit = true;
+				want_receive = false;
+				return;
 			}
 			else if (next(cmd, 0, "WAIT FOR INDEX "))
 			{
@@ -1029,7 +1178,7 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 			}
 			else if(next(cmd, 0, "SETTINGS ") )
 			{
-				CMD_UPDATE_SETTINGS(cmd); continue;
+				CMD_UPDATE_SETTINGS(cmd, identity); continue;
 			}
 			else if(next(cmd, 0, "PING RUNNING") )
 			{
@@ -1081,7 +1230,7 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 			}
 			else if( next(cmd, 0, "FILE RESTORE "))
 			{
-				CMD_FILE_RESTORE(cmd.substr(13)); continue;
+				CMD_FILE_RESTORE(cmd.substr(13), identity); continue;
 			}
 			else if (next(cmd, 0, "CLIENT ACCESS KEY "))
 			{
@@ -1094,6 +1243,14 @@ void ClientConnector::ReceivePackets(IRunOtherCallback* p_run_other)
 			else if (next(cmd, 0, "ADD IDENTITY "))
 			{
 				CMD_ADD_IDENTITY(cmd.substr(13)); continue;
+			}
+			else if (cmd=="GET CLIENTNAME")
+			{
+				CMD_GET_CLIENTNAME(cmd); continue;
+			}
+			else if (next(cmd, 0, "FINISH LBACKUP?"))
+			{
+				CMD_FINISH_LBACKUP(cmd);
 			}
 		}
 		if(pw_ok) //Commands from client frontend
@@ -1268,22 +1425,38 @@ std::string ClientConnector::removeIllegalCharsFromBackupName(std::string in)
 	return ret;
 }
 
-bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int group_offset)
+bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int group_offset, int facet_id)
 {
 	IDatabase *db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
 	db->BeginWriteTransaction();
-	db_results backupdirs=db->Read("SELECT name, path FROM backupdirs");
+	db_results backupdirs=db->Read("SELECT name, path FROM backupdirs WHERE facet="+convert(facet_id));
 	bool all_virtual_clients = false;
 	if (args.find("all_virtual_clients") != args.end())
 	{
 		all_virtual_clients = true;
-		db->Write("DELETE FROM backupdirs WHERE symlinked=0");
+		if (!server_default)
+		{
+			db->Write("DELETE FROM backupdirs WHERE symlinked=0 AND server_default=0 AND facet="+convert(facet_id));
+		}
+		else
+		{
+			db->Write("DELETE FROM backupdirs WHERE symlinked=0 AND server_default!=2 AND facet="+convert(facet_id));
+		}
 	}
 	else
 	{
-		db->Write("DELETE FROM backupdirs WHERE symlinked=0 AND tgroup BETWEEN " + convert(group_offset) + " AND " + convert(group_offset + c_group_max));
+		if (!server_default)
+		{
+			db->Write("DELETE FROM backupdirs WHERE symlinked=0 AND server_default=0 AND tgroup BETWEEN " 
+				+ convert(group_offset) + " AND " + convert(group_offset + c_group_max)+ " AND facet="+convert(facet_id));
+		}
+		else
+		{
+			db->Write("DELETE FROM backupdirs WHERE symlinked=0 AND server_default!=2 AND tgroup BETWEEN " 
+				+ convert(group_offset) + " AND " + convert(group_offset + c_group_max)+ " AND facet="+convert(facet_id));
+		}
 	}
-	IQuery *q=db->Prepare("INSERT INTO backupdirs (name, path, server_default, optional, tgroup) VALUES (?, ? ,"+convert(server_default?1:0)+", ?, ?)");
+	IQuery *q_insert_dir=db->Prepare("INSERT INTO backupdirs (name, path, server_default, optional, tgroup, facet) VALUES (?, ? , ?, ?, ?, ?)");
 	/**
 	Use empty client settings
 	if(server_default==false)
@@ -1293,8 +1466,8 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 		q->Reset();
 	}
 	*/
-	IQuery *q2=db->Prepare("SELECT id FROM backupdirs WHERE name=?");
-	IQuery* q_get_virtual_client_offset = db->Prepare("SELECT group_offset FROM virtual_client_group_offsets WHERE virtual_client=?");
+	IQuery *q2=db->Prepare("SELECT id FROM backupdirs WHERE name=? AND facet="+convert(facet_id));
+	IQuery* q_get_virtual_client_offset = db->Prepare("SELECT group_offset FROM virtual_client_group_offsets WHERE virtual_client=? AND facet="+convert(facet_id));
 	std::string dir;
 	size_t i=0;
 	std::vector<SBackupDir> new_watchdirs;
@@ -1449,13 +1622,26 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 
 				new_watchdirs.push_back(new_dir);
 			}
+
+			int curr_server_default = 0;
+
+			if (server_default)
+			{
+				str_map::iterator server_default_arg = args.find("dir_" + convert(i) + "_server_default");
+				if (server_default_arg != args.end())
+				{
+					curr_server_default = watoi(server_default_arg->second);
+				}
+			}
 			
-			q->Bind(name);
-			q->Bind(dir);
-			q->Bind(flags);
-			q->Bind(group);
-			q->Write();
-			q->Reset();
+			q_insert_dir->Bind(name);
+			q_insert_dir->Bind(dir);
+			q_insert_dir->Bind(curr_server_default);
+			q_insert_dir->Bind(flags);
+			q_insert_dir->Bind(group);
+			q_insert_dir->Bind(facet_id);
+			q_insert_dir->Write();
+			q_insert_dir->Reset();
 		}
 		++i;
 	}
@@ -1474,15 +1660,16 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 		{
 			data.addString(new_watchdirs[i].tname);
 		}
-		IndexThread::stopIndex();
 		IndexThread::getMsgPipe()->Write(data.getDataPtr(), data.getDataSize());
 	}
 
 	IQuery* q_other_has_path = NULL;
 	if (!all_virtual_clients)
 	{
-		q_other_has_path = db->Prepare("SELECT id FROM backupdirs WHERE path=? AND tgroup NOT BETWEEN " + convert(group_offset) + " AND " + convert(group_offset + c_group_max));
+		q_other_has_path = db->Prepare("SELECT id FROM backupdirs WHERE path=? AND tgroup NOT BETWEEN " + convert(group_offset) + " AND " + convert(group_offset + c_group_max)+" AND facet="+convert(facet_id));
 	}
+
+	IQuery* q_other_facet_has_path = db->Prepare("SELECT id FROM backupdirs WHERE path=? AND facet!=" + convert(facet_id));
 
 	for(size_t i=0;i<backupdirs.size();++i)
 	{
@@ -1498,6 +1685,12 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 					continue;
 			}
 
+			q_other_facet_has_path->Bind(backupdirs[i]["path"]);
+			db_results res_other_f = q_other_facet_has_path->Read();
+			q_other_facet_has_path->Reset();
+			if (!res_other_f.empty())
+				continue;
+
 			//Delete the watch
 			CWData data;
 			data.addChar(IndexThread::IndexThreadAction_RemoveWatchdir);
@@ -1507,7 +1700,6 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 			{
 				data.addString(backupdirs[i]["name"]);
 			}
-			IndexThread::stopIndex();
 			IndexThread::getMsgPipe()->Write(data.getDataPtr(), data.getDataSize());
 		}
 	}
@@ -1592,6 +1784,17 @@ bool ClientConnector::saveBackupDirs(str_map &args, bool server_default, int gro
 		}
 	}	
 #endif
+
+	if (updateDefaultDirsSetting(db, all_virtual_clients, group_offset, args.find("enable_client_paths_use")!=args.end(), facet_id))
+	{
+		IScopedLock lock(backup_mutex);
+		for (size_t o = 0; o<channel_pipes.size(); ++o)
+		{
+			CTCPStack tmpstack(channel_pipes[o].internet_connection);
+			tmpstack.Send(channel_pipes[o].pipe, "UPDATE SETTINGS");
+		}
+	}
+
 	db->destroyAllQueries();
 	return true;
 }
@@ -1623,7 +1826,7 @@ void ClientConnector::updateLastBackup(void)
 	IDatabase *db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
 	IQuery *q=db->Prepare("UPDATE status SET last_backup=CURRENT_TIMESTAMP WHERE id=1");
 	IQuery *q2=db->Prepare("SELECT last_backup FROM status WHERE id=1");
-	if(q!=NULL && q2!=NULL)
+	if(q!=nullptr && q2!=nullptr)
 	{
 		if(q2->Read().size()>0)
 		{
@@ -1632,7 +1835,7 @@ void ClientConnector::updateLastBackup(void)
 		else
 		{
 			q=db->Prepare("INSERT INTO status (last_backup, id) VALUES (CURRENT_TIMESTAMP, 1)");
-			if(q!=NULL)
+			if(q!=nullptr)
 				q->Write();
 		}
 	}
@@ -1641,21 +1844,22 @@ void ClientConnector::updateLastBackup(void)
 
 std::vector<std::string> getSettingsList(void);
 
-void ClientConnector::updateSettings(const std::string &pData)
+void ClientConnector::updateSettings(const std::string &pData, const std::string& server_identity)
 {
 	IDatabase *db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
-	std::auto_ptr<ISettingsReader> new_settings(Server->createMemorySettingsReader(pData));
+	std::unique_ptr<ISettingsReader> new_settings(Server->createMemorySettingsReader(pData));
 
-	std::string settings_fn="urbackup/data/settings.cfg";
-	std::string settings_server_fn="urbackup/data/settings_"+conv_filename(server_token)+".cfg";
+	int facet_id = getFacetId(ServerIdentityMgr::getIdentityFromSessionIdentity(server_identity));
+	std::string facet_dir = "data_" + convert(facet_id);
+
+	std::string settings_fn="urbackup/"+ facet_dir +"/settings.cfg";
 	std::string clientsubname;
 	std::string str_group_offset;
 	int group_offset=0;
 	if(new_settings->getValue("clientsubname", &clientsubname) && !clientsubname.empty()
 		&& new_settings->getValue("filebackup_group_offset", &str_group_offset))
 	{
-		settings_fn = "urbackup/data/settings_"+conv_filename(clientsubname)+".cfg";
-		settings_server_fn = "urbackup/data/settings_"+conv_filename(clientsubname) + "_"+ conv_filename(server_token)+".cfg";
+		settings_fn = "urbackup/"+ facet_dir +"/settings_"+conv_filename(clientsubname)+".cfg";
 		group_offset = atoi(str_group_offset.c_str());
 
 		db_results res_old_client = db->Read("SELECT virtual_client FROM virtual_client_group_offsets WHERE group_offset=" + convert(group_offset));
@@ -1673,197 +1877,110 @@ void ClientConnector::updateSettings(const std::string &pData)
 		db->destroyQuery(q);
 	}
 
-	bool reset_settings = false;
-	if (new_settings->getValue("reset_client_settings", "") == "1")
+	std::string ransomware_canary_paths;
+	std::string server_token;
+	if (new_settings->getValue("ransomware_canary_paths", &ransomware_canary_paths)
+		&& !ransomware_canary_paths.empty()
+		&& new_settings->getValue("server_token", &server_token)
+		&& !server_token.empty())
 	{
-		reset_settings = true;
+		setupRansomwareCanaries(ransomware_canary_paths, server_token,
+			facet_id, group_offset);
 	}
 
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
 
-	std::vector<std::string> settings_names=getSettingsList();
-	settings_names.push_back("client_set_settings");
-	settings_names.push_back("client_set_settings_time");
-	std::string new_settings_str="";
-	bool mod=false;
-	std::string tmp_str;
-	bool client_set_settings=false;
-	if(curr_settings->getValue("client_set_settings", &tmp_str) && tmp_str=="true")
+	std::vector<std::string> critical_settings;
+	critical_settings.push_back("internet_mode_enabled");
+	critical_settings.push_back("internet_server");
+	critical_settings.push_back("internet_server_port");
+	critical_settings.push_back("internet_server_proxy");
+	critical_settings.push_back("internet_authkey");
+	critical_settings.push_back("computername");
+
+	bool mod = false;
+
+	std::string settings_add="\n";
+	for (size_t i = 0; i < critical_settings.size(); ++i)
 	{
-		if( !new_settings->getValue("allow_overwrite", &tmp_str) )
-			new_settings->getValue("allow_overwrite_def", &tmp_str);
-
-		if( tmp_str!="false" )
+		std::string curr_v;
+		std::string new_v;
+		if (curr_settings->getValue(critical_settings[i], &curr_v)
+			&& !new_settings->getValue(critical_settings[i], &new_v) )
 		{
-			client_set_settings=true;
+			settings_add += critical_settings[i] + "=" + curr_v + "\n";
+			mod = true;
+		}
+		else if (curr_v != new_v && new_v.empty()
+			&& critical_settings[i] != "internet_server_proxy")
+		{
+			settings_add += critical_settings[i] + "=" + curr_v + "\n";
+			mod = true;
 		}
 	}
 
-	std::vector<std::string> only_server_settings_names;
-	if (client_set_settings)
+
+	int default_dirs_use = new_settings->getValue("default_dirs.use", 0);
+	std::vector<std::string> default_dirs_toks;
+	size_t default_dirs_client_off = std::string::npos;
+
+	if (default_dirs_use & c_use_group)
 	{
-		only_server_settings_names = getOnlyServerClientSettingsList();
+		std::string val;
+		Tokenize(new_settings->getValue("default_dirs.group", ""), default_dirs_toks, ";");
+	}
+	if (default_dirs_use & c_use_value)
+	{
+		std::string val;
+		std::vector<std::string> toks;
+		Tokenize(new_settings->getValue("default_dirs.home", ""), toks, ";");
+		default_dirs_toks.insert(default_dirs_toks.end(), toks.begin(), toks.end());
+	}
+	if (default_dirs_use & c_use_value_client)
+	{
+		std::string val;
+		std::vector<std::string> toks;
+		Tokenize(new_settings->getValue("default_dirs.client", ""), toks, ";");
+		default_dirs_client_off = default_dirs_toks.size();
+		default_dirs_toks.insert(default_dirs_toks.end(), toks.begin(), toks.end());
 	}
 
-	for(size_t i=0;i<settings_names.size();++i)
+	if(!default_dirs_toks.empty())
 	{
-		std::string key=settings_names[i];
-
-		std::string v;
-		std::string def_v;
-		curr_settings->getValue(key+"_def", def_v);
-
-		if(reset_settings
-			|| !curr_settings->getValue(key, &v) )
+		str_map args;
+		for(size_t i=0;i<default_dirs_toks.size();++i)
 		{
-			std::string nv;
-			std::string new_key;
-			if(new_settings->getValue(key, &nv) )
+			std::string path = UnescapeParamString(trim(default_dirs_toks[i]));
+			std::string name;
+			int group = c_group_default;
+			if(path.find("|")!=std::string::npos)
 			{
-				if (nv.empty()
-					&& reset_settings
-					&& key == "computername"
-					&& curr_settings->getValue(key, &v) )
+				std::vector<std::string> toks;
+				Tokenize(path, toks, "|");
+				path = toks[0];
+				name = toks[1];
+				if(toks.size()>2)
 				{
-					new_settings_str += key + "=" + v + "\n";
-					mod = true;
-				}
-				else
-				{
-					new_settings_str += key + "=" + nv + "\n";
-					mod = true;
+					group = (std::min)(c_group_max, (std::max)(0, watoi(toks[2])));
 				}
 			}
-			if(new_settings->getValue(key+"_def", &nv) )
-			{
-				if (nv.empty()
-					&& reset_settings
-					&& key == "computername"
-					&& curr_settings->getValue(key + "_def", &v))
-				{
-					new_settings_str += key + "_def=" + v + "\n";
-					mod = true;
-				}
-				else
-				{
-					new_settings_str += key + "_def=" + nv + "\n";
-					if (reset_settings
-						|| nv != def_v)
-					{
-						mod = true;
-					}
-				}
-			}	
-		}
-		else
-		{
-			if(client_set_settings)
-			{
-				std::string orig_v;
-				std::string nv;
-				if( ( (new_settings->getValue(key+"_orig", &orig_v) &&
-					   orig_v==v )
-					   || std::find(only_server_settings_names.begin(), only_server_settings_names.end(),
-						            key) != only_server_settings_names.end() )
-					 && (new_settings->getValue(key, &nv) ||
-					  new_settings->getValue(key+"_def", &nv) ) 
-				   )
-				{
-					new_settings_str+=key+"="+nv+"\n";
-					if(nv!=v)
-					{
-						mod=true;
-					}
-				}
-				else
-				{
-					new_settings_str+=key+"="+v+"\n";
-				}
-			}
-			else
-			{
-				std::string nv;
-				if(new_settings->getValue(key, &nv) )
-				{
-					if( (key=="internet_server" || key=="internet_server_def") && nv.empty() && !v.empty()
-						|| (key=="computername" || key=="computername_def" ) && nv.empty() && !v.empty())
-					{
-						new_settings_str+=key+"="+v+"\n";
-					}
-					else
-					{
-						new_settings_str+=key+"="+nv+"\n";
-						if(v!=nv)
-						{
-							mod=true;
-						}
-					}
-				}
-				else if( (key == "internet_server" || key == "internet_server_def") && !v.empty()
-					|| (key == "computername" || key == "computername_def") && !v.empty())
-				{
-					new_settings_str+=key+"="+v+"\n";
-				}
+			args["dir_"+convert(i)]=path;
+			if(!name.empty())
+				args["dir_"+convert(i)+"_name"]=name;
 
-				if(new_settings->getValue(key+"_def", &nv) )
-				{
-					new_settings_str+=key+"_def="+nv+"\n";
-					if(nv!=def_v)
-					{
-						mod=true;
-					}
-				}
-			}
+			args["dir_"+convert(i)+"_group"]=convert(group);
+			args["dir_" + convert(i) + "_server_default"] = convert(i>= default_dirs_client_off ? 0 : 1);
 		}
+
+		saveBackupDirs(args, true, group_offset, facet_id);
 	}
 
-	IQuery *q=db->Prepare("SELECT id FROM backupdirs WHERE server_default=0 AND tgroup=?", false);
-	q->Bind(group_offset);
-	db_results res=q->Read();
-	db->destroyQuery(q);
-	if(res.empty())
+	if(mod
+		|| getFile(settings_fn)!= pData)
 	{
-		std::string default_dirs;
-		if(!new_settings->getValue("default_dirs", &default_dirs) )
-			new_settings->getValue("default_dirs_def", &default_dirs);
-
-		if(!default_dirs.empty())
-		{
-			std::vector<std::string> def_dirs_toks;
-			Tokenize(default_dirs, def_dirs_toks, ";");
-			str_map args;
-			for(size_t i=0;i<def_dirs_toks.size();++i)
-			{
-				std::string path=trim(def_dirs_toks[i]);
-				std::string name;
-				int group = c_group_default;
-				if(path.find("|")!=std::string::npos)
-				{
-					std::vector<std::string> toks;
-					Tokenize(path, toks, "|");
-					path = toks[0];
-					name = toks[1];
-					if(toks.size()>2)
-					{
-						group = (std::min)(c_group_max, (std::max)(0, watoi(toks[2])));
-					}
-				}
-				args["dir_"+convert(i)]=path;
-				if(!name.empty())
-					args["dir_"+convert(i)+"_name"]=name;
-
-				args["dir_"+convert(i)+"_group"]=convert(group);
-			}
-
-			saveBackupDirs(args, true, group_offset);
-		}
-	}
-
-	if(mod)
-	{
-		std::auto_ptr<IFile> newf(Server->openFile(settings_fn + ".new", MODE_WRITE));
-		if (newf.get() != NULL
-			&& newf->Write(new_settings_str) == new_settings_str.size()
+		std::unique_ptr<IFile> newf(Server->openFile(settings_fn + ".new", MODE_WRITE));
+		if (newf.get() != nullptr
+			&& newf->Write(pData+ settings_add) == pData.size()+settings_add.size()
 			&& newf->Sync())
 		{
 			newf.reset();
@@ -1875,63 +1992,21 @@ void ClientConnector::updateSettings(const std::string &pData)
 		data.addChar(IndexThread::IndexThreadAction_UpdateCbt);
 		IndexThread::getMsgPipe()->Write(data.getDataPtr(), data.getDataSize());
 	}
-
-	std::auto_ptr<ISettingsReader> curr_server_settings(Server->createFileSettingsReader(settings_server_fn));
-	std::vector<std::string> global_settings = getGlobalizedSettingsList();
-
-	std::string new_token_settings="";
-
-	bool mod_server_settings=false;
-	for(size_t i=0;i<global_settings.size();++i)
-	{
-		std::string key=global_settings[i];
-
-		std::string v;
-		bool curr_v=curr_server_settings->getValue(key, &v);
-		std::string nv;
-		bool new_v=new_settings->getValue(key, &nv);
-
-		if(reset_settings
-			|| (!curr_v && new_v) )
-		{
-			new_token_settings+=key+"="+nv;
-			mod_server_settings=true;
-		}
-		else if(curr_v)
-		{
-			if(new_v)
-			{
-				new_token_settings+=key+"="+nv;
-
-				if(nv!=v)
-				{
-					mod_server_settings=true;
-				}
-			}
-			else
-			{
-				new_token_settings+=key+"="+v;
-			}
-		}
-	}
-
-	if(mod_server_settings)
-	{
-		std::auto_ptr<IFile> newf(Server->openFile(settings_server_fn + ".new", MODE_WRITE));
-		if (newf.get() != NULL
-			&& newf->Write(new_token_settings)==new_token_settings.size()
-			&& newf->Sync() )
-		{
-			newf.reset();
-			os_rename_file(settings_server_fn + ".new",
-				settings_server_fn);
-		}
-	}
 }
 
 void ClientConnector::replaceSettings(const std::string &pData)
 {
-	std::auto_ptr<ISettingsReader> new_settings(Server->createMemorySettingsReader(pData));
+	std::unique_ptr<ISettingsReader> new_settings(Server->createMemorySettingsReader(pData));
+
+	std::string facet_name = new_settings->getValue("facet_name", "default");
+
+	int facet_id = getFacetIdByName(facet_name);
+
+	if (facet_id == 0)
+	{
+		Server->Log("Facet \"" + facet_name + "\" not found. Cannot update settings.", LL_ERROR);
+		return;
+	}
 
 	std::string ncname=new_settings->getValue("computername", "");
 	if(!ncname.empty() && ncname!=IndexThread::getFileSrv()->getServerName())
@@ -1939,25 +2014,23 @@ void ClientConnector::replaceSettings(const std::string &pData)
 		Server->Log("Restarting filesrv because of name change. Old name: " + IndexThread::getFileSrv()->getServerName() + " New name: " + ncname, LL_DEBUG);
 
 		CWData data;
-		data.addChar(7);
+		data.addChar(IndexThread::IndexThreadAction_RestartFilesrv);
 		data.addUInt(0);
 		IndexThread::getMsgPipe()->Write(data.getDataPtr(), data.getDataSize());
 	}
 
-	bool keep_old_settings = (new_settings->getValue("keep_old_settings", "")=="true");
-
-	std::string settings_fn="urbackup/data/settings.cfg";
+	std::string settings_fn="urbackup/data_"+convert(facet_id )+"/settings.cfg";
 	std::string clientsubname;
 	if(new_settings->getValue("clientsubname", &clientsubname) && !clientsubname.empty())
 	{
-		settings_fn = "urbackup/data/settings_"+conv_filename(clientsubname)+".cfg";
+		settings_fn = "urbackup/data_"+convert(facet_id)+"/settings_"+conv_filename(clientsubname)+".cfg";
 	}
 
-	std::auto_ptr<ISettingsReader> old_settings(Server->createFileSettingsReader(settings_fn));
+	std::unique_ptr<ISettingsReader> old_settings(Server->createFileSettingsReader(settings_fn));
 
 	std::vector<std::string> new_keys = new_settings->getKeys();
 	bool modified_settings=true;
-	if(old_settings.get()!=NULL)
+	if(old_settings.get()!=nullptr)
 	{
 		modified_settings=false;
 		std::vector<std::string> old_keys = old_settings->getKeys();
@@ -1995,11 +2068,6 @@ void ClientConnector::replaceSettings(const std::string &pData)
 
 		for(size_t i=0;i<new_keys.size();++i)
 		{
-			if(new_keys[i]=="client_set_settings" ||
-				new_keys[i]=="client_set_settings_time" ||
-				new_keys[i]=="keep_old_settings" )
-				continue;
-
 			std::string val;
 			if(new_settings->getValue(new_keys[i], &val))
 			{
@@ -2007,7 +2075,7 @@ void ClientConnector::replaceSettings(const std::string &pData)
 			}
 		}
 
-		if (keep_old_settings && old_settings.get() != NULL)
+		if (old_settings.get() != nullptr)
 		{
 			std::vector<std::string> old_keys = old_settings->getKeys();
 
@@ -2025,9 +2093,6 @@ void ClientConnector::replaceSettings(const std::string &pData)
 		}
 
 		InternetClient::updateSettings();
-
-		new_data+="client_set_settings=true\n";
-		new_data+="client_set_settings_time="+convert(Server->getTimeSeconds())+"\n";
 
 		writestring(new_data, settings_fn);
 
@@ -2125,29 +2190,34 @@ void ClientConnector::getLogLevel(int logid, int loglevel, std::string &data)
 bool ClientConnector::sendFullImage(void)
 {
 	image_inf.thread_action=TA_FULL_IMAGE;
-	image_inf.image_thread=new ImageThread(this, pipe, curr_result_id, &image_inf, server_token, hashdatafile, NULL);
+	image_inf.image_thread=new ImageThread(this, pipe, curr_result_id, &image_inf, server_token, hashdatafile, nullptr);
 
 	IScopedLock lock(backup_mutex);
 
-	SRunningProcess* cproc = getRunningBackupProcess(server_token, image_inf.server_status_id);
-	if (cproc != NULL
-		&& cproc->action == RUNNING_FULL_IMAGE)
 	{
-		local_backup_running_id = cproc->id;
-		cproc->last_pingtime = Server->getTimeMS();
-	}
-	else
-	{
-		SRunningProcess new_proc;
-		new_proc.action = RUNNING_FULL_IMAGE;
-		new_proc.server_token = server_token;
-		new_proc.pcdone = 0;
-		new_proc.details = image_inf.orig_image_letter;
-		new_proc.server_id = image_inf.server_status_id;
-		local_backup_running_id = addNewProcess(new_proc);
-	}
+		IScopedLock process_lock(process_mutex);
+		SRunningProcess* cproc = getRunningBackupProcess(server_token, image_inf.server_status_id);
+		if (cproc != nullptr
+			&& cproc->action == RUNNING_FULL_IMAGE)
+		{
+			local_backup_running_id = cproc->id;
+			cproc->last_pingtime = Server->getTimeMS();
+			++cproc->refs;
+		}
+		else
+		{
+			SRunningProcess new_proc;
+			new_proc.action = RUNNING_FULL_IMAGE;
+			new_proc.server_token = server_token;
+			new_proc.pcdone = 0;
+			new_proc.details = image_inf.orig_image_letter;
+			new_proc.server_id = image_inf.server_status_id;
+			new_proc.refs = 1;
+			local_backup_running_id = addNewProcess(new_proc);
+		}
 
-	removeTimedOutProcesses(server_token, false);
+		removeTimedOutProcesses(server_token, false);
+	}
 
 	status_updated = true;
 	image_inf.running_process_id = local_backup_running_id;
@@ -2164,26 +2234,30 @@ bool ClientConnector::sendIncrImage(void)
 
 	IScopedLock lock(backup_mutex);
 
-	SRunningProcess* cproc = getRunningBackupProcess(server_token, image_inf.server_status_id);
-	if (cproc != NULL
-		&& cproc->action == RUNNING_INCR_IMAGE )
 	{
-		local_backup_running_id = cproc->id;
-		cproc->last_pingtime = Server->getTimeMS();
-	}
-	else
-	{
-		SRunningProcess new_proc;
-		new_proc.action = RUNNING_INCR_IMAGE;
-		new_proc.server_token = server_token;
-		new_proc.pcdone = 0;
-		new_proc.details = image_inf.orig_image_letter;
-		new_proc.server_id = image_inf.server_status_id;
+		IScopedLock process_lock(process_mutex);
 
-		local_backup_running_id = addNewProcess(new_proc);
-	}
+		SRunningProcess* cproc = getRunningBackupProcess(server_token, image_inf.server_status_id);
+		if (cproc != nullptr
+			&& cproc->action == RUNNING_INCR_IMAGE)
+		{
+			local_backup_running_id = cproc->id;
+			cproc->last_pingtime = Server->getTimeMS();
+		}
+		else
+		{
+			SRunningProcess new_proc;
+			new_proc.action = RUNNING_INCR_IMAGE;
+			new_proc.server_token = server_token;
+			new_proc.pcdone = 0;
+			new_proc.details = image_inf.orig_image_letter;
+			new_proc.server_id = image_inf.server_status_id;
 
-	removeTimedOutProcesses(server_token, false);
+			local_backup_running_id = addNewProcess(new_proc);
+		}
+
+		removeTimedOutProcesses(server_token, false);
+	}
 
 	status_updated = true;
 	image_inf.running_process_id = local_backup_running_id;
@@ -2200,9 +2274,270 @@ bool ClientConnector::waitForThread(void)
 		return false;
 }
 
+namespace
+{
+	bool parseDevicePartNumber(const std::string& volfn, std::string& dev, int& DeviceNumber, int& PartNumber)
+	{
+		if (next(volfn, 0, "/dev/mapper/")
+			|| next(volfn, 0, "/dev/dm-") )
+		{
+			std::string dm_table;
+			//TODO: Use ioctl here
+			if (os_popen("dmsetup table \"" + greplace("\"", "_", volfn) + "\"", dm_table)==0)
+			{
+				std::vector<std::string> toks;
+				Tokenize(trim(dm_table), toks, " ");
+				std::string back_dev;
+				if (toks.size() > 2)
+				{
+					if (toks[2] == "linear"
+						&& toks.size()>3)
+					{
+						back_dev = toks[3];
+					}
+					else if (toks[2] == "era"
+						&& toks.size() > 4)
+					{
+						back_dev = toks[4];
+					}
+					else if (toks[2] == "snapshot-origin"
+						&& toks.size()>3)
+					{
+						back_dev = toks[3];
+					}
+					else
+					{
+						Server->Log("Cannot follow device mapping " + toks[2], LL_WARNING);
+					}
+				}
+				else
+				{
+					Server->Log("Cannot parse device mapper table \"" + dm_table + "\"", LL_WARNING);
+				}
+
+				if (!back_dev.empty())
+				{
+					Server->Log("Following device mapping ("+toks[2]+") to device "+back_dev, LL_DEBUG);
+
+					std::string uevent_info = getFile("/sys/dev/block/" + back_dev + "/uevent");
+					std::string dev_name = getbetween("DEVNAME=", "\n", uevent_info);
+
+					if (FileExists("/dev/" + dev_name))
+					{
+						Server->Log("Device name /dev/"+dev_name, LL_DEBUG);
+
+						return parseDevicePartNumber("/dev/" + dev_name, dev, DeviceNumber, PartNumber);
+					}
+					else
+					{
+						Server->Log("Could not find device name of device "+back_dev, LL_WARNING);
+					}
+				}
+			}
+		}
+
+		std::string dl_devnum;
+		const char* const devnames[] = { "sd", "xvd", "vd", "hd", "loop", "nvme", "nbd", nullptr };
+
+		for (const char* const * devname = devnames; *devname != nullptr; ++devname)
+		{
+			if (next(volfn, 0, std::string("/dev/") + *devname))
+			{
+				dl_devnum = getafter(std::string("/dev/") + *devname, volfn);
+				dev = std::string("/dev/") + *devname;
+				break;
+			}
+		}
+
+		if (dl_devnum.empty())
+		{
+			DeviceNumber = -1;
+			PartNumber = -1;
+			return false;
+		}
+
+		Server->Log("dl_devnum=" + dl_devnum, LL_DEBUG);
+
+		int state = 0;
+		int devnum = -1;
+		std::string data;
+		std::vector<int> nums;
+		for (size_t i = 0; i <= dl_devnum.size(); ++i)
+		{
+			char ch = 0;
+			if (i < dl_devnum.size())
+				ch = dl_devnum[i];
+
+			if (state == 0)
+			{
+				if (str_isnumber(ch))
+				{
+					state = 1;
+					data += ch;
+					dev += ch;
+				}
+				else
+				{
+					state = 2;
+					if (ch != 0)
+					{
+						dev += ch;
+						devnum = tolower(ch) - 'a';
+					}
+				}
+			}
+			else if (state == 1)
+			{
+				if (str_isnumber(ch))
+				{
+					data += ch;
+				}
+				else
+				{
+					if (ch != 'n')
+					{
+						nums.push_back(watoi(data));
+					}
+					else
+					{
+						dev += ch;
+					}
+					data.clear();
+
+					if (ch == 'p')
+					{
+						state = 1;
+					}
+					else
+					{
+						state = 0;
+					}
+				}
+			}
+			else if (state == 2)
+			{
+				if (str_isnumber(ch))
+				{
+					data += ch;
+					state = 1;
+				}
+				else if (ch != 0)
+				{
+					dev += ch;
+					devnum = (devnum+1) * ('z' - 'a') + tolower(ch) - 'a';
+				}
+			}
+		}
+
+		if (devnum != -1)
+		{
+			DeviceNumber = devnum;
+			PartNumber = -1;
+
+			if (!nums.empty())
+			{
+				PartNumber = nums[0];
+			}
+
+			if (nums.size() > 1)
+			{
+				return false;
+			}			
+		}
+		else
+		{
+			if (nums.empty())
+				return false;
+
+			DeviceNumber = nums[0];
+			PartNumber = -1;
+
+			if (nums.size() > 1)
+			{
+				PartNumber = nums[1];
+			}
+
+			if (nums.size() > 2)
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool check_partition_used(IFile* dev, int64 offset, int64 length)
+	{
+		bool gpt_style2;
+		std::vector<IFSImageFactory::SPartition> parts = image_fak->readPartitions(dev, gpt_style2);
+
+		for (size_t i = 0; i < parts.size(); ++i)
+		{
+			if ((offset >= parts[i].offset
+				&& offset < parts[i].offset + parts[i].length)
+				|| (offset + length >= parts[i].offset
+					&& offset + length < parts[i].offset + parts[i].length))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+}
+
+void parse_devnum_test()
+{
+	int deviceNumber, partNumber;
+	std::string dev;
+	assert(parseDevicePartNumber("/dev/sda1", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 0);
+	assert(partNumber == 1);
+	assert(dev == "/dev/sda");
+	assert(parseDevicePartNumber("/dev/xvda1", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 0);
+	assert(partNumber == 1);
+	assert(dev == "/dev/xvda");
+	assert(parseDevicePartNumber("/dev/xvdc1", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 2);
+	assert(partNumber == 1);
+	assert(dev == "/dev/xvdc");
+	assert(parseDevicePartNumber("/dev/xvdc3", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 2);
+	assert(partNumber == 3);
+	assert(dev == "/dev/xvdc");
+	assert(parseDevicePartNumber("/dev/nvme0n1p1", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 1);
+	assert(partNumber == 1);
+	assert(dev == "/dev/nvme0n1");
+	assert(parseDevicePartNumber("/dev/nvme0n5p8", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 5);
+	assert(partNumber == 8);
+	assert(dev == "/dev/nvme0n5");
+	assert(parseDevicePartNumber("/dev/loop0", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 0);
+	assert(partNumber == -1);
+	assert(dev == "/dev/loop0");
+	assert(parseDevicePartNumber("/dev/sda", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 0);
+	assert(partNumber == -1);
+	assert(dev == "/dev/sda");
+	assert(parseDevicePartNumber("/dev/sdc", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 2);
+	assert(partNumber == -1);
+	assert(dev == "/dev/sdc");
+	assert(parseDevicePartNumber("/dev/sdaa", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 25);
+	assert(partNumber == -1);
+	assert(dev == "/dev/sdaa");
+	assert(parseDevicePartNumber("/dev/loop2p3", dev, deviceNumber, partNumber));
+	assert(deviceNumber == 2);
+	assert(partNumber == 3);
+	assert(dev == "/dev/loop2");
+}
+
 bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 {
-#ifdef _WIN32
 #pragma pack(push)
 #pragma pack(1)
 	struct EfiHeader
@@ -2225,7 +2560,10 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 #pragma pack(pop)
 
 	const uint64 gpt_magic = 0x5452415020494645ULL;
+	bool gpt_style = false;
+	unsigned int logical_sector_size = 512;
 
+#ifdef _WIN32
 	std::string vpath=dl;
 	if(!vpath.empty() && vpath[0]!='\\')
 	{
@@ -2239,10 +2577,7 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 		errmsg="CreateFile of volume '"+dl+"' failed. - sendMBR. Errorcode: "+convert((int)GetLastError());
 		Server->Log(errmsg, LL_ERROR);
 		return false;
-	}
-
-	bool gpt_style=false;
-	unsigned int logical_sector_size=512;
+	}	
 
 	STORAGE_DEVICE_NUMBER dev_num;
 	DWORD ret_bytes;
@@ -2257,7 +2592,7 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 	}
 
 	{
-		std::auto_ptr<VOLUME_DISK_EXTENTS> vde((VOLUME_DISK_EXTENTS*)new char[sizeof(VOLUME_DISK_EXTENTS)]);
+		std::unique_ptr<VOLUME_DISK_EXTENTS> vde((VOLUME_DISK_EXTENTS*)new char[sizeof(VOLUME_DISK_EXTENTS)]);
 		b=DeviceIoControl(hVolume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, vde.get(), sizeof(VOLUME_DISK_EXTENTS), &ret_bytes, NULL);
 		if(b==0 && GetLastError()==ERROR_MORE_DATA)
 		{
@@ -2297,7 +2632,7 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 			DWORD numPartitions=10;
 			DWORD inf_size=sizeof(DRIVE_LAYOUT_INFORMATION_EX)+sizeof(PARTITION_INFORMATION_EX)*(numPartitions-1);
 
-			std::auto_ptr<DRIVE_LAYOUT_INFORMATION_EX> inf((DRIVE_LAYOUT_INFORMATION_EX*)new char[sizeof(DRIVE_LAYOUT_INFORMATION_EX)+sizeof(PARTITION_INFORMATION_EX)*(numPartitions-1)]);
+			std::unique_ptr<DRIVE_LAYOUT_INFORMATION_EX> inf((DRIVE_LAYOUT_INFORMATION_EX*)new char[sizeof(DRIVE_LAYOUT_INFORMATION_EX)+sizeof(PARTITION_INFORMATION_EX)*(numPartitions-1)]);
 
 			b=DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, inf.get(), inf_size, &ret_bytes, NULL);
 			while(b==0 && GetLastError()==ERROR_INSUFFICIENT_BUFFER && numPartitions<1000)
@@ -2413,15 +2748,54 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 		return false;
 	}
 
+	std::string fi_serial = convert((_i64)voln_sern);
+	std::string volume_name = Server->ConvertFromWchar(voln);
+	std::string fi_name = Server->ConvertFromWchar(fsn);
+#else //_WIN32
+	struct
+	{
+		int DeviceNumber;
+		int PartitionNumber;
+	} dev_num;
+
+	std::string dev_fn;
+	parseDevicePartNumber(dl, dev_fn, dev_num.DeviceNumber, dev_num.PartitionNumber);
+
+	IFile* dev = Server->openFile(dev_fn, MODE_READ_DEVICE);
+	if (dev == nullptr)
+	{
+		errmsg = "Error opening Device " + dev_fn + ". " + os_last_error_str();
+		Server->Log(errmsg, LL_ERROR);
+		return false;
+	}
+
+	std::string gpt_header = dev->Read(512LL, 512, nullptr);
+
+	if (next(gpt_header, 0, "EFI PART"))
+	{
+		Server->Log("gpt_style=true", LL_DEBUG);
+		gpt_style = true;
+	}
+
+	std::string blkid;
+	os_popen("blkid \"" + dl + "\" -o export", blkid);
+	std::string fi_serial = trim(getbetween("UUID=", "\n", blkid));
+	std::string volume_name = "LINUX:"+dl;
+	std::string fi_name = trim(getbetween("PARTLABEL=", "\n", blkid));
+	if(fi_name.empty())
+		fi_name= trim(getbetween("TYPE=", "\n", blkid));
+#endif
+
 	CWData mbr;
 	mbr.addChar(1);
 	mbr.addChar(gpt_style?1:0);
 	mbr.addInt(dev_num.DeviceNumber);
 	mbr.addInt(dev_num.PartitionNumber);
-	mbr.addString(convert((_i64)voln_sern));
-	mbr.addString(Server->ConvertFromWchar(voln));
-	mbr.addString(Server->ConvertFromWchar(fsn));
+	mbr.addString(fi_serial);
+	mbr.addString(volume_name);
+	mbr.addString(fi_name);
 
+#ifdef _WIN32
 	IFile *dev=Server->openFile("\\\\.\\PhysicalDrive"+convert((int)dev_num.DeviceNumber), MODE_READ_DEVICE);
 
 	if(dev==NULL)
@@ -2430,7 +2804,9 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 		Server->Log(errmsg, LL_ERROR);
 		return false;
 	}
+#endif
 
+	dev->Seek(0);
 	std::string mbr_bytes=dev->Read(512);
 
 	mbr.addString(mbr_bytes);
@@ -2446,23 +2822,23 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 			return false;
 		}
 
-		std::string gpt_header = dev->Read(logical_sector_size);
+		std::string primary_gpt_header = dev->Read(logical_sector_size);
 
-		if(gpt_header.size()!=logical_sector_size)
+		if(primary_gpt_header.size()!=logical_sector_size)
 		{
 			errmsg="Error reading GPT header "+convert((int)dev_num.DeviceNumber);
 			Server->Log(errmsg, LL_ERROR);
 			return false;
 		}
 
-		if(gpt_header.size()<sizeof(EfiHeader))
+		if(primary_gpt_header.size()<sizeof(EfiHeader))
 		{
 			errmsg="GPT header too small "+convert((int)dev_num.DeviceNumber);
 			Server->Log(errmsg, LL_ERROR);
 			return false;
 		}
 
-		const EfiHeader* gpt_header_s = reinterpret_cast<const EfiHeader*>(gpt_header.data());
+		const EfiHeader* gpt_header_s = reinterpret_cast<const EfiHeader*>(primary_gpt_header.data());
 
 		if(gpt_header_s->signature!=gpt_magic)
 		{
@@ -2472,10 +2848,10 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 		}
 
 		mbr.addInt64(logical_sector_size);
-		mbr.addString(gpt_header);
+		mbr.addString(primary_gpt_header);
 
-		int64 paritition_table_pos = gpt_header_s->partition_table_lba*logical_sector_size;
-		if(!dev->Seek(paritition_table_pos))
+		int64 primary_paritition_table_pos = gpt_header_s->partition_table_lba*logical_sector_size;
+		if(!dev->Seek(primary_paritition_table_pos))
 		{
 			errmsg="Error seeking in device to GPT partition table "+convert((int)dev_num.DeviceNumber)+". "+ os_last_error_str();
 			Server->Log(errmsg, LL_ERROR);
@@ -2483,101 +2859,122 @@ bool ClientConnector::sendMBR(std::string dl, std::string &errmsg)
 		}
 
 		_u32 toread = gpt_header_s->num_parition_entries*gpt_header_s->partition_entry_size;
-		std::string gpt_table = dev->Read(toread);
+		std::string primary_gpt_table = dev->Read(toread);
 
 		Server->Log("GUID partition table size is "+PrettyPrintBytes(toread), LL_DEBUG);
 
-		if(gpt_table.size()!=toread)
+		if(primary_gpt_table.size()!=toread)
 		{
 			errmsg="Error reading GPT partition table "+convert((int)dev_num.DeviceNumber)+". "+ os_last_error_str();
 			Server->Log(errmsg, LL_ERROR);
 			return false;
 		}
 
-		mbr.addInt64(paritition_table_pos);
-		mbr.addString(gpt_table);
+		mbr.addInt64(primary_paritition_table_pos);
+		mbr.addString(primary_gpt_table);
 
 		// BACKUP HEADER
 		int64 backup_gpt_location = gpt_header_s->backup_lba*logical_sector_size;
+		std::string backup_gpt_header;
 		if(!dev->Seek(backup_gpt_location))
 		{
 			errmsg="Error seeking in device to backup GPT header "+convert((int)dev_num.DeviceNumber)+" at "+convert(backup_gpt_location)+". "+ os_last_error_str();
 			Server->Log(errmsg, LL_WARNING);
+
 			backup_gpt_location = logical_sector_size;
+			backup_gpt_header = primary_gpt_header;
 		}
 		else
 		{
-			std::string backup_gpt_header = dev->Read(logical_sector_size);
+			backup_gpt_header = dev->Read(logical_sector_size);
 
 			if (backup_gpt_header.size() != logical_sector_size)
 			{
 				errmsg = "Error reading backup GPT header " + convert((int)dev_num.DeviceNumber) + " at " + convert(backup_gpt_location);
 				Server->Log(errmsg, LL_WARNING);
+
 				backup_gpt_location = logical_sector_size;
-			}
-			else
-			{
-				gpt_header = backup_gpt_header;
+				backup_gpt_header = primary_gpt_header;
 			}
 		}
 
-		if(gpt_header.size()<sizeof(EfiHeader))
+		if(backup_gpt_header.size()<sizeof(EfiHeader))
 		{
 			errmsg="Backup GPT header too small "+convert((int)dev_num.DeviceNumber);
-			Server->Log(errmsg, LL_ERROR);
-			return false;
+			Server->Log(errmsg, LL_WARNING);
+
+			backup_gpt_location = logical_sector_size;
+			backup_gpt_header = primary_gpt_header;
 		}
 
-		const EfiHeader* backup_gpt_header_s = reinterpret_cast<const EfiHeader*>(gpt_header.data());
+		const EfiHeader* backup_gpt_header_s = reinterpret_cast<const EfiHeader*>(backup_gpt_header.data());
 
 		if(backup_gpt_header_s->signature!=gpt_magic)
 		{
 			errmsg="Backup GPT magic wrong "+convert((int)dev_num.DeviceNumber);
-			Server->Log(errmsg, LL_ERROR);
-			return false;
+			Server->Log(errmsg, LL_WARNING);
+
+			backup_gpt_location = logical_sector_size;
+			backup_gpt_header = primary_gpt_header;
+			backup_gpt_header_s = reinterpret_cast<const EfiHeader*>(backup_gpt_header.data());
 		}
 
 		mbr.addInt64(backup_gpt_location);
-		mbr.addString(gpt_header);
+		mbr.addString(backup_gpt_header);
 
-		paritition_table_pos = backup_gpt_header_s->partition_table_lba*logical_sector_size;
-		if(!dev->Seek(paritition_table_pos))
+		int64 backup_paritition_table_pos = backup_gpt_header_s->partition_table_lba*logical_sector_size;
+		if(!dev->Seek(backup_paritition_table_pos))
 		{
 			errmsg="Error seeking in device to GPT partition table "+convert((int)dev_num.DeviceNumber)+". "+ os_last_error_str();
-			Server->Log(errmsg, LL_ERROR);
-			return false;
+			Server->Log(errmsg, LL_WARNING);
+			
+			backup_paritition_table_pos = primary_paritition_table_pos;
+			dev->Seek(backup_paritition_table_pos);
 		}
 
 		toread = backup_gpt_header_s->num_parition_entries*backup_gpt_header_s->partition_entry_size;
-		gpt_table = dev->Read(toread);
+		std::string backup_gpt_table = dev->Read(toread);
 
-		if(gpt_table.size()!=toread)
+		if(backup_gpt_table.size()!=toread)
 		{
 			errmsg="Error reading GPT partition table "+convert((int)dev_num.DeviceNumber)+". "+ os_last_error_str();
-			Server->Log(errmsg, LL_ERROR);
-			return false;
+			Server->Log(errmsg, LL_WARNING);
+			
+			backup_paritition_table_pos = primary_paritition_table_pos;
+			backup_gpt_table = primary_gpt_table;
 		}
 
-		mbr.addInt64(paritition_table_pos);
-		mbr.addString(gpt_table);
+		mbr.addInt64(backup_paritition_table_pos);
+		mbr.addString(backup_gpt_table);
 	}
 	
 	mbr.addString(errmsg);
 
 	if (!gpt_style
-		&& mbr_bytes.find("VeraCrypt Boot Loader") != std::string::npos)
+		&& mbr_bytes.find("VeraCrypt Boot Loader") != std::string::npos
+		&& !check_partition_used(dev, 512, 63*512) )
 	{
 		std::string veracrypt_data = dev->Read(512LL, 63 * 512);
 		mbr.addVarInt(512);
 		mbr.addString2(veracrypt_data);
 	}
+	else if (!gpt_style
+		&& mbr_bytes.find("GRUB") != std::string::npos
+		&& !check_partition_used(dev, 512, 63 * 512) )
+	{
+		std::string grub_stage_1_5 = dev->Read(512LL, 63 * 512);
+		if (grub_stage_1_5.find("Geom") != std::string::npos
+			&& grub_stage_1_5.find("Read") != std::string::npos
+			&& grub_stage_1_5.find("Error") != std::string::npos)
+		{
+			mbr.addVarInt(512);
+			mbr.addString2(grub_stage_1_5);
+		}
+	}
 
 	tcpstack.Send(pipe, mbr);
 
 	return true;
-#else //_WIN32
-	return false;
-#endif
 }
 
 const int64 receive_timeouttime=60000;
@@ -2626,8 +3023,6 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 		return;
 	}
 
-	int l_pcdone=0;
-
 	{
 		IScopedLock lock(backup_mutex);
 		SRunningProcess new_proc;
@@ -2646,6 +3041,12 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 	for(size_t i=0;i<channel_pipes.size();++i)
 	{
 		SChannel::EChannelState orig_state = channel_pipes[i].state;
+
+		if(orig_state!=SChannel::EChannelState_Idle)
+			continue;
+
+		int restore_version = channel_pipes[i].restore_version;
+
 		channel_pipes[i].state = SChannel::EChannelState_Used;
 
 		_i64 received_bytes = 0;
@@ -2660,8 +3061,15 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 				received_bytes = watoi64(params["received_bytes"]);
 			}
 		}
+		
+		std::string token_param;
+		if (params.find("token") != params.end())
+		{
+			token_param = "&token=" + EscapeParamString(params["token"]);
+		}
+
 		sendChannelPacket(channel_pipes[i], "DOWNLOAD IMAGE with_used_bytes=1&img_id=" 
-			+ params["img_id"] + "&time=" + params["time"] + "&mbr=" + params["mbr"] + offset);
+			+ params["img_id"] + "&time=" + params["time"] + "&mbr=" + params["mbr"] + offset + token_param);
 		
 		Server->Log("Downloading from channel "+convert((int)i), LL_DEBUG);
 
@@ -2685,11 +3093,12 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 			}
 		}
 
-		backup_mutex_lock.relock(NULL);
+		backup_mutex_lock.relock(nullptr);
 		
 		if(!pipe->Write((char*)&imgsize, sizeof(_i64), (int)receive_timeouttime))
 		{
 			Server->Log("Could not write to pipe! downloadImage-1", LL_ERROR);
+			backup_mutex_lock.relock(backup_mutex);
 			removeChannelpipe(c);
 			return;
 		}
@@ -2707,12 +3116,14 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 				size_t c_read=c->Read(buf, c_buffer_size, 60000);
 				if(c_read==0)
 				{
+					backup_mutex_lock.relock(backup_mutex);
 					Server->Log("Read Timeout", LL_ERROR);
 					removeChannelpipe(c);
 					return;
 				}
 				if(!pipe->Write(buf, (_u32)c_read, (int)receive_timeouttime*5))
 				{
+					backup_mutex_lock.relock(backup_mutex);
 					Server->Log("Could not write to pipe! downloadImage-5", LL_ERROR);
 					removeChannelpipe(c);
 					return;
@@ -2720,20 +3131,27 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 				read+=c_read;
 			}
 			Server->Log("Downloading MBR done");
-			channel_pipes[i].state = orig_state;
+			backup_mutex_lock.relock(backup_mutex);
+			for(auto& cp: channel_pipes)
+			{
+				if(cp.pipe == c)
+				{
+					cp.state = orig_state;
+				}
+			}
 			return;
 		}
 
 		_i64 used_bytes = imgsize;
-		if (channel_pipes[i].restore_version > 0)
+		if (restore_version > 0)
 		{
 			if (!c->Read((char*)&used_bytes, sizeof(_i64), 60000))
 			{
 				Server->Log("Error getting used bytes", LL_ERROR);
+				backup_mutex_lock.relock(backup_mutex);
 				if (i + 1<channel_pipes.size())
 				{
 					removeChannelpipe(c);
-					backup_mutex_lock.relock(backup_mutex);
 					waitForPings(&backup_mutex_lock);
 					continue;
 				}
@@ -2743,12 +3161,28 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 					return;
 				}
 			}
-			Server->Log("Used bytes " + convert(used_bytes), LL_DEBUG);
+			Server->Log("Used bytes " + convert(used_bytes), LL_INFO);
 		}
 		else
 		{
+			Server->Log("Restore version 0. No used bytes", LL_INFO);
 			received_bytes = start_offset;
 		}
+
+		{
+			int t_pcdone=(std::min)((int)100, (int)(((float)received_bytes/(float)used_bytes)*100.f+0.5f));
+
+			IScopedLock lock(process_mutex);
+
+			SRunningProcess* proc = getRunningProcess(local_backup_running_id);
+			if (proc != nullptr)
+			{
+				proc->pcdone = t_pcdone;
+				proc->total_bytes = used_bytes;
+				proc->done_bytes = received_bytes;
+			}
+		}
+
 
 		if (received_bytes >= used_bytes)
 		{
@@ -2758,18 +3192,22 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 		unsigned int blockleft=0;
 		unsigned int off=0;
 		_i64 pos=0;
+		int64 lastupdatetime = Server->getTimeMS();
+		int64 last_received = received_bytes;
 		while(pos<imgsize)
 		{
 			size_t r=c->Read(&buf[off], c_buffer_size-off, 180000);
 			if( r==0 )
 			{
 				Server->Log("Read Timeout -2 CS", LL_ERROR);
+				backup_mutex_lock.relock(backup_mutex);
 				removeChannelpipe(c);
 				return;
 			}
 			if(!pipe->Write(&buf[off], r, (int)receive_timeouttime*5))
 			{
 				Server->Log("Could not write to pipe! downloadImage-3 size "+convert(r)+" off "+convert(off), LL_ERROR);
+				backup_mutex_lock.relock(backup_mutex);
 				removeChannelpipe(c);
 				return;
 			}
@@ -2819,19 +3257,41 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 					}
 				}
 			}
-
-			int t_pcdone=(std::min)((int)100, (int)(((float)received_bytes/(float)used_bytes)*100.f+0.5f));
-			if(t_pcdone!=l_pcdone)
-			{
-				l_pcdone=t_pcdone;
-				updateRunningPc(local_backup_running_id, l_pcdone);
-			}
-
+			
 			lasttime=Server->getTimeMS();
+
+			if(lasttime - lastupdatetime>1000)
+			{
+				int64 passed_time = lasttime - lastupdatetime;
+				lastupdatetime = lasttime;
+				int t_pcdone=(std::min)((int)100, (int)(((float)received_bytes/(float)used_bytes)*100.f+0.5f));
+				int64 new_bytes = received_bytes - last_received;
+				last_received = received_bytes;
+				double speed_bpms = static_cast<double>(new_bytes)/passed_time;
+
+				IScopedLock lock(process_mutex);
+
+				SRunningProcess* proc = getRunningProcess(local_backup_running_id);
+				if (proc != nullptr)
+				{
+					proc->pcdone = t_pcdone;
+					proc->done_bytes = received_bytes;
+					proc->speed_bpms = speed_bpms;
+					proc->last_pingtime = lasttime;
+					status_updated = true;
+				}
+			}
 		}
 		remove_running_backup.setSuccess(true);
 		Server->Log("Downloading image done", LL_DEBUG);
-		channel_pipes[i].state = orig_state;
+		backup_mutex_lock.relock(backup_mutex);
+		for(auto& cp: channel_pipes)
+		{
+			if(cp.pipe == c)
+			{
+				cp.state = orig_state;
+			}
+		}
 		return;
 	}
 	imgsize=-2;
@@ -2843,9 +3303,9 @@ void ClientConnector::waitForPings(IScopedLock *lock)
 	Server->Log("Waiting for pings...", LL_DEBUG);
 	while(hasChannelPing())
 	{
-		lock->relock(NULL);
+		lock->relock(nullptr);
 		Server->wait(10);
-		if (run_other != NULL)
+		if (run_other != nullptr)
 		{
 			run_other->runOther();
 		}
@@ -2896,13 +3356,16 @@ void ClientConnector::tochannelSendStartbackup(RunningAction backup_type, const 
 		return;
 
 	IScopedLock lock(backup_mutex);
+	IScopedLock lock_process(process_mutex);
 	lasttime=Server->getTimeMS();
-	if (getActiveProcess(x_pingtimeout) != NULL)
+	if (getActiveProcess(x_pingtimeout) != nullptr)
 	{
 		tcpstack.Send(pipe, "RUNNING");
 	}
 	else
 	{
+		lock_process.relock(nullptr);
+
 		size_t selidx = 0;
 		for (size_t i = 0; i < channel_pipes.size(); ++i)
 		{
@@ -2978,16 +3441,19 @@ void ClientConnector::update_silent(void)
 	Server->getThreadPool()->execute(new UpdateSilentThread(), "silent client update");
 }
 
-bool ClientConnector::calculateFilehashesOnClient(const std::string& clientsubname)
+bool ClientConnector::calculateFilehashesOnClient(const std::string& clientsubname, int facet_id)
 {
 	if(internet_conn)
 	{
-		std::string settings_fn = "urbackup/data/settings.cfg";
+		std::string settings_fn = "urbackup/data_" + convert(facet_id) + "/settings.cfg";
 		if(!clientsubname.empty())
 		{
-			settings_fn = "urbackup/data/settings_"+clientsubname+".cfg";
+			settings_fn = "urbackup/data_" + convert(facet_id) + "/settings_"+clientsubname+".cfg";
 		}
 		ISettingsReader *curr_settings=Server->createFileSettingsReader(settings_fn);
+
+		if (curr_settings == nullptr)
+			return false;
 
 		std::string val;
 		if(curr_settings->getValue("internet_calculate_filehashes_on_client", &val)
@@ -3006,6 +3472,84 @@ bool ClientConnector::calculateFilehashesOnClient(const std::string& clientsubna
 	return false;
 }
 
+bool ClientConnector::getBackupDest(const std::string& clientsubname, int facet_id,
+	std::string& dest, std::string& dest_params, str_map& dest_secret_params,
+	std::string& computername, size_t& max_backups, std::string& perm_uid)
+{
+	std::string settings_fn = "urbackup/data_"+convert(facet_id )+"/settings.cfg";
+	if (!clientsubname.empty())
+	{
+		settings_fn = "urbackup/data_"+convert(facet_id )+"/settings_" + clientsubname + ".cfg";
+	}
+
+	std::string secrets_fn = "urbackup/secrets_"+std::to_string(facet_id)+".cfg";
+	if (!clientsubname.empty())
+	{
+		secrets_fn = "urbackup/secrets_" + std::to_string(facet_id) + "_"+clientsubname+".cfg";
+	}
+
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+
+	if (!curr_settings)
+		return false;
+
+	std::string val;
+	if (curr_settings->getValue("backup_dest_url", &val)
+		|| curr_settings->getValue("backup_dest_url_def", &val))
+	{
+		dest = val;
+	}
+
+	if (curr_settings->getValue("backup_dest_params", &val)
+		|| curr_settings->getValue("backup_dest_params_def", &val))
+	{
+		dest_params = val;
+	}
+
+	if (curr_settings->getValue("computername", &val)
+		|| curr_settings->getValue("computername_def", &val))
+	{
+		computername = val;
+	}
+
+	if (curr_settings->getValue("min_file_incr", &val)
+		|| curr_settings->getValue("min_file_incr_def", &val))
+	{
+		max_backups = watoi(val);
+	}
+
+	if (curr_settings->getValue("perm_uid", &val))
+	{
+		perm_uid = watoi(val);
+	}
+	
+	if (computername.empty())
+	{
+		computername = IndexThread::getFileSrv()->getServerName();
+	}
+
+	if (!FileExists(secrets_fn))
+	{
+		std::string encryption_key;
+		encryption_key.resize(16);
+		Server->secureRandomFill(&encryption_key[0], encryption_key.size());
+
+		write_file_only_admin("encryption_key=" + bytesToHex(encryption_key) + "\n", secrets_fn);
+	}
+
+	std::unique_ptr<ISettingsReader> curr_secrets(Server->createFileSettingsReader(secrets_fn));
+
+	if (curr_secrets)
+	{
+		for (auto key : curr_secrets->getKeys())
+		{
+			dest_secret_params[key] = curr_secrets->getValue(key);
+		}
+	}
+
+	return true;
+}
+
 bool ClientConnector::isBackupRunning()
 {
 	IScopedLock lock(backup_mutex);
@@ -3014,6 +3558,18 @@ bool ClientConnector::isBackupRunning()
 	std::string job = getCurrRunningJob(false, pcdone);
 
 	return job!="NOA";
+}
+
+bool ClientConnector::tochannelSendLocked(bool locked)
+{
+	std::string msg = std::string("LOCKED locked=") + (locked ? "1" : "0");
+	bool rc = sendMessageToAllChannels(msg, 10000);
+	if (rc)
+	{
+		IScopedLock lock(ident_mutex);
+		last_locked = locked;
+	}
+	return rc;
 }
 
 bool ClientConnector::tochannelSendChanges( const char* changes, size_t changes_size)
@@ -3060,7 +3616,7 @@ int ClientConnector::getCapabilities(IDatabase* db)
 		{
 			IDatabase *db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
 			IQuery *cq=db->Prepare("UPDATE misc SET tvalue=? WHERE tkey='last_capa'", false);
-			if(cq!=NULL)
+			if(cq!=nullptr)
 			{
 				cq->Bind(capa);
 				if(cq->Write(0))
@@ -3141,6 +3697,53 @@ void ClientConnector::exit_backup_immediate(int rc)
 	}
 }
 
+void ClientConnector::createFacet(const std::string& server_identity, const std::string& facet_name)
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
+	ClientDAO clientdao(db);
+
+	ClientDAO::SClientFacet init_facet = clientdao.getClientFacet("");
+	if (init_facet.exists)
+	{
+		clientdao.updateClientFacet(server_identity, init_facet.id);
+	}
+
+	ClientDAO::SClientFacet facet = clientdao.getClientFacet(server_identity);
+
+	if (!facet.exists)
+	{
+		clientdao.addClientFacet(facet_name, server_identity);
+		facet.id = static_cast<int>(db->getLastInsertID());
+	}
+
+	std::string facet_dir = "urbackup" + os_file_sep() + "data_" + convert(facet.id);
+	if (!os_directory_exists(facet_dir))
+	{
+		os_create_dir(facet_dir);
+#ifndef _DEBUG
+		change_file_permissions_admin_only(facet_dir);
+#endif
+	}
+}
+
+int ClientConnector::getFacetId(const std::string& server_identity)
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
+	ClientDAO clientdao(db);
+
+	ClientDAO::SClientFacet facet = clientdao.getClientFacet(server_identity);
+	return facet.id;
+}
+
+int ClientConnector::getFacetIdByName(const std::string& facet_name)
+{
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
+	ClientDAO clientdao(db);
+
+	ClientDAO::SClientFacet facet = clientdao.getClientFacetByName(facet_name);
+	return facet.id;
+}
+
 IPipe* ClientConnector::getFileServConnection(const std::string& server_token, unsigned int timeoutms)
 {
 	IScopedLock lock(backup_mutex);
@@ -3151,7 +3754,7 @@ IPipe* ClientConnector::getFileServConnection(const std::string& server_token, u
 	{
 		for(size_t i=0;i<channel_pipes.size();++i)
 		{
-			if(channel_pipes[i].make_fileserv!=NULL &&
+			if(channel_pipes[i].make_fileserv!=nullptr &&
 				channel_pipes[i].token==server_token &&
 				!(*channel_pipes[i].make_fileserv))
 			{
@@ -3159,7 +3762,7 @@ IPipe* ClientConnector::getFileServConnection(const std::string& server_token, u
 			}
 		}
 
-		lock.relock(NULL);
+		lock.relock(nullptr);
 		Server->wait(100);
 		lock.relock(backup_mutex);
 
@@ -3177,7 +3780,7 @@ IPipe* ClientConnector::getFileServConnection(const std::string& server_token, u
 
 	Server->Log("Timeout while getting a fileserv connection");
 
-	return NULL;	
+	return nullptr;	
 }
 
 bool ClientConnector::closeSocket( void )
@@ -3247,7 +3850,7 @@ void ClientConnector::sendStatus()
 	{
 		ret+="&restore_ask="+convert(ask_restore_ok);
 
-		if (restore_files != NULL)
+		if (restore_files != nullptr)
 		{
 			if (restore_files->is_single_file())
 			{
@@ -3274,9 +3877,10 @@ void ClientConnector::sendStatus()
 	db->destroyAllQueries();
 }
 
-bool ClientConnector::tochannelLog(int64 log_id, const std::string& msg, int loglevel, const std::string& identity)
+bool ClientConnector::tochannelLog(int64 log_id, const std::string& msg, int loglevel,
+	const std::string& identity, int timeoutms)
 {
-	return sendMessageToChannel("LOG "+convert(log_id)+"-"+convert(loglevel)+"-"+msg, 10000, identity);
+	return sendMessageToChannel("LOG "+convert(log_id)+"-"+convert(loglevel)+"-"+msg, timeoutms, identity);
 }
 
 void ClientConnector::updateRestorePc(int64 local_process_id, int64 restore_id, int64 status_id, int nv, const std::string& identity,
@@ -3289,7 +3893,7 @@ void ClientConnector::updateRestorePc(int64 local_process_id, int64 restore_id, 
 
 		SRunningProcess* proc = getRunningProcess(local_process_id);
 
-		if (proc != NULL)
+		if (proc != nullptr)
 		{
 			if (nv > 100)
 			{
@@ -3322,6 +3926,50 @@ bool ClientConnector::restoreDone( int64 log_id, int64 status_id, int64 restore_
 		"&success=" + convert(success), 60000, identity);
 }
 
+void ClientConnector::updateLocalBackupPc(int64 local_process_id, int64 backup_id, int64 status_id, int nv, 
+	const std::string& identity, const std::string& details, int64 total_bytes, int64 done_bytes, double speed_bpms,
+	int64 eta, int64 eta_set_time)
+{
+	IScopedLock lock(backup_mutex);
+
+	{
+		IScopedLock lock_process(process_mutex);
+
+		SRunningProcess* proc = getRunningProcess(local_process_id);
+
+		if (proc != nullptr)
+		{
+			if (nv > 100)
+			{
+				removeRunningProcess(local_process_id, total_bytes == done_bytes);
+			}
+			else
+			{
+				proc->pcdone = nv;
+				proc->last_pingtime = Server->getTimeMS();
+				proc->details = details;
+				proc->total_bytes = total_bytes;
+				proc->done_bytes = done_bytes;
+				proc->speed_bpms = speed_bpms;
+				proc->eta_ms = eta;
+			}
+		}
+	}
+
+	sendMessageToChannel("BACKUP PERCENT pc=" + convert(nv) + "&status_id=" + convert(status_id) + "&id=" + convert(backup_id)
+		+ "&details=" + EscapeParamString(details) + "&total_bytes=" + convert(total_bytes) + "&done_bytes=" + convert(done_bytes)
+		+ "&speed_bpms=" + convert(speed_bpms)+"&eta="+std::to_string(eta) +"&eta_set_time="+std::to_string(Server->getTimeMS() - eta_set_time),
+		0, identity);
+}
+
+bool ClientConnector::localBackupDone(int64 log_id, int64 status_id, int64 backup_id, bool success, const std::string& identity)
+{
+	return sendMessageToChannel("BACKUP DONE status_id=" + convert(status_id) +
+		"&log_id=" + convert(log_id) +
+		"&id=" + convert(backup_id) +
+		"&success=" + convert(success), 60000, identity);
+}
+
 bool ClientConnector::sendMessageToChannel( const std::string& msg, int timeoutms, const std::string& identity )
 {
 	IScopedLock lock(backup_mutex);
@@ -3344,12 +3992,50 @@ bool ClientConnector::sendMessageToChannel( const std::string& msg, int timeoutm
 			}
 		}
 
-		lock.relock(NULL);
+		if (timeoutms == 0)
+			return false;
+
+		lock.relock(nullptr);
 		Server->wait(100);
 		lock.relock(backup_mutex);
 	} while(Server->getTimeMS()-starttime<timeoutms);
 
 	return false;
+}
+
+bool ClientConnector::sendMessageToAllChannels(const std::string& msg, int timeoutms)
+{
+	std::set<std::string> done_tokens;
+	IScopedLock lock(backup_mutex);
+
+	int64 starttime = Server->getTimeMS();
+
+	do
+	{
+		for (size_t i = 0; i < channel_pipes.size(); ++i)
+		{
+			if (done_tokens.find(channel_pipes[i].token) == done_tokens.end())
+			{
+				CTCPStack tmpstack(channel_pipes[i].internet_connection);
+				if (tmpstack.Send(channel_pipes[i].pipe, msg) == msg.size())
+				{
+					done_tokens.insert(channel_pipes[i].token);
+				}
+			}
+		}
+
+		if (done_tokens.size() == channel_pipes.size())
+			return true;
+
+		if (timeoutms == 0)
+			return false;
+
+		lock.relock(nullptr);
+		Server->wait(100);
+		lock.relock(backup_mutex);
+	} while (Server->getTimeMS() - starttime < timeoutms);
+
+	return done_tokens.size()==channel_pipes.size();
 }
 
 std::string ClientConnector::getAccessTokensParams(const std::string& tokens, bool with_clientname, const std::string& virtual_client)
@@ -3359,7 +4045,7 @@ std::string ClientConnector::getAccessTokensParams(const std::string& tokens, bo
         return std::string();
     }
 
-	std::auto_ptr<ISettingsReader> access_keys(
+	std::unique_ptr<ISettingsReader> access_keys(
 		Server->createFileSettingsReader("urbackup/access_keys.properties"));
 
 	std::vector<std::string> server_token_keys = access_keys->getKeys();
@@ -3408,7 +4094,7 @@ std::string ClientConnector::getAccessTokensParams(const std::string& tokens, bo
 
 	if(with_clientname)
 	{
-		std::auto_ptr<ISettingsReader> settings(
+		std::unique_ptr<ISettingsReader> settings(
 			Server->createFileSettingsReader("urbackup/data/settings.cfg"));
 
 		std::string computername;
@@ -3555,11 +4241,272 @@ void ClientConnector::refreshSessionFromChannel(const std::string& endpoint_name
 		{
 			if (!channel_pipes[i].server_identity.empty())
 			{
-				ServerIdentityMgr::checkServerSessionIdentity(channel_pipes[i].server_identity, endpoint_name);
+				std::string secret_key;
+				ServerIdentityMgr::checkServerSessionIdentity(channel_pipes[i].server_identity, endpoint_name, secret_key);
 			}
 			break;
 		}
 	}
+}
+
+bool ClientConnector::localBackup(std::string dest_url, const std::string& dest_params,
+	const str_map& dest_secret_params, const std::string& computername,
+	bool full, size_t max_backups, const std::string& server_identity, str_map& params,
+	const std::string& perm_uid)
+{
+	if (dest_url.empty())
+		return false;
+
+	if (next(dest_url, 0, "urbackup://"))
+		return false;
+
+	dest_url = greplace("$CLIENTNAME$", computername, dest_url);
+	dest_url = greplace("$CLIENTUID$", perm_uid, dest_url);
+
+	int64 server_id = watoi64(params["status_id"]);
+
+	int group = c_group_default;
+
+	str_map::iterator it_group = params.find("group");
+	if (it_group != params.end())
+	{
+		group = watoi(it_group->second);
+	}
+
+	std::string clientsubname;
+
+	str_map::iterator it_clientsubname = params.find("clientsubname");
+	if (it_clientsubname != params.end())
+	{
+		clientsubname = conv_filename(it_clientsubname->second);
+	}
+
+	int facet_id = getFacetId(ServerIdentityMgr::getIdentityFromSessionIdentity(server_identity));
+
+	std::string async_id;
+	async_id.resize(16);
+	Server->randomFill(&async_id[0], async_id.size());
+
+	SRunningProcess new_proc;
+
+	new_proc.action = full ? RUNNING_FULL_FILE : RUNNING_INCR_FILE;
+	new_proc.server_id = server_id;
+	new_proc.id = ++curr_backup_running_id;
+	new_proc.server_token = server_token;
+
+	IScopedLock process_lock(process_mutex);
+
+	removeTimedOutProcesses(server_token, true);
+
+	running_processes.push_back(new_proc);
+
+	int64 log_id = watoi64(params["log_id"]);
+
+	THREADPOOL_TICKET backup_ticket;
+	if (full)
+	{
+		LocalFullFileBackup* fb = new LocalFullFileBackup(group,
+			clientsubname, new_proc.id, log_id, server_id, new_proc.id,
+			server_token, server_identity, facet_id, max_backups,
+			dest_url, dest_params, dest_secret_params);
+
+		backup_ticket = Server->getThreadPool()->execute(fb, "lfbackup full");
+	}
+	else
+	{
+		LocalIncrFileBackup* fb = new LocalIncrFileBackup(group, 
+			clientsubname, new_proc.id, log_id, server_id, new_proc.id, server_token,
+			server_identity, facet_id, max_backups,
+			dest_url, dest_params, dest_secret_params);
+
+		backup_ticket = Server->getThreadPool()->execute(fb, "lfbackup incr");
+	}
+
+	SAsyncFileList new_async_backup = {
+		Server->getTimeMS(),
+		0,
+		0,
+		backup_ticket
+	};
+
+	async_file_index[async_id] = new_async_backup;
+
+	tcpstack.Send(pipe, "ASYNC-async_id=" + bytesToHex(async_id));
+
+	return true;
+
+}
+
+bool ClientConnector::updateDefaultDirsSetting(IDatabase* db, bool all_virtual_clients, int group_offset, bool update_use, int facet_id)
+{
+	db_results res_virtual_clients;
+	if(all_virtual_clients)
+		res_virtual_clients = db->Read("SELECT virtual_client, group_offset FROM virtual_client_group_offsets WHERE facet="+convert(facet_id));
+	else
+		res_virtual_clients = db->Read("SELECT virtual_client, group_offset FROM virtual_client_group_offsets WHERE group_offset="+convert(group_offset)+" AND facet="+convert(facet_id));
+
+	if (all_virtual_clients || group_offset == 0)
+	{
+		db_single_result res_def_client;
+		res_def_client["group_offset"] = "0";
+		res_virtual_clients.push_back(res_def_client);
+	}
+
+
+	bool mod = false;
+	for (size_t i = 0; i < res_virtual_clients.size(); ++i)
+	{
+		db_single_result& res_virtual_client = res_virtual_clients[i];
+
+		int curr_group_offset = watoi(res_virtual_client["group_offset"]);
+
+		db_results res_paths = db->Read("SELECT path, name, optional, server_default FROM backupdirs WHERE symlinked=0 AND tgroup=" + convert(curr_group_offset)+" AND facet="+convert(facet_id));
+
+		int default_dirs_use = c_use_value_client;
+		bool has_client_path = false;
+		std::string default_dirs;
+		for (size_t j = 0; j < res_paths.size(); ++j)
+		{
+			db_single_result& res_path = res_paths[j];
+
+			if (res_path["server_default"] != "0")
+			{
+				default_dirs_use |= c_use_group | c_use_value;
+				continue;
+			}
+			else
+			{
+				has_client_path = true;
+			}
+			
+			int optional = watoi(res_path["optional"]);
+
+			std::vector<std::pair<int, std::string> > flag_mapping = getFlagStrMapping();
+
+			std::string str_flags;
+			std::string str_flags_default;
+			for (size_t j = 0; j < flag_mapping.size(); ++j)
+			{
+				if (optional & flag_mapping[j].first)
+				{
+					if (!str_flags.empty()) str_flags += ",";
+					str_flags += flag_mapping[j].second;
+				}
+
+				if (EBackupDirFlags_Default&flag_mapping[j].first)
+				{
+					if (!str_flags_default.empty()) str_flags_default += ",";
+					str_flags_default += flag_mapping[j].second;
+				}
+			}
+
+			if (!default_dirs.empty())
+				default_dirs += ";";
+
+			if (!str_flags.empty()
+				&& str_flags != str_flags_default)
+				str_flags = "/" + str_flags;
+			else if (str_flags == str_flags_default)
+				str_flags.clear();
+
+			std::string path = greplace("%2F", "/", EscapePathParamString(res_path["path"]));
+
+			default_dirs += path +"|"+EscapePathParamString(res_path["name"]) + str_flags;
+		}
+
+		std::string settings_fn = "urbackup/data_"+convert(facet_id)+"/settings.cfg";
+		if (curr_group_offset !=0)
+		{
+			settings_fn = "urbackup/data_"+convert(facet_id)+"/settings_" + conv_filename(res_virtual_client["virtual_client"]) + ".cfg";
+		}
+
+		if (res_paths.empty() &&
+			!FileExists(settings_fn))
+			continue;
+
+		std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+
+		if (curr_settings.get() != nullptr)
+		{
+			str_map settings_repl;
+
+			int64 default_dirs_use_lm_orig = curr_settings->getValue("default_dirs.use_lm", 0LL);
+
+			int64 ctime = Server->getTimeSeconds();
+			if (default_dirs_use_lm_orig > ctime)
+				ctime = default_dirs_use_lm_orig + 1;
+
+			if (curr_settings->getValue("default_dirs.use", 0) == 0)
+			{
+				settings_repl["default_dirs.use"] = convert(default_dirs_use);
+				settings_repl["default_dirs.use_lm"] = convert(ctime);
+				mod = true;
+			}
+			else if (update_use)
+			{
+				int curr_use = curr_settings->getValue("default_dirs.use", 0);
+				if (has_client_path && !(curr_use & c_use_value_client))
+				{
+					settings_repl["default_dirs.use"] = convert(curr_use|c_use_value_client);
+					settings_repl["default_dirs.use_lm"] = convert(ctime);
+					mod = true;
+				}
+			}
+
+
+			if (curr_settings->getValue("default_dirs.client", "") != default_dirs)
+			{
+				settings_repl["default_dirs.client"] = default_dirs;
+				mod = true;
+			}
+
+			if (!settings_repl.empty())
+			{
+				std::vector<std::string> keys = curr_settings->getKeys();
+
+				for (str_map::iterator it = settings_repl.begin(); it != settings_repl.end(); ++it)
+				{
+					if (std::find(keys.begin(), keys.end(), it->first) == keys.end())
+						keys.push_back(it->first);
+				}
+
+				std::string new_data;
+
+				for (size_t i = 0; i < keys.size(); ++i)
+				{
+					std::string val;
+					str_map::iterator it = settings_repl.find(keys[i]);
+					if (it != settings_repl.end())
+						val = it->second;
+					else
+						curr_settings->getValue(keys[i], &val);
+
+					new_data += keys[i] + "=" + val + "\n";
+				}
+
+				std::unique_ptr<IFile> settings_f(Server->openFile(settings_fn+".new_2", MODE_WRITE));
+
+				if (settings_f.get() != nullptr)
+				{
+					if (settings_f->Write(new_data) == new_data.size()
+						&& settings_f->Sync())
+					{
+						settings_f.reset();
+						if (!os_rename_file(settings_fn + ".new_2", settings_fn))
+						{
+							Server->Log("Error renaming " + settings_fn + ".new_2 to " + settings_fn + ". " + os_last_error_str(), LL_ERROR);
+						}
+					}
+					else
+					{
+						Server->Log("Error writing new settings to " + settings_fn + ".new_2. " + os_last_error_str(), LL_ERROR);
+					}
+				}
+			}
+		}
+	}
+
+	return mod;
 }
 
 void ClientConnector::timeoutAsyncFileIndex()
@@ -3597,7 +4544,7 @@ SRunningProcess * ClientConnector::getRunningProcess(RunningAction action, std::
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 SRunningProcess * ClientConnector::getRunningFileBackupProcess(std::string server_token, int64 server_id)
@@ -3613,7 +4560,7 @@ SRunningProcess * ClientConnector::getRunningFileBackupProcess(std::string serve
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 SRunningProcess * ClientConnector::getRunningBackupProcess(std::string server_token, int64 server_id)
@@ -3628,7 +4575,7 @@ SRunningProcess * ClientConnector::getRunningBackupProcess(std::string server_to
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 SRunningProcess * ClientConnector::getRunningProcess(int64 id)
@@ -3642,7 +4589,7 @@ SRunningProcess * ClientConnector::getRunningProcess(int64 id)
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 SRunningProcess * ClientConnector::getActiveProcess(int64 timeout)
@@ -3657,10 +4604,10 @@ SRunningProcess * ClientConnector::getActiveProcess(int64 timeout)
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
-bool ClientConnector::removeRunningProcess(int64 id, bool success)
+bool ClientConnector::removeRunningProcess(int64 id, bool success, bool consider_refs)
 {
 	IScopedLock lock(process_mutex);
 
@@ -3669,13 +4616,24 @@ bool ClientConnector::removeRunningProcess(int64 id, bool success)
 		SRunningProcess& curr = running_processes[i];
 		if (curr.id == id)
 		{
-			finished_processes.push_back(SFinishedProcess(id, success));
-			while (finished_processes.size() > 20)
+			if (curr.refs > 0)
+				--curr.refs;
+
+			if (!consider_refs || curr.refs == 0)
 			{
-				finished_processes.erase(finished_processes.begin());
+				Server->Log("Removing running process (1) id " + convert(curr.id) + " server_id " + convert(curr.server_id) + " token " + curr.server_token + " action " + convert((int)curr.action), LL_DEBUG);
+				finished_processes.push_back(SFinishedProcess(id, success));
+				while (finished_processes.size() > 20)
+				{
+					finished_processes.erase(finished_processes.begin());
+				}
+				running_processes.erase(running_processes.begin() + i);
+				return true;
 			}
-			running_processes.erase(running_processes.begin() + i);
-			return true;
+			else
+			{
+				return false;
+			}
 		}
 	}
 
@@ -3728,7 +4686,7 @@ void ClientConnector::timeoutBackupImmediate(int64 start_timeout, int64 resume_t
 		}
 	}
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	if (found)
 	{
@@ -3758,7 +4716,7 @@ bool ClientConnector::updateRunningPc(int64 id, int pcdone)
 	IScopedLock lock(process_mutex);
 
 	SRunningProcess* proc = getRunningProcess(id);
-	if (proc == NULL)
+	if (proc == nullptr)
 	{
 		return false;
 	}
@@ -3811,6 +4769,7 @@ void ClientConnector::removeTimedOutProcesses(std::string server_token, bool fil
 			&& (curr.server_token == server_token || curr.server_token.empty() || server_token.empty())
 			&& ctime - curr.last_pingtime>x_pingtimeout )
 		{
+			Server->Log("Removing running process (timeout) id " + convert(curr.id) + " server_id "+convert(curr.server_id)+" token "+curr.server_token+" action " + convert((int)curr.action), LL_DEBUG);
 			running_processes.erase(running_processes.begin() + i);
 			continue;
 		}

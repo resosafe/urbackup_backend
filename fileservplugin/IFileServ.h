@@ -8,6 +8,7 @@
 
 class IPipe;
 class IPipeFileExt;
+class IFileMetadataPipe;
 
 class IFileServ : public IObject
 {
@@ -46,7 +47,7 @@ public:
 	virtual std::string getServerName(void)=0;
 	virtual void stopServer(void)=0;
 	virtual std::string getShareDir(const std::string &name, const std::string& identity)=0;
-	virtual void addIdentity(const std::string &pIdentity)=0;
+	virtual void addIdentity(const std::string &pIdentity, bool only_tunneled)=0;
 	virtual bool removeIdentity(const std::string &pIdentity)=0;
 	virtual void setPause(bool b)=0;
 	virtual bool getPause(void)=0;
@@ -57,11 +58,14 @@ public:
 	virtual void removeMetadataCallback(const std::string &name, const std::string& identity) = 0;
 	virtual void registerTokenCallbackFactory(ITokenCallbackFactory* callback_factory) = 0;
 	virtual bool hasActiveTransfers(const std::string& sharename, const std::string& server_token) = 0;
+	virtual bool hasActiveTransfersGen(const std::string& sharename, const std::string& server_token, size_t gen) = 0;
 	virtual bool registerFnRedirect(const std::string& source_fn, const std::string& target_fn) = 0;
 	virtual void registerReadErrorCallback(IReadErrorCallback* cb) = 0;
 	virtual void registerScriptPipeFile(const std::string& script_fn, IPipeFileExt* pipe_file) = 0;
 	virtual void deregisterScriptPipeFile(const std::string& script_fn) = 0;
 	virtual void clearReadErrors() = 0;
+	virtual IFileMetadataPipe* getFileMetadataPipe() = 0;
+	virtual size_t incrActiveGeneration() = 0;
 
 	struct CbtHashFileInfo
 	{

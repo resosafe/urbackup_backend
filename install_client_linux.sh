@@ -2,12 +2,51 @@
 
 set -e
 
+restore_image () {
+	if ! [ -t 1 ]
+	then
+		echo "Error: Stdout is not a TTY. Not running non-interactively"
+		exit 5
+	fi
+
+	USER=`whoami`
+
+	if [ "x$USER" != "xroot" ]
+	then
+		echo "Sorry, you must be super user to restore an image. Try again with sudo?"
+		exit 6
+	fi
+
+	if ! command -v systemctl >/dev/null 2>&1
+	then
+		echo "Sorry, image restore only works with systemd present currently."
+		exit 7
+	fi
+
+	echo "Uncompressing data..."
+	tar xzf install-data.tar.gz
+
+	sh restore_linux_img.sh "$SERVER_NAME" "$SERVER_PORT" "$SERVER_PROXY" "$RESTORE_AUTHKEY" "$RESTORE_TOKEN" "$PREFIX"
+	exit $?
+}
+
 cat << EOF > /dev/null
 #ab6b754c02624b348795c92da78b1e73$version$
 EOF
 
+#e1128bd07afd40a0a2752818730589ef
+RESTORE_IMAGE=0
+################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+#902761a5525a4007add0b016a35af985
+
 #Cannot be changed as paths are compiled into the binaries
 PREFIX=/usr/local
+
+if [ $RESTORE_IMAGE = 1 ]
+then
+	restore_image
+	exit $?
+fi
 
 SILENT=no
 
@@ -50,11 +89,11 @@ DEBIAN=no
 if [ -e /etc/debian_version ]
 then
 	DEBIAN=yes
-	echo "Detected Debian (derivative) system"
+	echo "Detected Debian \(derivative\) system"
 	mv urbackupclientbackend-debian.service urbackupclientbackend.service
 	mv init.d_client init.d
 else
-	echo "Assuming RedHat (derivative) system"
+	echo "Assuming RedHat \(derivative\) system"
 	if [ -e /etc/sysconfig ]
 	then
 		mv urbackupclientbackend-redhat.service urbackupclientbackend.service
@@ -113,30 +152,47 @@ test -e "$PREFIX/bin" || install -c -m 755 -d "$PREFIX/bin"
 install -c "$TARGET/urbackupclientbackend" "$PREFIX/sbin"
 install -c "$TARGET/urbackupclientctl" "$PREFIX/bin"
 
+ORIG_TARGET=$TARGET
+
 if [ $TARGET = x86_64-linux-glibc ]
 then
 	if ! "$PREFIX/bin/urbackupclientctl" --version 2>&1 | grep "UrBackup Client Controller" > /dev/null 2>&1
 	then
-		echo "Glibc not installed or too old. Falling back to Android NDK build..."
+		echo "\(Glibc not installed or too old. Falling back to Android NDK build...\)"
 		TARGET=x86_64-linux-android
 	else
 		if ! "$PREFIX/sbin/urbackupclientbackend" --version 2>&1 | grep "UrBackup Client Backend" > /dev/null 2>&1
 		then
-			echo "Glibc not installed or too old (2). Falling back to Android NDK..."
+			echo "\(Glibc not installed or too old \(2\). Falling back to Android NDK build...\)"
 			TARGET=x86_64-linux-android
 		fi
 	fi
-	
-	if [ $TARGET != x86_64-linux-glibc ]
+fi
+
+if [ $TARGET = arm-linux-androideabi ]
+then
+	if ! "$PREFIX/bin/urbackupclientctl" --version 2>&1 | grep "UrBackup Client Controller" > /dev/null 2>&1
 	then
-		install -c "$TARGET/urbackupclientbackend" "$PREFIX/sbin"
-		install -c "$TARGET/urbackupclientctl" "$PREFIX/bin"
+		echo "\(Android NDK build not working. Falling back to ELLCC build...\)"
+		TARGET=armv6-linux-engeabihf
+	else
+		if ! "$PREFIX/sbin/urbackupclientbackend" --version 2>&1 | grep "UrBackup Client Backend" > /dev/null 2>&1
+		then
+			echo "\(Android NDK build not working. Falling back to ELLCC build...\)"
+			TARGET=armv6-linux-engeabihf
+		fi
 	fi
+fi
+
+if [ $TARGET != $ORIG_TARGET ]
+then
+	install -c "$TARGET/urbackupclientbackend" "$PREFIX/sbin"
+	install -c "$TARGET/urbackupclientctl" "$PREFIX/bin"
 fi
 
 if ! "$PREFIX/bin/urbackupclientctl" --version 2>&1 | grep "UrBackup Client Controller" > /dev/null 2>&1
 then
-	echo "Error running executable on this system ($arch). Stopping installation."
+	echo "Error running executable on this system \($arch\). Stopping installation."
 	exit 2
 fi
 
@@ -155,6 +211,7 @@ do
 done
 
 install -c "backup_scripts/list" "$PREFIX/share/urbackup/scripts"
+install -c "backup_scripts/list_incr" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/mariadbdump" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/postgresqldump" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/postgresbase" "$PREFIX/share/urbackup/scripts"
@@ -162,6 +219,7 @@ install -c "backup_scripts/postgresqlprebackup" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/postgresqlpostbackup" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/setup-postgresbackup" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/mariadbxtrabackup" "$PREFIX/share/urbackup/scripts"
+install -c "backup_scripts/mariadbxtrabackup_incr" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/restore-mariadbbackup" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/mariadbprebackup" "$PREFIX/share/urbackup/scripts"
 install -c "backup_scripts/mariadbpostbackup" "$PREFIX/share/urbackup/scripts"
@@ -171,8 +229,10 @@ install -c "btrfs_create_filesystem_snapshot" "$PREFIX/share/urbackup"
 install -c "btrfs_remove_filesystem_snapshot" "$PREFIX/share/urbackup"
 install -c "lvm_create_filesystem_snapshot" "$PREFIX/share/urbackup"
 install -c "lvm_remove_filesystem_snapshot" "$PREFIX/share/urbackup"
-install -c "dattobd_create_filesystem_snapshot" "$PREFIX/share/urbackup"
-install -c "dattobd_remove_filesystem_snapshot" "$PREFIX/share/urbackup"
+install -c "dattobd_create_snapshot" "$PREFIX/share/urbackup"
+install -c "dattobd_remove_snapshot" "$PREFIX/share/urbackup"
+install -c "dm_create_snapshot" "$PREFIX/share/urbackup"
+install -c "dm_remove_snapshot" "$PREFIX/share/urbackup"
 install -c "filesystem_snapshot_common" "$PREFIX/share/urbackup"
 
 test -e "$PREFIX/etc/urbackup/mariadbdump.conf" || install -c "backup_scripts/mariadbdump.conf" "$PREFIX/etc/urbackup"
@@ -252,8 +312,18 @@ then
 	
 	if [ "x$SYSTEMD_DIR" = x ]
 	then
-		echo "Cannot find systemd unit dir. Assuming /lib/systemd/system"
-		SYSTEMD_DIR="/lib/systemd/system"
+		if test -e "/lib/systemd/system/urbackupclientbackend.service"
+		then
+			echo "Updating existing systemd unit at /lib/systemd/system/urbackupclientbackend.service"
+			SYSTEMD_DIR="/lib/systemd/system"
+		elif test -e "/usr/lib/systemd/system"
+		then
+			echo "Cannot find systemd unit dir. Assuming /usr/lib/systemd/system"
+			SYSTEMD_DIR="/usr/lib/systemd/system"
+		else
+			echo "Cannot find systemd unit dir. Assuming /lib/systemd/system"
+			SYSTEMD_DIR="/lib/systemd/system"
+		fi
 	fi
 	
 	install -c urbackupclientbackend.service $SYSTEMD_DIR
@@ -295,7 +365,7 @@ then
 			exit 1
 		fi
 	else
-		echo "Systemd failed (see previous messages). Starting urbackupclientbackend manually this time..."
+		echo "Systemd failed \(see previous messages\). Starting urbackupclientbackend manually this time..."
 		urbackupclientbackend -d -c $CONFIG_FILE
 	fi
 	
@@ -305,7 +375,7 @@ else
 	INSTALL_SYSV=yes
 	if [ $DEBIAN = yes ] && ! [ -e /lib/lsb/init-functions ]
 	then
-		echo "/lib/lsb/init-functions not found. lsb-base (>= 3.0-6) not installed? Not installing System V init script."
+		echo "/lib/lsb/init-functions not found. lsb-base \(>= 3.0-6\) not installed? Not installing System V init script."
 		INSTALL_SYSV=no
 	elif [ $DEBIAN = no ] && ! [ -e /etc/rc.d/init.d/functions ]
 	then
@@ -339,7 +409,7 @@ else
 		then
 			echo "Successfully started client service. Installation complete."
 		else
-			echo "Starting client service failed (see previous messages). Starting urbackupclientbackend manually this time..."
+			echo "Starting client service failed \(see previous messages\). Starting urbackupclientbackend manually this time..."
 			urbackupclientbackend -d -c $CONFIG_FILE
 		fi
 	else
@@ -362,6 +432,7 @@ then
     DATTO=no
     LVM=no
     BTRFS=no
+	DMSETUP=no
 
     if [ $DEBIAN = no ]
     then
@@ -434,7 +505,7 @@ then
 	if command -v lvs >/dev/null 2>&1
 	then
 		LVM_VOLS=`lvs 2> /dev/null | wc -l`
-		if [ "x$LVM_VOLS" != x ] && [ $LVM_VOLS > 1 ]
+		if [ "x$LVM_VOLS" != x ] && [ $LVM_VOLS -gt 1 ]
 		then
 			echo "+Detected LVM volumes"
 			LVM=yes
@@ -445,13 +516,21 @@ then
 		echo "-LVM not installed"
 	fi
 	
+	if command -v dmsetup >/dev/null 2>&1
+	then
+		DMSETUP=yes
+		echo "+dmsetup present"
+	else
+		echo "-dmsetup not present"
+	fi
+	
 
     while true
     do
         echo "Please select the snapshot mechanism to be used for backups:"
         if [ $DATTO != no ]
         then
-            echo "1) dattobd volume snapshot kernel module from https://github.com/datto/dattobd"
+            echo "1) dattobd volume snapshot kernel module from https://github.com/datto/dattobd (supports image backups and changed block tracking)"
         fi
 
         if [ $LVM != no ]
@@ -463,8 +542,13 @@ then
         then
             echo "3) btrfs filesystem snapshots (dattobd and LVM will automatically use btrfs snapshots for btrfs filesystems)"
         fi
+		
+		if [ $DMSETUP != no ]
+        then
+            echo "4) Linux device mapper based snapshots (supports image backups and changed block tracking)"
+        fi
 
-        echo "4) Use no snapshot mechanism"
+        echo "5) Use no snapshot mechanism"
 
         read snapn
 
@@ -487,12 +571,19 @@ then
         then
             break
         fi
+		
+		if [ "x$snapn" = x5 ]
+        then
+            break
+        fi
     done
 
     mkdir -p $PREFIX/etc/urbackup
 
 	CREATE_SNAPSHOT_SCRIPT=""
 	REMOVE_SNAPSHOT_SCRIPT=""
+	CREATE_VOLUME_SNAPSHOT=""
+	REMOVE_VOLUME_SNAPSHOT=""
     if [ $snapn = 3 ]
     then
 		CREATE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/btrfs_create_filesystem_snapshot"
@@ -526,11 +617,43 @@ then
 		
 		echo "Configured dattobd. Please install dattobd following the instructions at https://github.com/datto/dattobd"
 
-		CREATE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dattobd_create_filesystem_snapshot"
-		REMOVE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dattobd_remove_filesystem_snapshot"
+		CREATE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dattobd_create_snapshot"
+		REMOVE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dattobd_remove_snapshot"
+		CREATE_VOLUME_SNAPSHOT="$PREFIX/share/urbackup/dattobd_create_snapshot"
+		REMOVE_VOLUME_SNAPSHOT="$PREFIX/share/urbackup/dattobd_remove_snapshot"
     fi
 	
 	if [ $snapn = 4 ]
+	then
+		CREATE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dm_create_snapshot"
+		REMOVE_SNAPSHOT_SCRIPT="$PREFIX/share/urbackup/dm_remove_snapshot"
+		CREATE_VOLUME_SNAPSHOT="$PREFIX/share/urbackup/dm_create_snapshot"
+		REMOVE_VOLUME_SNAPSHOT="$PREFIX/share/urbackup/dm_remove_snapshot"
+		
+		if [ $DEBIAN = yes ] || [ $UBUNTU = yes ]
+		then
+			echo "## Install thin-provisioning tools for changed block detection and partclone for used space optimization ##"
+			apt-get install thin-provisioning-tools partclone || true
+		fi
+		
+		echo "Convert root device into device mapper device on boot (initramfs)? This is required for root device/filesystem backup. [Y/n]"
+		read yn
+		if [ "x$yn" != xn ]
+		then
+			if [ -e /usr/share/initramfs-tools/hooks ]
+			then
+				install -c "hooks_urbackup-setup-snapshot" /usr/share/initramfs-tools/hooks/urbackup-setup-snapshot
+				mkdir -p /usr/share/initramfs-tools/scripts/local-top
+				install -c "scripts_local-top_urbackup-setup-snapshot" /usr/share/initramfs-tools/scripts/local-top/urbackup-setup-snapshot
+				update-initramfs -u
+				echo "Info: You need to reboot your system in order to be able to snapshot the root file system/device"
+			else
+				echo "Did not find initramfs-tools. Installation failed."
+			fi
+		fi
+	fi
+	
+	if [ $snapn = 5 ]
 	then
 		touch $PREFIX/etc/urbackup/no_filesystem_snapshot
 		echo "Configured no snapshot mechanism"
@@ -542,6 +665,11 @@ then
 		echo "" >> $PREFIX/etc/urbackup/snapshot.cfg
 		echo "create_filesystem_snapshot=$CREATE_SNAPSHOT_SCRIPT" >> $PREFIX/etc/urbackup/snapshot.cfg
 		echo "remove_filesystem_snapshot=$REMOVE_SNAPSHOT_SCRIPT" >> $PREFIX/etc/urbackup/snapshot.cfg
+		if [ "x$CREATE_VOLUME_SNAPSHOT" != "x" ]
+		then
+			echo "create_volume_snapshot=$CREATE_VOLUME_SNAPSHOT" >> $PREFIX/etc/urbackup/snapshot.cfg
+			echo "remove_volume_snapshot=$REMOVE_VOLUME_SNAPSHOT" >> $PREFIX/etc/urbackup/snapshot.cfg
+		fi
 		echo "Configured snapshot mechanism via $PREFIX/etc/urbackup/snapshot.cfg"
 	fi
 fi

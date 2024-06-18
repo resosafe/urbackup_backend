@@ -45,10 +45,10 @@ struct SDatabase
 	std::map<THREAD_ID, IDatabaseInt*> tmap;
 	std::vector<std::pair<std::string,std::string> > attach;
 	size_t allocation_chunk_size;
-	std::auto_ptr<ISharedMutex> single_user_mutex;
-	std::auto_ptr<IMutex> lock_mutex;
-	std::auto_ptr<int> lock_count;
-	std::auto_ptr<ICondition> unlock_cond;
+	std::unique_ptr<ISharedMutex> single_user_mutex;
+	std::unique_ptr<IMutex> lock_mutex;
+	std::unique_ptr<int> lock_count;
+	std::unique_ptr<ICondition> unlock_cond;
 	str_map params;
 
 private:
@@ -73,6 +73,7 @@ public:
 	virtual void setLogCircularBufferSize(size_t size);
 	virtual std::vector<SCircularLogEntry> getCicularLogBuffer(size_t minid);
 	virtual void Log(const std::string &pStr, int LogLevel=LL_INFO);
+	virtual void setLogRotationFiles(size_t n);
 	virtual bool Write(THREAD_ID tid, const std::string &str, bool cached=true);
 	virtual bool WriteRaw(THREAD_ID tid, const char *buf, size_t bsize, bool cached=true);
 
@@ -86,6 +87,9 @@ public:
 	virtual bool RemoveAction(IAction *action);
 	virtual void setActionContext(std::string context);
 	virtual void resetActionContext(void);
+
+	virtual void addWebSocket(IWebSocket* websocket);
+	virtual THREAD_ID ExecuteWebSocket(const std::string& name, str_map& GET, str_map& PARAMS, IPipe* pipe, const std::string& endpoint_name);
 
 	virtual int64 getTimeSeconds(void);
 	virtual int64 getTimeMS(void);
@@ -156,7 +160,7 @@ public:
 	virtual IFsFile* openFile(std::string pFilename, int pMode=0);
 	virtual IFsFile* openFileFromHandle(void *handle, const std::string& pFilename);
 	virtual IFsFile* openTemporaryFile(void);
-	virtual IFile* openMemoryFile(void);
+	virtual IMemFile* openMemoryFile(const std::string& name, bool mlock_mem);
 	virtual bool deleteFile(std::string pFilename);
 	virtual bool fileExists(std::string pFilename);
 
@@ -215,6 +219,8 @@ public:
 	virtual int getRecvWindowSize();
 #endif
 
+	void mallocFlushTcache();
+
 private:
 
 	void logToCircularBuffer(const std::string& msg, int loglevel);
@@ -233,6 +239,7 @@ private:
 
 	IMutex* log_mutex;
 	IMutex* action_mutex;
+	IMutex* web_socket_mutex;
 	IMutex* requests_mutex;
 	IMutex* outputs_mutex;
 	IMutex* db_mutex;
@@ -248,6 +255,8 @@ private:
 	bool startup_complete;
 
 	std::map< std::string, std::map<std::string, IAction*> > actions;
+
+	std::map<std::string, IWebSocket*> web_sockets;
 
 	std::map<std::string, UNLOADACTIONS> unload_functs;
 	std::vector<HMODULE> unload_handles;

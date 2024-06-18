@@ -17,12 +17,24 @@
 **************************************************************************/
 
 #include "LRUMemCache.h"
+#include "../Interface/Server.h"
+#include "../stringtools.h"
 #include <string.h>
+#include <assert.h>
 
 
-LRUMemCache::LRUMemCache( size_t buffersize, size_t nbuffers )
-	: buffersize(buffersize), nbuffers(nbuffers), callback(NULL)
+LRUMemCache::LRUMemCache(size_t buffersize, size_t nbuffers, size_t p_n_threads)
+	: buffersize(buffersize), nbuffers(nbuffers), callback(nullptr),
+	mutex(Server->createMutex()), cond(Server->createCondition()), n_threads(p_n_threads),
+	do_quit(false), n_threads_working(0), cond_wait(Server->createCondition()), wait_work(false)
 {
+	if (n_threads > 0)
+		--n_threads;
+
+	for (size_t i = 0; i < n_threads; ++i)
+	{
+		Server->createThread(this, "comp img"+convert(i));
+	}
 }
 
 char* LRUMemCache::get( __int64 offset, size_t& bsize )
@@ -38,7 +50,7 @@ char* LRUMemCache::get( __int64 offset, size_t& bsize )
 		}
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 bool LRUMemCache::put( __int64 offset, const char* buffer, size_t bsize )
@@ -94,6 +106,8 @@ void LRUMemCache::setCacheEvictionCallback( ICacheEvictionCallback* cacheEvictio
 
 void LRUMemCache::clear()
 {
+	waitThreadWork();
+
 	for(size_t i=0;i<lruItems.size();++i)
 	{
 		evict(lruItems[i], true);
@@ -101,43 +115,141 @@ void LRUMemCache::clear()
 	lruItems.clear();
 }
 
-void LRUMemCache::evict( SCacheItem& item, bool deleteBuffer )
+void LRUMemCache::operator()()
 {
-	if(callback!=NULL)
+	IScopedLock lock(mutex.get());
+	while (!do_quit)
 	{
+		while (!do_quit
+			&& evictedItems.empty())
+		{
+			cond->wait(&lock);
+		}
+
+		if (evictedItems.empty())
+			break;
+
+		SCacheItem item = evictedItems.back();
+		evictedItems.pop_back();
+		++n_threads_working;
+		lock.relock(nullptr);
+
 		callback->evictFromLruCache(item);
-	}
-	if(deleteBuffer)
+
+		lock.relock(mutex.get());
+		lruItemBuffers.push_back(item.buffer);
+		--n_threads_working;
+		if(wait_work)
+			cond_wait->notify_all();
+	}	
+	--n_threads;
+	cond_wait->notify_all();
+}
+
+char* LRUMemCache::evict( SCacheItem& item, bool deleteBuffer )
+{
+	if (deleteBuffer)
 	{
-		delete[] item.buffer;
+		if (callback != nullptr)
+		{
+			callback->evictFromLruCache(item);
+		}
+		if (deleteBuffer)
+		{
+			delete[] item.buffer;
+		}
+
+		return nullptr;
 	}
+	else
+	{
+		if (callback == nullptr)
+		{
+			return nullptr;
+		}
+
+		IScopedLock lock(mutex.get());
+		if (evictedItems.size() >= n_threads)
+		{
+			char* ret = item.buffer;
+			callback->evictFromLruCache(item);
+			return ret;
+		}
+		else
+		{
+			evictedItems.push_back(item);
+			cond->notify_one();
+			return getLruItemBuffer(lock);
+		}
+	}
+}
+
+char* LRUMemCache::getLruItemBuffer(IScopedLock& lock)
+{
+	if (!lruItemBuffers.empty())
+	{
+		char* ret = lruItemBuffers.back();
+		lruItemBuffers.pop_back();
+		return ret;
+	}
+	lock.relock(nullptr);
+	return new char[buffersize];
 }
 
 LRUMemCache::~LRUMemCache()
 {
 	clear();
+
+	finishThreads();
+
+	for (size_t i = 0; i < lruItemBuffers.size(); ++i)
+	{
+		delete[] lruItemBuffers[i];
+	}
+
+	lruItemBuffers.clear();
+}
+
+void LRUMemCache::finishThreads()
+{
+	IScopedLock lock(mutex.get());
+	do_quit = true;
+	while (n_threads > 0)
+	{
+		cond->notify_all();
+		cond_wait->wait(&lock);
+	}
+}
+
+void LRUMemCache::waitThreadWork()
+{
+	IScopedLock lock(mutex.get());
+	wait_work = true;
+	while (!evictedItems.empty()
+		|| n_threads_working > 0)
+	{
+		cond_wait->wait(&lock);
+	}
+	wait_work = false;
 }
 
 SCacheItem LRUMemCache::createInt( __int64 offset )
 {
-	char* buffer=NULL;
-	if(lruItems.size()==nbuffers)
+	char* buffer=nullptr;
+	if(lruItems.size()>=nbuffers)
 	{
 		SCacheItem& toremove = lruItems[0];
-		buffer = toremove.buffer;
-		evict(toremove, false);
+		buffer = evict(toremove, false);
 		lruItems.erase(lruItems.begin());
-	}
-
-	SCacheItem newItem;
-	if(buffer!=NULL)
-	{
-		newItem.buffer=buffer;
 	}
 	else
 	{
-		newItem.buffer=new char[buffersize];
+		buffer = new char[buffersize];
 	}
+
+	SCacheItem newItem;
+	assert(buffer != nullptr);
+	newItem.buffer=buffer;
 	newItem.offset=offset - offset % buffersize;
 
 	lruItems.push_back(newItem);
@@ -150,7 +262,7 @@ char* LRUMemCache::create( __int64 offset )
 	size_t bsize;
 	char* buf = get(offset, bsize);
 
-	if(buf!=NULL)
+	if(buf!=nullptr)
 	{
 		return buf;
 	}

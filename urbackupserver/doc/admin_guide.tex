@@ -14,7 +14,7 @@
 \hypersetup{ pdfborder={0 0 0} }
 
 \author{Martin Raiber}
-\title{Administration Manual for\\UrBackup Server 2.2.x}
+\title{Administration Manual for\\UrBackup Server 2.5.x}
 
 \maketitle
 
@@ -27,7 +27,7 @@
 UrBackup is a client/server backup system. This means there is a server
 which backs up clients. Accordingly UrBackup is divided into a client and server
 software.
-The client software currently runs on Windows, Linux and Mac OS X with only
+The client software currently runs on Windows, Linux and FreeBSD with only
 the Windows client being able to perform image backups. 
 The server part of UrBackup runs on Windows, GNU/Linux and FreeBSD.\\
 A lot of effort in UrBackup was made to make setup as easy as possible. If you
@@ -79,13 +79,8 @@ a 64-bit operating system and at least Windows Vista/2008.
      volumes or a hardware raid. If you are using a plain volume change it to a dynamic volume before the
      first backup.
      \item Turn on compression for the urbackup folder (in Explorer: Right click and properties). If you are not using a really old computer it should pay off without decreasing the backup speed. Possible exception: If you plan to backup files with more than 50GB or turn off the image compression and plan to backup volumes with more than 50GB you should not turn on compression. NTFS cannot compress files larger than about 50GB.
-     \item Alternative to the compression you can use the offline dedup and compression build into Windows Server 2012
-     \item Disable 8.3 name generation on the volume. See \url{https://support.microsoft.com/en-us/kb/121007} on how to do this. 8.3 name generation causes errors in rare cases, lowers performance and the 8.3 names are only used in rare cases.
-     \item If you are using Windows Server 2008(R2) (or the equivalent Desktop versions) you should consider consider applying hotfix \url{https://support.microsoft.com/en-us/kb/967351} and then formatting the backup storage volume with
- 	\begin{verbatim}
-     Format <Drive:> /FS:NTFS /L
-     \end{verbatim}
-     This prevents a potential issue with large files on those operating systems.
+     \item Alternative to the compression you can use the offline dedup and compression built into Windows Server 2012
+     \item Check 8.3 name generation is disabled on the volume. Since Windows 8 and Windows Server 2012 newly formatted NTFS volumes have short names disabled by default. See \url{https://docs.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-8dot3name} on how to do this. 8.3 name generation lowers performance and can cause errors in large directories with lots of similarly starting file names and the 8.3 names are only used in rare cases.
    \end{itemize}
    \item Continue with the operating system independent installation steps in section \ref{os_independent_installation_steps}. 
 \end{itemize}
@@ -136,7 +131,7 @@ Go to the webinterface (\url{http://localhost:55414}) and configure the backup s
 \begin{itemize}
   \item It should be easily extendable, which can be done by using a hardware raid, the volume manager LVM or the next generation file systems btrfs and ZFS.
   \item You should compress the file backups. This can be done by using ZFS (\url{http://zfsonlinux.org/}) or btrfs.
-  \item Prefer btrfs, because UrBackup can put each file backup into a separate sub-volume and is able to do a cheap block based deduplication in incremental file backups. See section \ref{subsec_btrfs_setup} on how to setup a btrfs backup storage. You should set a generously low soft file system quota (see section \ref{global_soft_fs_quota})  if using btrfs, because btrfs currently still has issues in out-of-space situations and may require manual intervention.
+  \item Prefer btrfs, because UrBackup can put each file backup into a separate sub-volume and is able to do a cheap block based deduplication in incremental file backups. See section \ref{subsec_btrfs_setup} on how to setup a btrfs backup storage.
 \end{itemize}
 
 \subsubsection{Operating system independent server installation steps}
@@ -157,7 +152,7 @@ After you have installed the UrBackup server you should perform following steps:
 \subsection{Client installation}
 \label{client_installation}
 
-\subsubsection{Windows/Mac OS X client installation}
+\subsubsection{Windows client installation}
 
 \noindent If you plan on using the client in the same local network as the server, or the client is in your local network during setup time:
 
@@ -189,7 +184,14 @@ First, if you want to deviate from the default backup path selection, configure 
 
 \noindent \textbf{For internet clients:}\\
 
-\noindent Adapt the script at \url{https://urbackup.atlassian.net/wiki/display/US/Download+custom+client+installer+via+Python} to your server URL and create a python executable from the modified script via cx\_Freeze (\url{http://cx-freeze.sourceforge.net/}). Executing the python executable on the client automatically creates a new internet client on the server, downloads a custom client and runs the installer. You could also add the silent install switch (``/S'') when starting the downloaded installer such that it needs no user intervention.
+\noindent You can use \url{https://installercreator.urbackup.org} to create a custom installer for your server that creates a client on the server,
+then downloads the client installer from the server and finally installs it. There are multiple options to allow e.g. silent installation, installation without tray
+icon, etc.
+
+Alternatively adapt the script at \url{https://urbackup.atlassian.net/wiki/display/US/Download+custom+client+installer+via+Python} to your server URL and settings
+and create a python executable from the modified script via e.g. cx\_Freeze (\url{http://cx-freeze.sourceforge.net/}) or py2exe. Executing the python
+executable on the client automatically creates a new internet client on the server, downloads a custom client and runs the installer.
+You could also e.g. add the silent install switch (``/S'') when starting the downloaded installer such that it needs no user intervention.
 
 \subsubsection{Client installation on Linux}
 
@@ -205,9 +207,14 @@ First, if you want to deviate from the default backup path selection, configure 
 \noindent If the client is only reachable via Internet/through NAT:
 
 \begin{itemize}
-  \item Add a new Internet client on the status page.
-  \item Download the client installer for the Internet client and send it to the new client. Alternatively, create a user for the new client (in the settings) and send the user the username/password. The user can then download the client installer from the server on the status page and install it.
-  \item Select the backup paths you want to backup on the client via command line (``urbackupclientctl add-backupdir --path /'' or configure appropriate default directories to backup on the server (see section \ref{subsub_default_dirs}).
+  \item Add a new Internet client on the status page (selecting the client behind NAT option).
+  \item Follow the instructs for Linux on the page after the client was added. Alternatively download the
+  	client installer for the Internet client and send it to the new client. Another alternative is to create
+  	a user for the new client (in the settings) and send the user the username/password. The user can then
+  	download the client installer from the server on the status page and install it.
+  \item Select the backup paths you want to backup on the client via command line
+  (``urbackupclientctl add-backupdir --path /'' or configure appropriate default directories
+  to backup on the server (see section \ref{subsub_default_dirs}).
   \item The server will automatically start backups once the client is connected.
 \end{itemize}
 
@@ -321,16 +328,23 @@ The server web interface is accessible via FastCGI (on port 55413 TCP). With thi
 \subsubsection{Apache configuration}
 \label{subsub_apache}
 
-Either add a symlink to the 'www' UrBackup directory or define it as an alias. For the symlink method you need to go to your SSL webroot and then do e.g.:
+Either add a symlink to the 'www' UrBackup directory or define it as an alias. 
+For the symlink method you need to go to your SSL webroot and then do e.g.:
 \begin{verbatim}
 ln -s /usr/share/urbackup/www urbackup
 \end{verbatim}
-Be sure you have set 'Option +FollowSymLinks' in the web server configuration on the directory you link into. From now on it is assumed that urbackup should be accessible via\\ https://hostname/urbackup.
-Download and install 'libapache2-mod-fastcgi' (this may have another name on other distributions and maybe in a ``non-free'' section). Add following line to the 'fastcgi.conf':
+Be sure you have set 'Option +FollowSymLinks' in the web server configuration on the directory you link into. 
+Afterwards enable the Apache $2$ plugin ``mod\_proxy\_fcgi''. For example on Debian/Ubuntu with
 \begin{verbatim}
-FastCgiExternalServer /var/www/urbackup/x -host 127.0.0.1:55413
+a2enmod proxy_fcgi
 \end{verbatim}
-The path depends of cause on where your web root is and where you want the web interface to be. UrBackup should now be accessible via apache.
+Then proxy the ``x'' file to the locally (or remotely) running UrBackup FastCGI server (default port 55413).
+E.g. by adding the following to your SSL virtual host configuration:
+\begin{verbatim}
+ProxyPass "/urbackup/x" "fcgi://127.0.0.1:55413"
+\end{verbatim}
+The path (``/urbackup/x'') depends on where your web root of UrBackup is (``index.htm" should be in the same directory)
+and where you want the web interface to be. UrBackup should now be accessible via apache.
 
 \subsubsection{Lighttp configuration}
 

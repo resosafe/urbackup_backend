@@ -45,6 +45,13 @@
 #include "../fileservplugin/chunk_settings.h"
 #include "ImageThread.h"
 #include "../common/adler32.h"
+#include <string.h>
+
+#ifdef __APPLE__
+#include <iostream>
+#include <sys/xattr.h>
+#include <sys/types.h>
+#endif
 
 //For truncating files
 #ifdef _WIN32
@@ -53,6 +60,7 @@
 #include <sys\stat.h>
 #include "win_disk_mon.h"
 #include "win_all_volumes.h"
+#include "win_locked.h"
 #else
 #include "../config.h"
 #ifdef HAVE_MNTENT_H
@@ -66,6 +74,21 @@
 #include "../urbackupcommon/glob.h"
 #include "TokenCallback.h"
 
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#endif
+
+#if defined(__ANDROID__)
+#include <sys/socket.h>
+#include <sys/types.h>
+#include "../urbackupcommon/android_popen.h"
+#endif
+
+
 volatile bool IdleCheckerThread::idle=false;
 volatile bool IdleCheckerThread::pause=false;
 volatile bool IndexThread::stop_index=false;
@@ -74,7 +97,7 @@ IMutex* IndexThread::cbt_shadow_id_mutex;
 std::map<std::string, int> IndexThread::cbt_shadow_ids;
 std::map<unsigned int, IndexThread::SResult> IndexThread::index_results;
 unsigned int IndexThread::next_result_id = 1;
-IMutex* IndexThread::result_mutex = NULL;
+IMutex* IndexThread::result_mutex = nullptr;
 
 const char IndexThread::IndexThreadAction_StartFullFileBackup=0;
 const char IndexThread::IndexThreadAction_StartIncrFileBackup=1;
@@ -85,11 +108,18 @@ const char IndexThread::IndexThreadAction_GetLog=9;
 const char IndexThread::IndexThreadAction_PingShadowCopy=10;
 const char IndexThread::IndexThreadAction_AddWatchdir = 5;
 const char IndexThread::IndexThreadAction_RemoveWatchdir = 6;
-const char IndexThread::IndexThreadAction_UpdateCbt = 7;
+const char IndexThread::IndexThreadAction_RestartFilesrv = 7;
+const char IndexThread::IndexThreadAction_Stop = 8;
 const char IndexThread::IndexThreadAction_SnapshotCbt = 12;
 const char IndexThread::IndexThreadAction_WriteTokens = 13;
+const char IndexThread::IndexThreadAction_UpdateCbt = 14;
 
 extern PLUGIN_ID filesrv_pluginid;
+
+#ifdef __APPLE__
+    std::vector<std::string> IndexThread::macos_exclusions;
+    std::vector<std::string> IndexThread::macos_overrides;
+#endif
 
 namespace
 {
@@ -205,7 +235,7 @@ namespace
 		}
 		else
 		{
-			std::auto_ptr<IFile> journal_info(Server->openFile(vol+"\\$Extend\\$UsnJrnl:$Max", MODE_READ_SEQUENTIAL_BACKUP));
+			std::unique_ptr<IFile> journal_info(Server->openFile(vol+"\\$Extend\\$UsnJrnl:$Max", MODE_READ_SEQUENTIAL_BACKUP));
 
 			if(journal_info.get()==NULL) return -1;
 
@@ -217,7 +247,7 @@ namespace
 
 			sequence_id = journal_data.UsnJournalID;
 
-			std::auto_ptr<IFile> journal(Server->openFile(vol+"\\$Extend\\$UsnJrnl:$J", MODE_READ_SEQUENTIAL_BACKUP));
+			std::unique_ptr<IFile> journal(Server->openFile(vol+"\\$Extend\\$UsnJrnl:$J", MODE_READ_SEQUENTIAL_BACKUP));
 
 			if(journal.get()==NULL) return -1;
 
@@ -382,6 +412,73 @@ namespace
 #endif //!_WIN32
 
 #ifndef _WIN32
+	std::string getMountDevice(const std::string& path)
+	{		
+#ifndef HAVE_MNTENT_H
+		return std::string();
+#else
+		if(path.find("/dev/")==0)
+		{
+			return path;
+		}
+
+		FILE *aFile;
+
+		aFile = setmntent("/proc/mounts", "r");
+		if (aFile == NULL) {
+			return std::string();
+		}
+		struct mntent *ent;
+		while (NULL != (ent = getmntent(aFile)))
+		{
+			if(std::string(ent->mnt_dir)==path)
+			{
+				endmntent(aFile);
+				return ent->mnt_fsname;
+			}
+		}
+		endmntent(aFile);
+
+		return std::string();
+#endif //HAVE_MNTENT_H
+	}
+#else //!_WIN32
+	std::string getMountDevice(const std::string& path)
+	{
+		return std::string();
+	}
+#endif
+
+#ifndef _WIN32
+	std::string getDeviceMount(const std::string& dev)
+	{		
+#ifndef HAVE_MNTENT_H
+		return std::string();
+#else
+		FILE *aFile;
+
+		aFile = setmntent("/proc/mounts", "r");
+		if (aFile == NULL) {
+			return std::string();
+		}
+		struct mntent *ent;
+		while (NULL != (ent = getmntent(aFile)))
+		{
+			if(std::string(ent->mnt_fsname)==dev)
+			{
+				endmntent(aFile);
+				return ent->mnt_dir;
+			}
+		}
+		endmntent(aFile);
+
+		return std::string();
+#endif //HAVE_MNTENT_H
+	}
+#endif //!_WIN32
+
+
+#ifndef _WIN32
 	std::vector<std::string> getAllMounts(const std::vector<std::string>& excl_fs, bool filter_usb)
 	{
 #ifndef HAVE_MNTENT_H
@@ -434,10 +531,10 @@ namespace
 #endif
 }
 
-IMutex *IndexThread::filelist_mutex=NULL;
-IPipe* IndexThread::msgpipe=NULL;
-IFileServ *IndexThread::filesrv=NULL;
-IMutex *IndexThread::filesrv_mutex=NULL;
+IMutex *IndexThread::filelist_mutex=nullptr;
+IPipe* IndexThread::msgpipe=nullptr;
+IFileServ *IndexThread::filesrv=nullptr;
+IMutex *IndexThread::filesrv_mutex=nullptr;
 
 std::string add_trailing_slash(const std::string &strDirName)
 {
@@ -457,27 +554,27 @@ std::string add_trailing_slash(const std::string &strDirName)
 
 IndexThread::IndexThread(void)
 	: index_error(false), last_filebackup_filetime(0), index_group(-1),
-	with_scripts(false), volumes_cache(NULL), phash_queue(NULL),
-	index_backup_dirs_optional(false)
+	with_scripts(false), volumes_cache(nullptr), phash_queue(nullptr),
+	index_backup_dirs_optional(false), sc_refs_cleanup(false)
 {
-	if(filelist_mutex==NULL)
+	if(filelist_mutex==nullptr)
 		filelist_mutex=Server->createMutex();
-	if(msgpipe==NULL)
+	if(msgpipe==nullptr)
 		msgpipe=Server->createMemoryPipe();
-	if(filesrv_mutex==NULL)
+	if(filesrv_mutex==nullptr)
 		filesrv_mutex=Server->createMutex();
 
 	read_error_mutex = Server->createMutex();
 
-	if (cbt_shadow_id_mutex == NULL)
+	if (cbt_shadow_id_mutex == nullptr)
 		cbt_shadow_id_mutex = Server->createMutex();
 
-	if (result_mutex == NULL)
+	if (result_mutex == nullptr)
 		result_mutex = Server->createMutex();
 
 	curr_result_id = 0;
 
-	dwt=NULL;
+	dwt=nullptr;
 
 	if(Server->getPlugin(Server->getThreadID(), filesrv_pluginid))
 	{
@@ -485,7 +582,7 @@ IndexThread::IndexThread(void)
 	}
 	else
 	{
-		filesrv=NULL;
+		filesrv=nullptr;
 		Server->Log("Error starting fileserver", LL_ERROR);
 	}
 
@@ -536,6 +633,9 @@ void IndexThread::updateDirs(void)
 	std::vector<ContinuousWatchEnqueue::SWatchItem> continuous_watch;
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		watching.push_back(backup_dirs[i].path);
 
 		if(backup_dirs[i].group==c_group_continuous)
@@ -554,6 +654,9 @@ void IndexThread::updateDirs(void)
 	{
 		for(size_t i=0;i<backup_dirs.size();++i)
 		{
+			if (backup_dirs[i].facet != index_facet_id)
+				continue;
+
 			std::string msg="A"+backup_dirs[i].path;
 			dwt->getPipe()->Write(msg);
 		}
@@ -588,6 +691,7 @@ void IndexThread::operator()(void)
 	Server->waitForStartupComplete();
 
 #ifdef _WIN32
+	init_win_locked();
 	initVss();
 	init_cbt_mutex();
 	if (os_get_file_type("urbctctl.exe") != 0)
@@ -607,11 +711,7 @@ void IndexThread::operator()(void)
 	db=Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT);
 	cd=new ClientDAO(Server->getDatabase(Server->getThreadID(), URBACKUPDB_CLIENT));
 
-#ifdef _WIN32
-#ifdef ENABLE_VSS
 	cleanup_saved_shadowcopies();
-#endif
-#endif
 	
 	updateDirs();
 	register_token_callback();
@@ -630,7 +730,13 @@ void IndexThread::operator()(void)
 		}
 
 		std::string msg;
-		msgpipe->Read(&msg);
+		msgpipe->Read(&msg, sc_refs_cleanup ? 60000 : -1);
+
+		if (msg.empty())
+		{
+			run_sc_refs_cleanup();
+			continue;
+		}
 
 		async_timeout = false;
 		CRData data(&msg);
@@ -663,6 +769,7 @@ void IndexThread::operator()(void)
 			data.getInt(&sha_version);
 			int running_jobs = 2;
 			data.getInt(&running_jobs);
+			data.getInt(&index_facet_id);
 			char async_index = 0;
 			data.getChar(&async_index);
 			std::string async_ticket;
@@ -761,7 +868,7 @@ void IndexThread::operator()(void)
 
 				IndexErrorInfo error_info = indexDirs(false, running_jobs>1);
 
-				if ( (e_rc=execute_postindex_hook(true, starttoken, index_group))!=0 )
+				if ( (e_rc=execute_postindex_hook(true, starttoken, index_group, error_info))!=0 )
 				{
 					addResult(curr_result_id, "error - postfileindex script failed with error code " + convert(e_rc));
 				}
@@ -791,12 +898,12 @@ void IndexThread::operator()(void)
 				async_timeout_starttime = Server->getTimeMS();
 			}
 
-			if (phash_queue != NULL
+			if (phash_queue != nullptr
 				&& phash_queue->deref())
 			{
 				delete phash_queue;
 			}
-			phash_queue = NULL;
+			phash_queue = nullptr;
 		}
 		else if(action==IndexThreadAction_StartFullFileBackup)
 		{
@@ -811,6 +918,7 @@ void IndexThread::operator()(void)
 			data.getInt(&sha_version);
 			int running_jobs = 2;
 			data.getInt(&running_jobs);
+			data.getInt(&index_facet_id);
 			char async_index = 0;
 			data.getChar(&async_index);
 			std::string async_ticket;
@@ -862,7 +970,7 @@ void IndexThread::operator()(void)
 
 				IndexErrorInfo error_info = indexDirs(true, running_jobs>1);
 
-				if ( (e_rc=execute_postindex_hook(false, starttoken, index_group))!=0 )
+				if ( (e_rc=execute_postindex_hook(false, starttoken, index_group, error_info))!=0 )
 				{
 					addResult(curr_result_id, "error - postfileindex script failed with error code "+convert(e_rc));
 				}
@@ -888,12 +996,12 @@ void IndexThread::operator()(void)
 				async_timeout_starttime = Server->getTimeMS();
 			}
 
-			if (phash_queue != NULL
+			if (phash_queue != nullptr
 				&& phash_queue->deref())
 			{
 				delete phash_queue;
 			}
-			phash_queue = NULL;
+			phash_queue = nullptr;
 		}
 		else if(action==IndexThreadAction_CreateShadowcopy
 			 || action==IndexThreadAction_ReferenceShadowcopy )
@@ -948,14 +1056,14 @@ void IndexThread::operator()(void)
 			
 			if(scd->running==true && Server->getTimeSeconds()-scd->starttime<shadowcopy_timeout/1000)
 			{
-				if(scd->ref!=NULL && image_backup==0)
+				if(scd->ref!=nullptr && image_backup==0)
 				{
 					scd->ref->dontincrement=true;
 				}
 				bool onlyref = reference_sc;
 				if(start_shadowcopy(scd, &onlyref, image_backup!=0?true:false, running_jobs>1, std::vector<SCRef*>(), image_backup!=0?true:false))
 				{
-					if (scd->ref!=NULL
+					if (scd->ref!=nullptr
 						&& !onlyref)
 					{
 						for (size_t k = 0; k < sc_refs.size(); ++k)
@@ -966,13 +1074,13 @@ void IndexThread::operator()(void)
 								{
 									sc_refs[k]->cbt = finishCbt(sc_refs[k]->target,
 										image_backup != 0 ? sc_refs[k]->save_id : -1, sc_refs[k]->volpath,
-										image_backup != 0);
+										image_backup != 0, sc_refs[k]->cbt_file, sc_refs[k]->cbt_type);
 								}
 							}
 						}
 					}
 
-					if (scd->ref != NULL
+					if (scd->ref != nullptr
 						&& !scd->ref->cbt
 						&& !disableCbt(scd->orig_target) )
 					{
@@ -1025,7 +1133,7 @@ void IndexThread::operator()(void)
 				bool onlyref = reference_sc;
 				bool b= start_shadowcopy(scd, &onlyref, image_backup!=0?true:false, running_jobs>1, std::vector<SCRef*>(), image_backup==0?false:true);
 				Server->Log("done.", LL_DEBUG);
-				if(!b || scd->ref==NULL)
+				if(!b || scd->ref==nullptr)
 				{
 					if(scd->fileserv)
 					{
@@ -1042,7 +1150,7 @@ void IndexThread::operator()(void)
 				}
 				else
 				{
-					if (scd->ref != NULL
+					if (scd->ref != nullptr
 						&& !onlyref)
 					{
 						for (size_t k = 0; k < sc_refs.size(); ++k)
@@ -1053,13 +1161,13 @@ void IndexThread::operator()(void)
 								{
 									sc_refs[k]->cbt = finishCbt(sc_refs[k]->target, 
 										image_backup != 0 ? sc_refs[k]->save_id : -1, sc_refs[k]->volpath,
-										image_backup != 0);
+										image_backup != 0, sc_refs[k]->cbt_file, sc_refs[k]->cbt_type);
 								}
 							}
 						}
 					}
 
-					if (scd->ref != NULL
+					if (scd->ref != nullptr
 						&& !scd->ref->cbt
 						&& !disableCbt(scd->orig_target))
 					{
@@ -1114,14 +1222,14 @@ void IndexThread::operator()(void)
 
 			int64 starttime = Server->getTimeMS();
 
-			while (filesrv != NULL
+			while (filesrv != nullptr
 				&& filesrv->hasActiveTransfers(scdir, starttoken)
 				&& Server->getTimeMS() - starttime < 5000)
 			{
 				Server->wait(100);
 			}
 
-			if (filesrv != NULL
+			if (filesrv != nullptr
 				&& filesrv->hasActiveTransfers(scdir, starttoken) )
 			{
 				addResult(curr_result_id, "in use");
@@ -1286,14 +1394,14 @@ void IndexThread::operator()(void)
 			stop_index=false;
 		}
 #endif
-		else if(action==7) // restart filesrv
+		else if(action== IndexThreadAction_RestartFilesrv) // restart filesrv
 		{
 			IScopedLock lock(filesrv_mutex);
 			filesrv->stopServer();
 			start_filesrv();
 			readBackupDirs();
 		}
-		else if(action==8) //stop
+		else if(action==IndexThreadAction_Stop) //stop
 		{
 			break;
 		}
@@ -1332,11 +1440,11 @@ void IndexThread::operator()(void)
 
 			SCDirs *scd = getSCDir(scdir, index_clientsubname, true);
 
-			if(scd!=NULL && scd->ref!=NULL)
+			if(scd!=nullptr && scd->ref!=nullptr)
 			{
 				scd->ref->starttime = Server->getTimeSeconds();
 			}
-			if (scd != NULL)
+			if (scd != nullptr)
 			{
 				scd->starttime = Server->getTimeSeconds();
 			}
@@ -1356,7 +1464,7 @@ void IndexThread::operator()(void)
 			data.getStr(&volume);
 
 			if (prepareCbt(volume)
-				&& finishCbt(volume, -1, std::string(), false))
+				&& finishCbt(volume, -1, std::string(), false, std::string(), CbtType_None))
 			{
 				addResult(curr_result_id, "done");
 			}
@@ -1380,7 +1488,7 @@ void IndexThread::operator()(void)
 
 IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simultaneous_other)
 {
-	readPatterns(index_group, index_clientsubname,
+	readPatterns(index_facet_id, index_group, index_clientsubname,
 		index_exclude_dirs, index_include_dirs,
 		index_backup_dirs_optional);
 	file_id = 0;
@@ -1407,6 +1515,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 	std::vector<int> selected_dir_db_tgroup;
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if(backup_dirs[i].group==index_group
 			|| (backup_with_vss_components
 				&& backup_dirs[i].group== c_group_vss_components) )
@@ -1484,6 +1595,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		backup_dirs[i].symlinked_confirmed=false;
 	}
 
@@ -1492,19 +1606,19 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 	last_tmp_update_time=Server->getTimeMS();
 	index_error=false;
 
-	std::string filelist_dest_fn = "urbackup/data/filelist.ub";
+	std::string filelist_dest_fn = "urbackup/data_"+convert(index_facet_id)+"/filelist.ub";
 	if (index_group != c_group_default)
 	{
-		filelist_dest_fn = "urbackup/data/filelist_" + convert(index_group) + ".ub";
+		filelist_dest_fn = "urbackup/data_"+convert(index_facet_id)+"/filelist_" + convert(index_group) + ".ub";
 	}
 
-	IFile* last_filelist_f = NULL;
+	IFile* last_filelist_f = nullptr;
 	ScopedFreeObjRef<IFile*> last_filelist_f_scope(last_filelist_f);
 	if (index_follow_last)
 	{
 		last_filelist_f = Server->openFile(filelist_dest_fn, MODE_READ);
 
-		if (last_filelist_f == NULL)
+		if (last_filelist_f == nullptr)
 		{
 			index_follow_last = false;
 		}
@@ -1513,7 +1627,8 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 		last_filelist->f = last_filelist_f;
 	}
 
-	std::string filelist_fn = "urbackup/data/filelist_new_" + convert(index_group) + ".ub";
+	std::string filelist_fn = "urbackup/data_"+convert(index_facet_id)+
+		"/filelist_new_" + convert(index_group) + ".ub";
 
 	std::streamoff outfile_size = 0;
 	{
@@ -1546,7 +1661,8 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 						{
 							if (sc_refs[k]->cbt)
 							{
-								sc_refs[k]->cbt = finishCbt(sc_refs[k]->target, -1, sc_refs[k]->volpath, false);
+								sc_refs[k]->cbt = finishCbt(sc_refs[k]->target, -1, sc_refs[k]->volpath,
+									false, sc_refs[k]->cbt_file, sc_refs[k]->cbt_type);
 							}
 							postSnapshotProcessing(sc_refs[k], full_backup);
 						}
@@ -1573,6 +1689,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 
 		for(size_t i=0;i<backup_dirs.size();++i)
 		{
+			if (backup_dirs[i].facet != index_facet_id)
+				continue;
+
 			if(backup_dirs[i].group!=index_group)
 			{
 				continue;
@@ -1708,8 +1827,15 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 					
 					postSnapshotProcessing(scd, full_backup);
 				}
+#else
+				if (!onlyref)
+				{
+					past_refs.push_back(scd->ref);
 
-				if (scd->ref != NULL
+					postSnapshotProcessing(scd, full_backup);
+				}
+#endif
+				if (scd->ref != nullptr
 					&& !scd->ref->cbt)
 				{
 					if (!disableCbt(backup_dirs[i].path))
@@ -1718,13 +1844,6 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 						index_error = true;
 					}
 				}
-
-#else
-				if (!onlyref)
-				{
-					past_refs.push_back(scd->ref);
-				}
-#endif
 
 				for (size_t k = 0; k < changed_dirs.size(); ++k)
 				{
@@ -1785,6 +1904,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 			{
 				for(size_t k=0;k<backup_dirs.size();++k)
 				{
+					if (backup_dirs[k].facet != index_facet_id)
+						continue;
+
 					SCDirs *scd=getSCDir(backup_dirs[k].tname, index_clientsubname, false);
 					release_shadowcopy(scd);
 				}
@@ -1847,7 +1969,7 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 	commitAddFilesBuffer();
 	commitModifyHardLinks();
 
-	if (phash_queue != NULL)
+	if (phash_queue != nullptr)
 	{
 		CWData data;
 		data.addChar(ID_PHASH_FINISH);
@@ -1907,10 +2029,10 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 		ret = IndexErrorInfo_NoBackupPaths;
 	}
 
-	if (last_filelist_f!=NULL)
+	if (last_filelist_f!=nullptr)
 	{
 		Server->destroy(last_filelist_f);
-		last_filelist_f = NULL;
+		last_filelist_f = nullptr;
 		last_filelist.reset();
 	}
 
@@ -1946,6 +2068,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 
 	for (size_t i = 0; i < backup_dirs.size(); ++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if (backup_dirs[i].group == index_group
 			&& backup_dirs[i].reset_keep)
 		{
@@ -1957,6 +2082,9 @@ IndexThread::IndexErrorInfo IndexThread::indexDirs(bool full_backup, bool simult
 
 	for (size_t i = 0; i < backup_dirs.size(); ++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if (backup_dirs[i].group == index_group
 			&& (!backup_dirs[i].symlinked || backup_dirs[i].symlinked_confirmed) )
 		{
@@ -1984,6 +2112,9 @@ void IndexThread::updateBackupDirsWithAll()
 	std::vector<std::string> filter_add;
 	for (size_t i = 0; i < backup_dirs.size(); ++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if (backup_dirs[i].group == index_group
 			&& backup_dirs[i].path == "ALL" && backup_dirs[i].tname == "ALL"
 			&& backup_dirs[i].server_default == EBackupDirServerDefault_Default)
@@ -2064,7 +2195,7 @@ void IndexThread::updateBackupDirsWithAll()
 	std::vector<std::string> volumes_norm;
 	if (!volumes.empty())
 	{
-		IQuery *q_add = db->Prepare("INSERT INTO backupdirs (name, path, server_default, optional, tgroup) VALUES (?, ? ," + convert((int)EBackupDirServerDefault_AllSrc) + ", ?, ?)", false);
+		IQuery *q_add = db->Prepare("INSERT INTO backupdirs (name, path, server_default, optional, tgroup, facet) VALUES (?, ? ," + convert((int)EBackupDirServerDefault_AllSrc) + ", ?, ?, ?)", false);
 		IQuery *q_name = db->Prepare("SELECT id FROM backupdirs WHERE name=?", false);
 
 		for (size_t i = 0; i < volumes.size(); ++i)
@@ -2073,11 +2204,18 @@ void IndexThread::updateBackupDirsWithAll()
 #ifdef _WIN32
 			if (!normalizeVolume(cvol))
 				continue;
-			else
-				cvol = os_get_final_path(cvol);
-#else
-			cvol = os_get_final_path(cvol);
 #endif
+
+			if (cvol[cvol.size() - 1] == '\\' || cvol[cvol.size() - 1] == '/')
+			{
+				cvol.erase(cvol.size() - 1, 1);
+#ifndef _WIN32
+				if (cvol.empty())
+				{
+					cvol = "/";
+				}
+#endif
+			}
 
 			volumes_norm.push_back(cvol);
 
@@ -2085,6 +2223,9 @@ void IndexThread::updateBackupDirsWithAll()
 			bool found = false;
 			for (size_t j = 0; j < backup_dirs.size(); ++j)
 			{
+				if (backup_dirs[j].facet != index_facet_id)
+					continue;
+
 				std::string ovol = backup_dirs[j].path;
 #ifdef _WIN32
 				if (ovol.size() <= 3)
@@ -2156,6 +2297,7 @@ void IndexThread::updateBackupDirsWithAll()
 				q_add->Bind(cvol);
 				q_add->Bind(new_flags);
 				q_add->Bind(index_group);
+				q_add->Bind(index_facet_id);
 				q_add->Write();
 				q_add->Reset();
 			}
@@ -2165,9 +2307,15 @@ void IndexThread::updateBackupDirsWithAll()
 		db->destroyQuery(q_name);
 	}
 
-	IQuery* q_del = NULL;
+	IQuery* q_del = nullptr;
 	for (size_t i = 0; i < backup_dirs.size();)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+		{
+			++i;
+			continue;
+		}
+
 		if (backup_dirs[i].group == index_group
 			&& backup_dirs[i].server_default == EBackupDirServerDefault_AllSrc)
 		{
@@ -2179,7 +2327,7 @@ void IndexThread::updateBackupDirsWithAll()
 
 			if (std::find(volumes_norm.begin(), volumes_norm.end(), ovol)== volumes_norm.end())
 			{
-				if(q_del==NULL)
+				if(q_del==nullptr)
 					q_del = db->Prepare("DELETE FROM backupdirs WHERE id=?", false);
 
 				std::string cpath = backup_dirs[i].path;
@@ -2192,6 +2340,9 @@ void IndexThread::updateBackupDirsWithAll()
 				bool found = false;
 				for (size_t j = 0; j < backup_dirs.size(); ++j)
 				{
+					if (backup_dirs[j].facet != index_facet_id)
+						continue;
+
 					if (backup_dirs[j].path == cpath)
 					{
 						found = true;
@@ -2241,8 +2392,8 @@ bool IndexThread::skipFile(const std::string& filepath, const std::string& named
 	{
 		return true;
 	}
-	if( !isIncluded(include_dirs, filepath, NULL)
-		&& (namedpath.empty() || !isIncluded(include_dirs, namedpath, NULL) ) )
+	if( !isIncluded(include_dirs, filepath, nullptr)
+		&& (namedpath.empty() || !isIncluded(include_dirs, namedpath, nullptr) ) )
 	{
 		return true;
 	}
@@ -2325,7 +2476,8 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 					}
 
 					VSSLog("Hint: Directory to backup (\"" + orig_dir + "\") does not exist. It may have been deleted or renamed. "
-						"Set the \"optional\" directory flag if you do not want backups to fail if directories are missing.", LL_WARNING);
+						"Set the \"optional\" directory flag if you do not want backups to fail if this directory is missing or "
+						"set \"Directories to backup are optional by default\" in the file backup settings.", LL_WARNING);
 
 #ifdef _WIN32
 					if (orig_dir.size() > 1
@@ -2398,6 +2550,8 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 	}
 
 	bool finish_phash_path = false;
+	int64 phash_dir_id = file_id;
+	int64 phash_dir_files = 0;
 	bool has_include = false;
 	
 	for(size_t i=0;i<files.size();++i)
@@ -2452,8 +2606,9 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 				}
 			}
 			else if (calculate_filehashes_on_client
-				&& phash_queue != NULL
-				&& !files[i].isspecialf)
+				&& phash_queue != nullptr
+				&& !files[i].isspecialf
+				&& files[i].size>=link_file_min_size )
 			{
 				if (!finish_phash_path)
 				{
@@ -2461,16 +2616,19 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 
 					CWData wdata;
 					wdata.addChar(ID_SET_CURR_DIRS);
+					wdata.addVarInt(phash_dir_id);
 					wdata.addString2(orig_dir);
 					wdata.addInt(index_group);
 					wdata.addString2(dir);
 					addToPhashQueue(wdata);
 				}
 
+				++phash_dir_files;
 				CWData wdata;
 				wdata.addChar(ID_HASH_FILE);
 				wdata.addVarInt(file_id);
 				wdata.addString2(files[i].name);
+				wdata.addVarInt(phash_dir_id);
 				addToPhashQueue(wdata);
 			}
 
@@ -2508,14 +2666,16 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 	{
 		CWData wdata;
 		wdata.addChar(ID_FINISH_CURR_DIR);
+		wdata.addVarInt(phash_dir_id);
 		wdata.addVarInt(target_generation);
+		wdata.addVarInt(phash_dir_files);
 		addToPhashQueue(wdata);
 	}
 
 	if (first)
 	{
 		assert(params_stack.empty());
-		SRecurParams curr_params(SFileAndHash(), NULL, false,
+		SRecurParams curr_params(SFileAndHash(), nullptr, false,
 			std::string(), std::string(), std::string(), depth, std::string::npos);
 		curr_params.state = 2;
 		params_stack.push_back(curr_params);
@@ -2570,7 +2730,7 @@ bool IndexThread::initialCheck(std::vector<SRecurParams>& params_stack, size_t s
 			if( curr_included ||  !adding_worthless1 || !adding_worthless2 )
 			{
 				first_info.idx = i;
-				SRecurParams curr_params(files[i], first ? &first_info : NULL, curr_included,
+				SRecurParams curr_params(files[i], first ? &first_info : nullptr, curr_included,
 					orig_dir, dir, named_path, depth, stack_idx);
 				params_stack.push_back(curr_params);
 			}
@@ -2662,7 +2822,7 @@ void IndexThread::initialCheckRecur1(std::vector<SRecurParams>& params_stack, SR
 
 	std::string listname = params.file.name;
 
-	if (params.first_info!=NULL && !params.first_info->fn_filter.empty() && params.first_info->idx == 0)
+	if (params.first_info!=nullptr && !params.first_info->fn_filter.empty() && params.first_info->idx == 0)
 	{
 		listname = params.named_path;
 	}
@@ -2769,6 +2929,9 @@ bool IndexThread::readBackupDirs(void)
 	bool has_backup_dir = false;
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if (isAllSpecialDir(backup_dirs[i]))
 		{
 			if (index_group != -1 && backup_dirs[i].group == index_group)
@@ -2786,7 +2949,7 @@ bool IndexThread::readBackupDirs(void)
 			has_backup_dir=true;
 		}
 
-		if(filesrv!=NULL)
+		if(filesrv!=nullptr)
 			shareDir("", backup_dirs[i].tname, backup_dirs[i].path);
 	}
 	return has_backup_dir;
@@ -2796,7 +2959,7 @@ bool IndexThread::readBackupScripts(bool full_backup)
 {
 	scripts.clear();
 
-	if(!with_scripts || index_group!=c_group_default)
+	if(!with_scripts)
 	{
 		return false;
 	}
@@ -2830,10 +2993,15 @@ bool IndexThread::readBackupScripts(bool full_backup)
 			first_script_path = curr_script_path;
 		}
 
-#ifdef _WIN32
-		script_cmd = curr_script_path + os_file_sep() + "list.bat";
-#else
 		script_cmd = curr_script_path + os_file_sep() + "list";
+
+		if (index_group != c_group_default)
+		{
+			script_cmd += "_" + conv_filename(index_clientsubname);
+		}
+
+#ifdef _WIN32
+		script_cmd += ".bat";
 #endif
 
 		if (!FileExists(script_cmd))
@@ -2909,9 +3077,19 @@ bool IndexThread::readBackupScripts(bool full_backup)
 						new_script.orig_path = it->second;
 					}
 
+					it = params.find("lastmod");
+					if (it != params.end())
+					{
+						new_script.lastmod = watoi64(it->second);
+					}
+					else
+					{
+						new_script.lastmod = -1;
+					}
+
 					scripts.push_back(new_script);
 
-					if (filesrv != NULL)
+					if (filesrv != nullptr)
 					{
 						filesrv->addScriptOutputFilenameMapping(new_script.outputname,
 							new_script.scriptname, tar_file);
@@ -2927,7 +3105,7 @@ bool IndexThread::readBackupScripts(bool full_backup)
 		}
 	}
 
-	if (filesrv != NULL && !scripts.empty() && !first_script_path.empty())
+	if (filesrv != nullptr && !scripts.empty() && !first_script_path.empty())
 	{
 		filesrv->shareDir("urbackup_backup_scripts", first_script_path, std::string(), true);
 	}
@@ -2943,7 +3121,7 @@ bool IndexThread::addMissingHashes(std::vector<SFileAndHash>* dbfiles, std::vect
 {
 	bool calculated_hash=false;
 
-	if(fsfiles!=NULL)
+	if(fsfiles!=nullptr)
 	{
 		for(size_t i=0;i<fsfiles->size();++i)
 		{
@@ -2961,7 +3139,7 @@ bool IndexThread::addMissingHashes(std::vector<SFileAndHash>* dbfiles, std::vect
 
 			bool needs_hashing=true;
 
-			if(dbfiles!=NULL)
+			if(dbfiles!=nullptr)
 			{
 				std::vector<SFileAndHash>::iterator it = std::lower_bound(dbfiles->begin(), dbfiles->end(), fsfile);
 
@@ -2986,7 +3164,7 @@ bool IndexThread::addMissingHashes(std::vector<SFileAndHash>* dbfiles, std::vect
 			}
 		}
 	}
-	else if(dbfiles!=NULL
+	else if(dbfiles!=nullptr
 		&& calc_hashes)
 	{
 		for(size_t i=0;i<dbfiles->size();++i)
@@ -3162,10 +3340,10 @@ std::vector<SFileAndHash> IndexThread::getFilesProxy(const std::string &orig_pat
 
 
 		if(calculate_filehashes_on_client
-			&& (phash_queue==NULL || has_files) )
+			&& (phash_queue==nullptr || has_files) )
 		{
-			addMissingHashes(has_files ? &db_files : NULL, &fs_files, orig_path,
-				path, named_path, exclude_dirs, include_dirs, phash_queue==NULL);
+			addMissingHashes(has_files ? &db_files : nullptr, &fs_files, orig_path,
+				path, named_path, exclude_dirs, include_dirs, phash_queue==nullptr);
 		}
 
 		if( has_files)
@@ -3185,6 +3363,7 @@ std::vector<SFileAndHash> IndexThread::getFilesProxy(const std::string &orig_pat
 
 				++index_c_db_update;
 				modifyFilesInt(path_lower, get_db_tgroup(), fs_files, target_generation);
+				++target_generation;
 			}
 		}
 		else
@@ -3218,6 +3397,7 @@ std::vector<SFileAndHash> IndexThread::getFilesProxy(const std::string &orig_pat
 				{
 					++index_c_db_update;
 					modifyFilesInt(path_lower, get_db_tgroup(), fs_files, target_generation);
+					++target_generation;
 				}
 			}
 
@@ -3352,6 +3532,28 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 				|| only_own_tokens 
 				|| cannot_open_shadowcopy ) )
 			{
+#ifndef _WIN32
+				int64 wait_starttime = Server->getTimeMS();
+
+				while (filesrv != nullptr
+					&& filesrv->hasActiveTransfers(dir->dir, starttoken)
+					&& Server->getTimeMS() - wait_starttime < 5000)
+				{
+					Server->wait(100);
+				}
+
+				if (filesrv != nullptr
+					&& filesrv->hasActiveTransfers(dir->dir, starttoken))
+				{
+					sc_refs[i]->cleanup = true;
+					sc_refs[i]->cleanup_gen = filesrv->incrActiveGeneration();
+					sc_refs_cleanup = true;
+					VSSLog("Old shadow copy of " + sc_refs[i]->target + " still in use. Not deleting or using it.", LL_WARNING);
+					dir->target = dir->orig_target;
+					continue;
+				}
+#endif
+
 				if ( (sc_refs[i]->for_imagebackup == for_imagebackup)
 					|| !simultaneous_other )
 				{
@@ -3394,7 +3596,7 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 						for (std::map<std::string, SCDirs*>::iterator it = scdirs_server.begin();
 							it != scdirs_server.end();++it)
 						{
-							if (it->second->ref != NULL
+							if (it->second->ref != nullptr
 								&& it->second->ref != curr
 								&& it->second->ref->ssetid == ssetid)
 							{
@@ -3416,6 +3618,7 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 			}
 			else if(!cannot_open_shadowcopy)
 			{
+				sc_refs[i]->cleanup = false;
 				dir->ref=sc_refs[i];
 				if(!dir->ref->dontincrement)
 				{
@@ -3425,6 +3628,8 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 				{
 					dir->ref->dontincrement=false;
 				}
+
+				dir->ref->sharenames.push_back(dir->dir);
 
 				VSSLog("orig_target="+dir->orig_target+" volpath="+dir->ref->volpath, LL_DEBUG);
 
@@ -3438,7 +3643,14 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 				}
 				dir->target=dir->ref->volpath+ (dir->target.empty()? "" : dir->target);
 #else
-				dir->target=dir->ref->volpath+os_file_sep()+dir->target;
+				if(for_imagebackup)
+				{
+					dir->target=dir->ref->volpath;
+				}
+				else
+				{
+					dir->target=dir->ref->volpath+os_file_sep()+dir->target;
+				}
 #endif
 				if(dir->fileserv
 					&& share_new)
@@ -3451,12 +3663,12 @@ bool IndexThread::find_existing_shadowcopy(SCDirs *dir, bool *onlyref, bool allo
 					cd->modShadowcopyRefCount(dir->ref->save_id, 1);
 				}
 
-				if(onlyref!=NULL)
+				if(onlyref!=nullptr)
 				{
 					*onlyref=true;
 				}
 
-				if( stale_shadowcopy!=NULL )
+				if( stale_shadowcopy!=nullptr )
 				{
 					if(!do_restart)
 					{
@@ -3482,7 +3694,7 @@ bool IndexThread::start_shadowcopy(SCDirs *dir, bool *onlyref, bool allow_restar
 	bool* has_active_transaction)
 {
 	bool c_onlyref = false;
-	if (onlyref != NULL)
+	if (onlyref != nullptr)
 	{
 		if (*onlyref)
 		{
@@ -3508,7 +3720,8 @@ bool IndexThread::start_shadowcopy(SCDirs *dir, bool *onlyref, bool allow_restar
 #else
 	std::string wpath = "/";
 
-	if (get_volumes_mounted_locally())
+	if (get_volumes_mounted_locally()
+		&& !for_imagebackup)
 	{
 		wpath = getFolderMount(dir->orig_target);
 		if (wpath.empty())
@@ -3518,7 +3731,11 @@ bool IndexThread::start_shadowcopy(SCDirs *dir, bool *onlyref, bool allow_restar
 	}
 	else
 	{
-		dir->target = wpath;
+		wpath = getDeviceMount(dir->orig_target);
+		if(wpath.empty())
+		{
+			wpath = dir->orig_target;
+		}
 	}
 #endif
 
@@ -3538,6 +3755,7 @@ bool IndexThread::start_shadowcopy(SCDirs *dir, bool *onlyref, bool allow_restar
 	dir->ref->starttime=Server->getTimeSeconds();
 	dir->ref->target=wpath;
 	dir->ref->starttokens.push_back(starttoken);
+	dir->ref->sharenames.push_back(dir->dir);
 	dir->ref->clientsubname = index_clientsubname;
 	dir->ref->for_imagebackup = for_imagebackup;
 	sc_refs.push_back(dir->ref);
@@ -3553,7 +3771,7 @@ bool IndexThread::start_shadowcopy(SCDirs *dir, bool *onlyref, bool allow_restar
 	{
 		sc_refs.erase(sc_refs.end()-1);
 		delete dir->ref;
-		dir->ref=NULL;
+		dir->ref=nullptr;
 		dir->target = dir->orig_target;
 	}
 
@@ -3598,6 +3816,12 @@ bool IndexThread::deleteShadowcopy(SCDirs *dir)
 #ifdef _WIN32
 	return deleteShadowcopyWin(dir);
 #else
+
+	for (size_t i = 0; i < dir->ref->flock_fds.size(); ++i)
+		close(dir->ref->flock_fds[i]);
+
+	dir->ref->flock_fds.clear();
+
 	std::string loglines;
 	std::string scriptname;
 	if(dir->fileserv)
@@ -3606,10 +3830,10 @@ bool IndexThread::deleteShadowcopy(SCDirs *dir)
 	}
 	else
 	{
-		scriptname = "remove_device_snapshot";
+		scriptname = "remove_volume_snapshot";
 	}
 
-	std::string scriptlocation = get_snapshot_script_location(scriptname);
+	std::string scriptlocation = get_snapshot_script_location(scriptname, index_clientsubname);
 
 	if (scriptlocation.empty())
 	{
@@ -3637,7 +3861,7 @@ bool IndexThread::release_shadowcopy(SCDirs *dir, bool for_imagebackup, int save
 {
 	if(for_imagebackup)
 	{
-		if(dir->ref!=NULL && dir->ref->save_id!=-1)
+		if(dir->ref!=nullptr && dir->ref->save_id!=-1)
 		{
 			cd->modShadowcopyRefCount(dir->ref->save_id, -1);
 		}
@@ -3649,7 +3873,7 @@ bool IndexThread::release_shadowcopy(SCDirs *dir, bool for_imagebackup, int save
 
 	bool ok=true;
 
-	if(dir->ref!=NULL 
+	if(dir->ref!=nullptr 
 #ifdef _WIN32
 		&& dir->ref->backupcom!=NULL
 #endif
@@ -3671,7 +3895,7 @@ bool IndexThread::release_shadowcopy(SCDirs *dir, bool for_imagebackup, int save
 		}
 	}
 
-	if(dir->ref!=NULL)
+	if(dir->ref!=nullptr)
 	{
 		for(size_t k=0;k<dir->ref->starttokens.size();++k)
 		{
@@ -3715,8 +3939,8 @@ bool IndexThread::release_shadowcopy(SCDirs *dir, bool for_imagebackup, int save
 								}
 								it->second->target=it->second->orig_target;
 
-								it->second->ref=NULL;
-								if(dontdel==NULL || it->second!=dontdel )
+								it->second->ref=nullptr;
+								if(dontdel==nullptr || it->second!=dontdel )
 								{
 									delete it->second;
 									server_it->second.erase(it);
@@ -3753,10 +3977,10 @@ bool IndexThread::deleteSavedShadowCopy( SShadowCopy& scs, SShadowCopyContext& c
 	}
 	else
 	{
-		scriptname = "remove_device_snapshot";
+		scriptname = "remove_volume_snapshot";
 	}
 
-	std::string scriptlocation = get_snapshot_script_location(scriptname);
+	std::string scriptlocation = get_snapshot_script_location(scriptname, index_clientsubname);
 
 	if (scriptlocation.empty())
 	{
@@ -3827,6 +4051,9 @@ SCDirs* IndexThread::getSCDir(const std::string& path, const std::string& client
 	std::map<std::string, SCDirs*>::iterator it=scdirs_server.find(path);
 	if(it!=scdirs_server.end())
 	{
+		if (it->second->ref != nullptr)
+			it->second->ref->cleanup = false;
+
 		return it->second;
 	}
 	else
@@ -3846,7 +4073,7 @@ IFileServ *IndexThread::getFileSrv(void)
 	return filesrv;
 }
 
-int IndexThread::execute_hook(std::string script_name, bool incr, std::string server_token, int* index_group)
+int IndexThread::execute_hook(std::string script_name, bool incr, std::string server_token, int* index_group, int* error_info)
 {
 	if (!FileExists(script_name))
 	{
@@ -3868,7 +4095,8 @@ int IndexThread::execute_hook(std::string script_name, bool incr, std::string se
 	std::string output;
 	int rc = os_popen(quoted_script_name + " " + (incr ? "1" : "0") + " \"" 
 		+ server_token + "\" "
-		+ (index_group!=NULL ? convert(*index_group) : "" )
+		+ (index_group!=nullptr ? convert(*index_group) : "" )
+		+ (error_info!=nullptr ? convert(*error_info) : "" )
 		+" 2>&1", output);
 
 	if (rc != 0 && !output.empty())
@@ -3903,7 +4131,7 @@ int IndexThread::execute_prebackup_hook(bool incr, std::string server_token, int
 	return execute_hook(script_name, incr, server_token, &index_group);
 }
 
-int IndexThread::execute_postindex_hook(bool incr, std::string server_token, int index_group)
+int IndexThread::execute_postindex_hook(bool incr, std::string server_token, int index_group, IndexErrorInfo error_info)
 {
 	std::string script_name;
 #ifdef _WIN32
@@ -3912,7 +4140,9 @@ int IndexThread::execute_postindex_hook(bool incr, std::string server_token, int
 	script_name = SYSCONFDIR "/urbackup/postfileindex";
 #endif
 
-	return execute_hook(script_name, incr, server_token, &index_group);
+	int i_error_info = static_cast<int>(error_info);
+
+	return execute_hook(script_name, incr, server_token, &index_group, &i_error_info);
 }
 
 void IndexThread::execute_postbackup_hook(std::string scriptname, int group, const std::string& clientsubname)
@@ -3952,7 +4182,7 @@ void IndexThread::execute_postbackup_hook(std::string scriptname, int group, con
 			std::string fullname = std::string(SYSCONFDIR "/urbackup/") + scriptname;
 			std::string group_str = convert(group);
 			char* const argv[]={ const_cast<char*>(fullname.c_str()), 
-				const_cast<char*>(group_str.c_str()), const_cast<char*>(clientsubname.c_str()), NULL };
+				const_cast<char*>(group_str.c_str()), const_cast<char*>(clientsubname.c_str()), nullptr };
 			execv(const_cast<char*>(fullname.c_str()), argv);
 			exit(1);
 		}
@@ -4000,7 +4230,7 @@ std::string IndexThread::sanitizePattern(const std::string &p)
 			}
 			++j;
 		}
-		else if(ch=='\\' && ( j+1>=ep.size() || (ep[j+1]!='[' ) ) )
+		else if(ch=='\\')
 		{
 			if(os_file_sep()=="\\")
 				nep+="\\\\";
@@ -4015,7 +4245,7 @@ std::string IndexThread::sanitizePattern(const std::string &p)
 	return nep;
 }
 
-void IndexThread::readPatterns(int index_group, std::string index_clientsubname,
+void IndexThread::readPatterns(int facet_id, int index_group, std::string index_clientsubname,
 	std::vector<std::string>& exclude_dirs, std::vector<SIndexInclude>& include_dirs,
 	bool& backup_dirs_optional)
 {
@@ -4030,24 +4260,24 @@ void IndexThread::readPatterns(int index_group, std::string index_clientsubname,
 		include_pattern_key="continuous_include_files";
 	}
 
-	std::string settings_fn = "urbackup/data/settings.cfg";
+	std::string settings_fn = "urbackup/data_"+std::to_string(facet_id)+"/settings.cfg";
 	if(!index_clientsubname.empty())
 	{
-		settings_fn = "urbackup/data/settings_"+conv_filename(index_clientsubname)+".cfg";
+		settings_fn = "urbackup/data" + std::to_string(facet_id) + "/settings_"+conv_filename(index_clientsubname)+".cfg";
 	}
 
 	ISettingsReader *curr_settings=Server->createFileSettingsReader(settings_fn);
 	exclude_dirs.clear();
-	if(curr_settings!=NULL)
+	if(curr_settings!=nullptr)
 	{	
 		std::string val;
 		if(curr_settings->getValue(exclude_pattern_key, &val) || curr_settings->getValue(exclude_pattern_key+"_def", &val) )
 		{
-			exclude_dirs = parseExcludePatterns(val);
+			exclude_dirs = buildExcludeList(val);
 		}
 		else
 		{
-			exclude_dirs = parseExcludePatterns(std::string());
+			exclude_dirs = buildExcludeList(std::string());
 		}
 
 		if(curr_settings->getValue(include_pattern_key, &val) || curr_settings->getValue(include_pattern_key+"_def", &val) )
@@ -4064,7 +4294,7 @@ void IndexThread::readPatterns(int index_group, std::string index_clientsubname,
 	}
 	else
 	{
-		exclude_dirs = parseExcludePatterns(std::string());
+		exclude_dirs = buildExcludeList(std::string());
 	}
 }
 
@@ -4189,6 +4419,18 @@ void IndexThread::removeResult(unsigned int id)
 	}
 }
 
+std::vector<std::string> IndexThread::buildExcludeList(const std::string& val)
+{
+	std::vector<std::string> exclude_dirs_combined;
+	exclude_dirs_combined = parseExcludePatterns(val);
+	addFileExceptions(exclude_dirs_combined);
+	addHardExcludes(exclude_dirs_combined);
+#ifdef __APPLE__
+	addMacOSExcludes(exclude_dirs_combined);
+#endif
+	return exclude_dirs_combined;
+}
+
 std::vector<std::string> IndexThread::parseExcludePatterns(const std::string& val)
 {
 	std::vector<std::string> exclude_dirs;
@@ -4216,11 +4458,7 @@ std::vector<std::string> IndexThread::parseExcludePatterns(const std::string& va
 		{
 			exclude_dirs[i]=sanitizePattern(exclude_dirs[i]);
 		}
-	}	
-
-	addFileExceptions(exclude_dirs);
-	addHardExcludes(exclude_dirs);
-
+	}
 	return exclude_dirs;
 }
 
@@ -4323,10 +4561,20 @@ bool IndexThread::isExcluded(const std::vector<std::string>& exclude_dirs, const
 			bool b=amatch(wpath.c_str(), exclude_dirs[i].c_str());
 			if(b)
 			{
+#ifdef __APPLE__
+                logMacOSExclude(path);
+#endif
 				return true;
 			}
 		}
 	}
+#ifdef __APPLE__
+    if(isExcludedByXattr(path))
+    {
+        logIsExcludedByXattr(path);
+        return true;
+    };
+#endif
 	return false;
 }
 
@@ -4361,7 +4609,7 @@ bool IndexThread::isIncluded(const std::vector<SIndexInclude>& include_dirs, con
 	strupper(&wpath);
 #endif
 	int wpath_level=0;
-	if(adding_worthless!=NULL)
+	if(adding_worthless!=nullptr)
 	{
 		for(size_t i=0;i<wpath.size();++i)
 		{
@@ -4385,7 +4633,7 @@ bool IndexThread::isIncluded(const std::vector<SIndexInclude>& include_dirs, con
 			{
 				return true;
 			}
-			if(adding_worthless!=NULL)
+			if(adding_worthless!=nullptr)
 			{
 				if( include_dirs[i].depth==-1 )
 				{
@@ -4419,7 +4667,7 @@ void IndexThread::start_filesrv(void)
 	else
 	{
 		ISettingsReader *curr_settings=Server->createFileSettingsReader("urbackup/data/settings.cfg");
-		if(curr_settings!=NULL)
+		if(curr_settings!=nullptr)
 		{
 			std::string val;
 			if(curr_settings->getValue("computername", &val)
@@ -4464,7 +4712,6 @@ void IndexThread::start_filesrv(void)
 
 	filesrv=filesrv_fak->createFileServ(curr_tcpport, curr_udpport, name, use_fqdn,
 		backgroundBackupsEnabled(std::string()));
-	filesrv->shareDir("urbackup", Server->getServerWorkingDir()+"/urbackup/data", std::string(), false);
 
 	ServerIdentityMgr::setFileServ(filesrv);
 	ServerIdentityMgr::loadServerIdentities();
@@ -4534,7 +4781,7 @@ void IndexThread::unshare_dirs()
 void IndexThread::doStop(void)
 {
 	CWData wd;
-	wd.addUChar(8);
+	wd.addChar(IndexThreadAction_Stop);
 	wd.addUInt(0);
 	msgpipe->Write(wd.getDataPtr(), wd.getDataSize());
 }
@@ -4617,7 +4864,8 @@ void IndexThread::commitAddFilesBuffer()
 	db->BeginWriteTransaction();
 	for(size_t i=0;i<add_file_buffer.size();++i)
 	{
-		cd->addFiles(add_file_buffer[i].path, add_file_buffer[i].tgroup, add_file_buffer[i].files);
+		cd->addFiles(add_file_buffer[i].path, add_file_buffer[i].tgroup, add_file_buffer[i].files,
+			add_file_buffer[i].target_generation);
 	}
 	db->EndTransaction();
 
@@ -4654,7 +4902,7 @@ std::string IndexThread::getSHA256(const std::string& fn)
 
 	IFile * f=Server->openFile(os_file_prefix(fn), MODE_READ_SEQUENTIAL_BACKUP);
 
-	if(f==NULL)
+	if(f==nullptr)
 	{
 		return std::string();
 	}
@@ -4819,6 +5067,223 @@ void IndexThread::addHardExcludes(std::vector<std::string>& exclude_dirs)
 	exclude_dirs.push_back(sanitizePattern(":\\SYSTEM VOLUME INFORMATION\\*{3808876B-C176-4E48-B7AE-04046E6CC752}*"));
 #endif
 }
+
+#ifdef __APPLE__
+    void IndexThread::addMacOSExcludes(std::vector<std::string>& exclude_dirs)
+    {
+//        Read the overrides list
+        std::ifstream overrides_file("urbackup/macOS_exclusion_overrides.txt");
+        if (overrides_file.is_open())
+        {
+            std::string file_line;
+            while (std::getline(overrides_file, file_line))
+            {
+                const char * file_line_prefix = &file_line[0];
+                if (strncmp (file_line_prefix, "#", 1) != 0)
+                {
+                    IndexThread::macos_overrides.push_back(sanitizePattern(file_line));
+                }
+            }
+            overrides_file.close();
+        }
+
+        
+//        Exclude these items entirely
+        IndexThread::macos_exclusions.push_back("/.MobileBackups*");
+        IndexThread::macos_exclusions.push_back("/MobileBackups.trash*");
+        IndexThread::macos_exclusions.push_back("/.MobileBackups.trash*");
+        IndexThread::macos_exclusions.push_back("/.Spotlight-V100*");
+        IndexThread::macos_exclusions.push_back("/.TemporaryItems*");
+        IndexThread::macos_exclusions.push_back("/.Trashes*");
+        IndexThread::macos_exclusions.push_back("/.com.apple.backupd.mvlist.plist*");
+        IndexThread::macos_exclusions.push_back("/.fseventsd*");
+        IndexThread::macos_exclusions.push_back("/.hotfiles.btree*");
+        IndexThread::macos_exclusions.push_back("/Backups.backupdb*");
+        IndexThread::macos_exclusions.push_back("/Desktop DB*");
+        IndexThread::macos_exclusions.push_back("/Desktop DF*");
+        IndexThread::macos_exclusions.push_back("/Network/Servers*");
+        IndexThread::macos_exclusions.push_back("/Library/Updates*");
+        IndexThread::macos_exclusions.push_back("/Previous Systems*");
+        IndexThread::macos_exclusions.push_back("/Users/Shared/SC Info*");
+        IndexThread::macos_exclusions.push_back("/Users/Guest*");
+        IndexThread::macos_exclusions.push_back("/dev*");
+        IndexThread::macos_exclusions.push_back("/home*");
+        IndexThread::macos_exclusions.push_back("/net*");
+    IndexThread::macos_exclusions.push_back("/private/var/db/com.apple.backupd.backupVerification*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/efw_cache*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/Spotlight*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/Spotlight-V100*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/systemstats*");
+        IndexThread::macos_exclusions.push_back("/private/var/lib/postfix/greylist.db*");
+        
+        IndexThread::macos_exclusions.push_back("/.DocumentRevisions-V100*");
+        IndexThread::macos_exclusions.push_back("/.HFS+ Private Directory Data*");
+        IndexThread::macos_exclusions.push_back("/private/etc/kcpassword*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/dyld*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/dyld/shared_region_roots*");
+        
+//        Backup the top level folder, but exclude all contents
+        IndexThread::macos_exclusions.push_back("/Volumes/*");
+        IndexThread::macos_exclusions.push_back("/Network/*");
+        IndexThread::macos_exclusions.push_back("/automount/*");
+        IndexThread::macos_exclusions.push_back("/.vol/*");
+        IndexThread::macos_exclusions.push_back("/tmp/*");
+        IndexThread::macos_exclusions.push_back("/cores/*");
+        IndexThread::macos_exclusions.push_back("/private/tmp/*");
+        IndexThread::macos_exclusions.push_back("/private/Network/*");
+        IndexThread::macos_exclusions.push_back("/private/tftpboot/*");
+        IndexThread::macos_exclusions.push_back("/private/var/automount/*");
+        IndexThread::macos_exclusions.push_back("/private/var/folders/*");
+        IndexThread::macos_exclusions.push_back("/private/var/run/*");
+        IndexThread::macos_exclusions.push_back("/private/var/tmp/*");
+        IndexThread::macos_exclusions.push_back("/private/var/vm/*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/dhcpclient/*");
+        IndexThread::macos_exclusions.push_back("/private/var/db/fseventsd/*");
+        IndexThread::macos_exclusions.push_back("/Library/Caches/*");
+        IndexThread::macos_exclusions.push_back("/Library/Logs/*");
+        IndexThread::macos_exclusions.push_back("/System/Library/Caches/*");
+        IndexThread::macos_exclusions.push_back("/System/Library/Extensions/Caches/*");
+        
+        
+//        Backup folder structure, but exclude all files
+        IndexThread::macos_exclusions.push_back("/private/var/log/*");
+        IndexThread::macos_exclusions.push_back("/private/var/spool/cups/*");
+        IndexThread::macos_exclusions.push_back("/private/var/spool/fax/*");
+        IndexThread::macos_exclusions.push_back("/private/var/spool/uucp/*");
+        
+        
+//        Exclude these items within each user account
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Application Support/SyncServices/data.version*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Application Support/Ubiquity*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Caches*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Logs*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/Envelope Index*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/Envelope Index-journal*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/AvailableFeeds*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/Metadata/BackingStoreUpdateJournal*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/Envelope Index*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/Envelope Index-journal*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/AvailableFeeds*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/BackingStoreUpdateJournal*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/Envelope Index-shm*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mail/V2/MailData/Envelope Index-wal*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Mirrors*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/PubSub/Database*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/PubSub/Downloads*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/PubSub/Feeds*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Safari/Icons.db*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Safari/WebpageIcons.db*");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Safari/HistoryIndex.sk*");
+        IndexThread::macos_exclusions.push_back("/Users/:/.Trash*");
+        
+        //        Exclude DataVaults
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/VoiceTrigger/SAT");
+        IndexThread::macos_exclusions.push_back("/Users/:/Library/Containers/com.apple.mail/Data/DataVaults");
+        IndexThread::macos_exclusions.push_back("/var/folders/:/:/:/com.apple.nsurlsessiond");
+        
+//        Exclude volumes from macOS 10.14+
+        IndexThread::macos_exclusions.push_back("/System/Volumes/*");
+
+        
+//        Filter the standard exclusions with the overrides list
+        std::string overridden_macos_exclusions;
+        for(size_t i=0; i<IndexThread::macos_exclusions.size(); i++)
+        {
+            if ( std::find(IndexThread::macos_overrides.begin(), IndexThread::macos_overrides.end(), IndexThread::macos_exclusions[i]) == IndexThread::macos_overrides.end())
+            {
+                overridden_macos_exclusions = overridden_macos_exclusions + IndexThread::macos_exclusions[i] + ";";
+            }
+        }
+        
+        IndexThread::macos_exclusions = parseExcludePatterns(overridden_macos_exclusions);
+
+//        Add the filtered exclusions to the exclude_dirs array
+        for(size_t i=0; i<IndexThread::macos_exclusions.size(); i++)
+        {
+            exclude_dirs.push_back(IndexThread::macos_exclusions[i]);
+        }
+
+    }
+    
+
+    void IndexThread::logMacOSExclude(const std::string path)
+    {
+//        Get the exclusion term which caused the file to be skipped, if it was a standard exclusion
+        std::string pathMatch = returnExcludeDirsMatch(IndexThread::macos_exclusions, path);
+        
+//        Log the exclusion
+        if(!pathMatch.empty())
+        {
+            Server->Log("[macOS] Skipping \""+path+"\" due to macOS exclusion \""+pathMatch+"\"", LL_INFO);
+        }
+    }
+
+
+//      Based on isExcluded, but returning the exclusion term
+    std::string IndexThread::returnExcludeDirsMatch(std::vector<std::string> exclude_dirs, std::string path)
+    {
+        std::string wpath=path;
+
+        for(size_t i=0;i<exclude_dirs.size();++i)
+        {
+            if(!exclude_dirs[i].empty())
+            {
+                bool b=amatch(wpath.c_str(), exclude_dirs[i].c_str());
+                if(b)
+                {
+                    return exclude_dirs[i];
+                }
+            }
+        }
+        return std::string();
+    }
+
+    bool IndexThread::isExcludedByXattr(const std::string path)
+    {
+        ssize_t xattr_size = 0;
+        char xattr_out[1024];
+        std::string backup_excludeItem_string = "com.apple.metadata:com_apple_backup_excludeItem";
+        
+        xattr_size = listxattr(path.c_str(), NULL, 0,  XATTR_NOFOLLOW);
+        listxattr(path.c_str(), xattr_out, 1024,  XATTR_NOFOLLOW);
+        if(xattr_size > 0) {
+            std::string xattr_str(reinterpret_cast<char*>(xattr_out), xattr_size);
+            
+            if (xattr_str.find(backup_excludeItem_string) != std::string::npos) {
+                //      Based on isExcluded
+                std::string wpath=path;
+
+                for(size_t i=0;i<macos_overrides.size();++i)
+                {
+                    if(!macos_overrides[i].empty())
+                    {
+                        bool b=amatch(wpath.c_str(), macos_overrides[i].c_str());
+                        if(b)
+                        {
+    //                        File is overridden
+                            Server->Log("[macOS] Backing up \""+path+"\" due to overridden macOS extended attribute exclusion", LL_INFO);
+                            return false;
+                        }
+                    }
+                }
+    //            File is not overridden, and contains backup_excludeItem xattr
+                return true;
+            }
+    //        Does not contain backup_excludeItem xattr
+            return false;
+        } else {
+//            Does not contain any xattr
+            return false;
+        }
+    }
+
+    void IndexThread::logIsExcludedByXattr(const std::string path)
+    {
+        Server->Log("[macOS] Skipping \""+path+"\" due to macOS extended attribute exclusion", LL_INFO);
+    }
+
+#endif
+
 
 void IndexThread::handleHardLinks(const std::string& bpath, const std::string& vsspath, const std::string& normalized_volume)
 {
@@ -5205,7 +5670,7 @@ void IndexThread::commitModifyHardLinks()
 #ifdef _WIN32
 uint128 IndexThread::getFrn(const std::string & fn)
 {
-	HANDLE hFile = CreateFileW(Server->ConvertToWchar(os_file_prefix(fn)).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	HANDLE hFile = CreateFileW(Server->ConvertToWchar(os_file_prefix(fn)).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS| FILE_FLAG_OPEN_REPARSE_POINT, NULL);
 
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
@@ -5275,8 +5740,8 @@ std::string IndexThread::getShaBinary(const std::string& fn)
 	}
 	else if (sha_version == 528)
 	{
-		TreeHash treehash(index_hdat_file.get() == NULL ? NULL : client_hash.get());
-		if (!getShaBinary(fn, treehash, index_hdat_file.get() != NULL))
+		TreeHash treehash(index_hdat_file.get() == nullptr ? nullptr : client_hash.get());
+		if (!getShaBinary(fn, treehash, index_hdat_file.get() != nullptr))
 		{
 			return std::string();
 		}
@@ -5309,8 +5774,8 @@ bool IndexThread::backgroundBackupsEnabled(const std::string& clientsubname)
 		settings_fn = "urbackup/data/settings_"+conv_filename(clientsubname)+".cfg";
 	}
 
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
-	if(curr_settings.get()!=NULL)
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	if(curr_settings.get()!=nullptr)
 	{
 		std::string background_backups;
 		if(curr_settings->getValue("background_backups", &background_backups)
@@ -5322,9 +5787,26 @@ bool IndexThread::backgroundBackupsEnabled(const std::string& clientsubname)
 	return true;
 }
 
+bool IndexThread::pauseIfWindowsUnlocked()
+{
+	std::string settings_fn = "urbackup/data/settings.cfg";
+
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	if (curr_settings.get() != nullptr)
+	{
+		std::string pause_if_windows_unlocked;
+		if (curr_settings->getValue("pause_if_windows_unlocked", &pause_if_windows_unlocked)
+			|| curr_settings->getValue("pause_if_windows_unlocked_def", &pause_if_windows_unlocked))
+		{
+			return pause_if_windows_unlocked == "true";
+		}
+	}
+	return false;
+}
+
 void IndexThread::writeTokens()
 {
-	std::auto_ptr<ISettingsReader> access_keys(
+	std::unique_ptr<ISettingsReader> access_keys(
 		Server->createFileSettingsReader("urbackup/access_keys.properties"));
 
 	std::string access_keys_data;
@@ -5498,7 +5980,7 @@ int IndexThread::execute_preimagebackup_hook(bool incr, std::string server_token
 	script_name = SYSCONFDIR "/urbackup/preimagebackup";
 #endif
 
-	return execute_hook(script_name, incr, server_token, NULL);
+	return execute_hook(script_name, incr, server_token, nullptr);
 }
 
 bool IndexThread::addBackupScripts(std::fstream& outfile)
@@ -5510,7 +5992,12 @@ bool IndexThread::addBackupScripts(std::fstream& outfile)
 
 		for(size_t i=0;i<scripts.size();++i)
 		{
-			int64 rndnum=Server->getRandomNumber()<<30 | Server->getRandomNumber();
+			int64 rndnum;
+			if (scripts[i].lastmod != -1)
+				rndnum = scripts[i].lastmod;
+			else
+				rndnum = Server->getRandomNumber() << 30 | Server->getRandomNumber();
+
 			outfile << "f\"" << escapeListName(scripts[i].outputname) << "\" " << scripts[i].size << " " << rndnum;
 			++file_id;
 
@@ -5565,8 +6052,8 @@ int IndexThread::get_db_tgroup()
 
 bool IndexThread::nextLastFilelistItem(SFile& data, str_map* extra, bool with_up)
 {
-	if (last_filelist.get() == NULL
-		|| last_filelist->f==NULL)
+	if (last_filelist.get() == nullptr
+		|| last_filelist->f==nullptr)
 	{
 		return false;
 	}
@@ -5632,7 +6119,7 @@ bool IndexThread::nextLastFilelistItem(SFile& data, str_map* extra, bool with_up
 
 void IndexThread::addFromLastUpto(const std::string& fname, bool isdir, size_t depth, bool finish, std::fstream &outfile)
 {
-	if (!index_follow_last || last_filelist.get()==NULL)
+	if (!index_follow_last || last_filelist.get()==nullptr)
 	{
 		return;
 	}
@@ -5683,7 +6170,7 @@ void IndexThread::addFromLastUpto(const std::string& fname, bool isdir, size_t d
 
 void IndexThread::addFromLastLiftDepth(size_t depth, std::fstream & outfile)
 {
-	if (!index_follow_last || last_filelist.get() == NULL)
+	if (!index_follow_last || last_filelist.get() == nullptr)
 	{
 		return;
 	}
@@ -5821,15 +6308,17 @@ bool IndexThread::volIsEnabled(std::string settings_val, std::string volume)
 
 bool IndexThread::cbtIsEnabled(std::string clientsubname, std::string volume)
 {
-	std::string settings_fn = "urbackup/data/settings.cfg";
+	return false;
+
+	std::string settings_fn = "urbackup/data_"+convert(index_facet_id)+"/settings.cfg";
 
 	if (!clientsubname.empty())
 	{
-		settings_fn = "urbackup/data/settings_" + conv_filename(clientsubname) + ".cfg";
+		settings_fn = "urbackup/data_"+ convert(index_facet_id) + "/settings_" + conv_filename(clientsubname) + ".cfg";
 	}
 
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
-	if (curr_settings.get() != NULL)
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	if (curr_settings.get() != nullptr)
 	{
 		std::string cbt_volumes;
 		if (curr_settings->getValue("cbt_volumes", &cbt_volumes)
@@ -5850,8 +6339,8 @@ bool IndexThread::crashPersistentCbtIsEnabled(std::string clientsubname, std::st
 		settings_fn = "urbackup/data/settings_" + conv_filename(clientsubname) + ".cfg";
 	}
 
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
-	if (curr_settings.get() != NULL)
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	if (curr_settings.get() != nullptr)
 	{
 		std::string cbt_crash_persistent_volumes;
 		if (curr_settings->getValue("cbt_crash_persistent_volumes", &cbt_crash_persistent_volumes)
@@ -5901,7 +6390,7 @@ namespace
 
 	PURBCT_BITMAP_DATA readBitmap(std::string fn, std::vector<char>& data)
 	{
-		std::auto_ptr<IFile> f(Server->openFile(fn, MODE_READ));
+		std::unique_ptr<IFile> f(Server->openFile(fn, MODE_READ));
 
 		if (f.get() == NULL)
 		{
@@ -6012,7 +6501,7 @@ namespace
 			}
 		}
 
-		std::auto_ptr<IFile> f(Server->openFile(fn+".new", MODE_WRITE));
+		std::unique_ptr<IFile> f(Server->openFile(fn+".new", MODE_WRITE));
 
 		if (f.get() == NULL)
 		{
@@ -6108,12 +6597,12 @@ bool IndexThread::prepareCbt(std::string volume)
 
 	if (!b)
 	{
-		unlock_cbt_mutex();
-
 		DWORD lasterr = GetLastError();
-
 		std::string errmsg;
 		int64 err = os_last_error(errmsg);
+
+		unlock_cbt_mutex();
+
 		int ll = (lasterr != ERROR_INVALID_FUNCTION 
 			&& lasterr!= ERROR_NOT_SUPPORTED ) ? LL_ERROR : LL_DEBUG;
 		VSSLog("Preparing change block tracking reset for volume " + volume + " failed: " + errmsg + " (code: " + convert(err) + ")", ll);
@@ -6175,24 +6664,284 @@ bool IndexThread::normalizeVolume(std::string & volume)
 	return true;
 }
 
-bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_volume, bool for_image_backup)
+#ifndef _WIN32
+namespace
+{
+#define DATTO_UUID_SIZE 16
+
+	struct dattobd_info
+	{
+		unsigned int minor;
+		unsigned long state;
+		int error;
+		unsigned long cache_size;
+		unsigned long long falloc_size;
+		unsigned long long seqid;
+		char uuid[DATTO_UUID_SIZE];
+		char cow[PATH_MAX];
+		char bdev[PATH_MAX];
+		unsigned long long version;
+		unsigned long long nr_changed_blocks;
+	};
+
+	struct dattobd_header
+	{
+		unsigned int magic;
+		unsigned int flags;
+		uint64 fpos;
+		uint64 fsize;
+		uint64 seqid;
+		char uuid[DATTO_UUID_SIZE];
+		uint64 version;
+		uint64 nr_changed_blocks;
+	};
+
+#define IOCTL_DATTOBD_INFO _IOR(DATTO_IOCTL_MAGIC, 8, struct dattobd_info)
+#define DATTO_MAGIC ((unsigned int)4776)
+#define DATTO_IOCTL_MAGIC 0x91
+}
+#endif
+
+#ifdef _WIN32
+inline int64 roundDown(int64 numToRound, int64 multiple)
+{
+	return ((numToRound / multiple) * multiple);
+}
+
+bool  IndexThread::addFileToCbt(const std::string& fpath, const DWORD& blocksize, const PURBCT_BITMAP_DATA& bitmap_data)
+{
+	std::unique_ptr<IFsFile> hive_file(Server->openFile(fpath, MODE_READ));
+
+	if (hive_file.get() != nullptr)
+	{
+		bool ret = true;
+		bool more_exts = true;
+		int64 offset = 0;
+		while (more_exts)
+		{
+			std::vector<IFsFile::SFileExtent> exts = hive_file->getFileExtents(offset, blocksize, more_exts);
+			for (size_t j = 0; j < exts.size(); ++j)
+			{
+				offset = (std::max)(offset, exts[j].offset + exts[j].size);
+
+				if (exts[j].volume_offset < 0)
+					continue;
+
+				for (int64 k = roundDown(exts[j].volume_offset, URBT_BLOCKSIZE);
+					k < exts[j].volume_offset + exts[j].size; k += URBT_BLOCKSIZE)
+				{
+					int64 block = k / URBT_BLOCKSIZE;
+					int64 bitmap_byte_wmagic = block / 8;
+					int64 real_block_size = bitmap_data->SectorSize - URBT_MAGIC_SIZE;
+					int64 bitmap_byte = (bitmap_byte_wmagic / real_block_size)
+						* bitmap_data->SectorSize + URBT_MAGIC_SIZE + bitmap_byte_wmagic % real_block_size;
+					unsigned int bitmap_bit = block % 8;
+
+					if (bitmap_byte >= bitmap_data->BitmapSize)
+					{
+						VSSLog("Registry hive extent outside of cbt data", LL_WARNING);
+						ret = false;
+					}
+					else
+					{
+						bitmap_data->Bitmap[bitmap_byte] |= (1 << bitmap_bit);
+					}
+				}
+			}
+		}
+		return ret;
+	}
+	else
+	{
+		return false;
+	}
+}
+#endif
+
+bool  IndexThread::punchHoleOrZero(IFile* f, int64 pos, const char* zero_buf, char* zero_read_buf, size_t zero_size)
+{
+	if (!f->PunchHole(pos, zero_size))
+	{
+		bool data_differs = (f->Read(pos, zero_read_buf, static_cast<_u32>(zero_size)) != zero_size
+			|| memcmp(zero_read_buf, zero_buf, static_cast<_u32>(zero_size)) != 0);
+
+		if (data_differs &&
+			f->Write(pos, zero_buf, static_cast<_u32>(zero_size)) != zero_size)
+		{
+			VSSLog("Errro zeroing file hash data in "+f->getFilename()+". " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void IndexThread::run_sc_refs_cleanup()
+{
+	bool has_cleanup = false;
+	bool retry_all = true;
+	while(retry_all)
+	{
+		retry_all = false;
+		for (size_t i = 0; i < sc_refs.size(); ++i)
+		{
+			if (sc_refs[i]->cleanup)
+			{
+				has_cleanup = true;
+
+				bool in_use = false;
+
+				bool found_ref = false;
+				
+				starttoken.clear();
+
+				SCRef* curr = sc_refs[i];
+
+				for (size_t k = 0; k < curr->starttokens.size(); ++k)
+				{
+					starttoken = curr->starttokens[k];
+
+					for (std::map<SCDirServerKey, std::map<std::string, SCDirs*> >::iterator it_scdirs = scdirs.begin();
+						it_scdirs != scdirs.end(); ++it_scdirs)
+					{
+						std::map<std::string, SCDirs*>& scdirs_server = it_scdirs->second;
+
+						VSS_ID ssetid = curr->ssetid;
+
+						bool in_use = false;
+						std::vector<std::string> paths;
+						for (std::map<std::string, SCDirs*>::iterator it = scdirs_server.begin();
+							it != scdirs_server.end(); ++it)
+						{
+							if (filesrv != nullptr
+								&& filesrv->hasActiveTransfersGen(it->second->dir, it_scdirs->first.start_token, curr->cleanup_gen))
+							{
+								VSSLog(it->first + " orig_target=" + it->second->orig_target + " target=" + it->second->target + " gen="+convert(curr->cleanup_gen)+" still in use. Not releasing.", LL_DEBUG);
+								in_use = true;
+								break;
+							}
+
+							paths.push_back(it->first);
+						}
+
+						if (in_use)
+							break;
+
+						for (size_t j = 0; j < paths.size(); ++j)
+						{
+							std::map<std::string, SCDirs*>::iterator it = scdirs_server.find(paths[j]);
+							if (it != scdirs_server.end()
+								&& it->second->ref == curr)
+							{
+								VSSLog("Releasing " + it->first + " orig_target=" + it->second->orig_target + " target=" + it->second->target + " (run_sc_refs_cleanup)", LL_DEBUG);
+								found_ref = true;
+								release_shadowcopy(it->second, false, -1);
+							}
+						}
+
+						bool retry = true;
+						while (retry)
+						{
+							retry = false;
+							for (std::map<std::string, SCDirs*>::iterator it = scdirs_server.begin();
+								it != scdirs_server.end(); ++it)
+							{
+								if (it->second->ref != nullptr
+									&& it->second->ref != curr
+									&& it->second->ref->ssetid == ssetid)
+								{
+									VSSLog("Releasing group shadow copy " + it->first + " orig_target=" + it->second->orig_target + " target=" + it->second->target + " (run_sc_refs_cleanup)", LL_DEBUG);
+									release_shadowcopy(it->second, false, -1);
+									found_ref = true;
+									retry = true;
+									break;
+								}
+							}
+						}
+					}
+				}
+
+				if (!found_ref)
+				{
+					VSSLog("Reference not found. Iterating over all start tokens and share names for deletion", LL_INFO);
+					for (size_t k = 0; k < curr->starttokens.size() && !retry_all; ++k)
+					{
+						starttoken = curr->starttokens[k];
+						SCDirs scd;
+						scd.running = true;
+
+						for (size_t j = 0; j < curr->sharenames.size() && !retry_all; ++j)
+						{
+							scd.dir = curr->sharenames[j];
+							scd.starttime = Server->getTimeSeconds();
+							if (sc_refs[i]->for_imagebackup)
+							{
+								scd.target = scd.dir;
+								scd.fileserv = false;
+							}
+							else
+							{
+								scd.target = getShareDir(scd.dir);
+								scd.fileserv = true;
+							}
+
+							if (filesrv != nullptr
+								&& filesrv->hasActiveTransfersGen(scd.dir, starttoken, curr->cleanup_gen))
+							{
+								VSSLog(scd.dir + " orig_target=" + scd.orig_target + " target=" + scd.target + " starttoken="+ starttoken+ " gen="+convert(curr->cleanup_gen)+" still in use. Not releasing. (2)", LL_DEBUG);
+								in_use = true;
+								break;
+							}
+
+							scd.ref = sc_refs[i];
+
+							size_t orig_size = sc_refs.size();
+
+							release_shadowcopy(&scd, false, -1, &scd);
+
+							if (sc_refs.size() != orig_size)
+							{
+								retry_all = true;
+								break;
+							}
+						}
+					}
+				}
+
+				if (in_use)
+					continue;
+
+				retry_all = true;
+				break;
+			}
+		}
+	}
+
+	if (!has_cleanup)
+	{
+		sc_refs_cleanup = false;
+	}
+}
+
+bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_volume,
+	bool for_image_backup, std::string cbt_file, CbtType cbt_type)
 {
 #ifdef _WIN32
 	ScopedUnlockCbtMutex unlock_cbt_mutex;
 
 	if (!normalizeVolume(volume))
 	{
-		VSSLog("Error normalizing volume. Input \""+volume+"\" (2)", LL_ERROR);
+		VSSLog("Error normalizing volume. Input \"" + volume + "\" (2)", LL_ERROR);
 		return false;
 	}
 
-	HANDLE hVolume = CreateFileA(("\\\\.\\" + volume).c_str(), GENERIC_READ|GENERIC_WRITE,
+	HANDLE hVolume = CreateFileA(("\\\\.\\" + volume).c_str(), GENERIC_READ | GENERIC_WRITE,
 		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
 		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
 
 	if (hVolume == INVALID_HANDLE_VALUE)
 	{
-		VSSLog("Error opening volume "+volume+". "+os_last_error_str(), LL_ERROR);
+		VSSLog("Error opening volume " + volume + ". " + os_last_error_str(), LL_ERROR);
 		return false;
 	}
 
@@ -6217,7 +6966,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 
 		if (hSnapVolume == INVALID_HANDLE_VALUE)
 		{
-			VSSLog("Error opening volume snapshot of "+volume+" at " + snap_volume+ ". " + os_last_error_str(), LL_ERROR);
+			VSSLog("Error opening volume snapshot of " + volume + " at " + snap_volume + ". " + os_last_error_str(), LL_ERROR);
 			return false;
 		}
 	}
@@ -6267,19 +7016,30 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 	{
 		BytesPerSector = alignmentDescr.BytesPerPhysicalSector;
 	}
-	
 
-	ULONGLONG bitmapBlocks = lengthInfo.Length.QuadPart / URBT_BLOCKSIZE + (lengthInfo.Length.QuadPart%URBT_BLOCKSIZE == 0 ? 0 : 1);
+	DWORD sectors_per_cluster;
+	DWORD bytes_per_sector;
+	DWORD NumberOfFreeClusters;
+	DWORD TotalNumberOfClusters;
+	b = GetDiskFreeSpaceW((Server->ConvertToWchar(volume) + L"\\").c_str(), &sectors_per_cluster, &bytes_per_sector, &NumberOfFreeClusters, &TotalNumberOfClusters);
+	if (!b)
+	{
+		VSSLog("Error in GetDiskFreeSpaceW. " + os_last_error_str(), LL_ERROR);
+		return false;
+	}
+	DWORD blocksize = bytes_per_sector * sectors_per_cluster;
+
+	ULONGLONG bitmapBlocks = lengthInfo.Length.QuadPart / URBT_BLOCKSIZE + (lengthInfo.Length.QuadPart % URBT_BLOCKSIZE == 0 ? 0 : 1);
 
 	size_t bitmapBytesWoMagic = bitmapBlocks / 8 + (bitmapBlocks % 8 == 0 ? 0 : 1);
 
 	DWORD bitmapSectorSize = BytesPerSector - URBT_MAGIC_SIZE;
 
-	size_t bitmapBytes = (bitmapBytesWoMagic / bitmapSectorSize)*BytesPerSector 
-		+ ((bitmapBytesWoMagic%bitmapSectorSize != 0) ? (URBT_MAGIC_SIZE + bitmapBytesWoMagic%bitmapSectorSize) : 0);
+	size_t bitmapBytes = (bitmapBytesWoMagic / bitmapSectorSize) * BytesPerSector
+		+ ((bitmapBytesWoMagic % bitmapSectorSize != 0) ? (URBT_MAGIC_SIZE + bitmapBytesWoMagic % bitmapSectorSize) : 0);
 
 	std::vector<char> buf;
-	buf.resize(2*sizeof(DWORD));
+	buf.resize(2 * sizeof(DWORD));
 
 	DWORD bytesReturned;
 	b = DeviceIoControl(hVolume, IOCTL_URBCT_RETRIEVE_BITMAP, NULL, 0, buf.data(), static_cast<DWORD>(buf.size()), &bytesReturned, NULL);
@@ -6296,7 +7056,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 
 	if (bitmap_data->BitmapSize < bitmapBytes)
 	{
-		VSSLog("Did not track enough (volume resize?). Tracked " + convert((int)bitmap_data->BitmapSize) + " should track " + convert(bitmapBytes)+". "
+		VSSLog("Did not track enough (volume resize?). Tracked " + convert((int)bitmap_data->BitmapSize) + " should track " + convert(bitmapBytes) + ". "
 			"CBT will disable itself once this area is written to and CBT will reengage itself.", LL_INFO);
 	}
 	else
@@ -6304,7 +7064,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 		bitmapBytes = bitmap_data->BitmapSize;
 	}
 
-	buf.resize(2*sizeof(DWORD) + bitmapBytes);
+	buf.resize(2 * sizeof(DWORD) + bitmapBytes);
 
 	b = DeviceIoControl(hVolume, IOCTL_URBCT_RETRIEVE_BITMAP, NULL, 0, buf.data(), static_cast<DWORD>(buf.size()), &bytesReturned, NULL);
 
@@ -6353,7 +7113,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 
 	for (DWORD i = bitmap_data->BitmapSize; i < bitmapBytes;)
 	{
-		if (i%bitmap_data->SectorSize == 0)
+		if (i % bitmap_data->SectorSize == 0)
 		{
 			memcpy(&bitmap_data->Bitmap[i], urbackupcbt_magic, URBT_MAGIC_SIZE);
 			i += URBT_MAGIC_SIZE;
@@ -6401,12 +7161,12 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 		}
 
 		VSSLog("VSS geometry. "
-				"Orig sector size=" + convert(static_cast<int64>(bitmap_data->SectorSize)) +
-				" Orig bitmap size=" + convert(static_cast<int64>(bitmap_data->BitmapSize)) +
-				" VSS sector size=" + convert(static_cast<int64>(snap_bitmap_data->SectorSize)) +
-				" VSS bitmap size=" + convert(static_cast<int64>(snap_bitmap_data->BitmapSize)) +
-				" RealVssBitmapSize=" + convert(static_cast<int64>(RealVssBitmapSize)) +
-				" RealBitmapSize=" + convert(static_cast<int64>(RealBitmapSize)), LL_DEBUG);
+			"Orig sector size=" + convert(static_cast<int64>(bitmap_data->SectorSize)) +
+			" Orig bitmap size=" + convert(static_cast<int64>(bitmap_data->BitmapSize)) +
+			" VSS sector size=" + convert(static_cast<int64>(snap_bitmap_data->SectorSize)) +
+			" VSS bitmap size=" + convert(static_cast<int64>(snap_bitmap_data->BitmapSize)) +
+			" RealVssBitmapSize=" + convert(static_cast<int64>(RealVssBitmapSize)) +
+			" RealBitmapSize=" + convert(static_cast<int64>(RealBitmapSize)), LL_DEBUG);
 
 		for (DWORD i = 0, s = 0; i < bitmap_data->BitmapSize
 			&& s < snap_bitmap_data->BitmapSize;)
@@ -6499,6 +7259,62 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 		}
 	}
 
+	if (!snap_volume.empty())
+	{
+		HKEY profile_list;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+			Server->ConvertToWchar("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList").c_str(),
+			0, KEY_READ, &profile_list) == ERROR_SUCCESS)
+		{
+			wchar_t buf[300];
+
+			for (DWORD i = 0; RegEnumKeyW(profile_list, i, buf, sizeof(buf)) == ERROR_SUCCESS; ++i)
+			{
+				DWORD rsize = sizeof(buf) * sizeof(wchar_t);
+				if (RegGetValueW(profile_list, std::wstring(buf).c_str(), L"ProfileImagePath",
+					RRF_RT_REG_SZ, NULL, buf, &rsize) == ERROR_SUCCESS)
+				{
+					std::string profile_path = Server->ConvertFromWchar(buf);
+
+					if (next(profile_path, 0, volume))
+					{
+						profile_path.erase(0, volume.size());
+
+						addFileToCbt(snap_volume + profile_path + "\\NTUSER.DAT", blocksize, bitmap_data);
+						for (size_t n = 1; n < 100; ++n)
+						{
+							if (!addFileToCbt(snap_volume + profile_path + "\\ntuser.dat.LOG" + convert(n), blocksize, bitmap_data))
+								break;
+						}
+					}
+				}
+			}
+
+			RegCloseKey(profile_list);
+		}
+
+		if (strlower(volume) == "c:")
+		{
+			char* locations[] = { "\\Windows\\System32\\config\\SYSTEM",
+				"\\Windows\\System32\\config\\SOFTWARE",
+				"\\Windows\\System32\\config\\SECURITY",
+				"\\Windows\\System32\\config\\SAM",
+				"\\Windows\\System32\\config\\DEFAULT" };
+
+			for (size_t i = 0; i < sizeof(locations) / sizeof(locations[0]); ++i)
+			{
+				std::string loc = locations[i];
+
+				addFileToCbt(snap_volume + loc, blocksize, bitmap_data);
+				for (size_t n = 1; n < 100; ++n)
+				{
+					if (!addFileToCbt(snap_volume + loc + "LOG" + convert(n), blocksize, bitmap_data))
+						break;
+				}
+			}
+		}
+	}
+
 	if (for_image_backup)
 	{
 		if (!saveMergeBitmap("urbackup\\hdat_file_" + conv_filename(strlower(volume)) + ".cbt", bitmap_data))
@@ -6513,7 +7329,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 			return false;
 		}
 
-		std::auto_ptr<IFsFile> hdat_img(ImageThread::openHdatF(volume, false));
+		std::unique_ptr<IFsFile> hdat_img(ImageThread::openHdatF(volume, false));
 
 		bool concurrent_active = false;
 
@@ -6554,6 +7370,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 		}
 
 		char zero_sha[SHA256_DIGEST_SIZE] = {};
+		char zero_sha_read[sizeof(zero_sha)];
 
 		VSSLog("Zeroing image hash data of volume " + volume + "...", LL_DEBUG);
 
@@ -6576,14 +7393,11 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 				{
 					if ((ch & (1 << bit)) > 0)
 					{
-						if (hdat_img->Write(sizeof(shadow_id) + (curr_byte * 8 + bit)*SHA256_DIGEST_SIZE, zero_sha, SHA256_DIGEST_SIZE) != SHA256_DIGEST_SIZE)
+						int64 zero_pos = sizeof(shadow_id) + (curr_byte * 8 + bit) * SHA256_DIGEST_SIZE;
+						if (!punchHoleOrZero(hdat_img.get(), zero_pos, zero_sha, zero_sha_read, sizeof(zero_sha)))
 						{
-							std::string errmsg;
-							int64 err = os_last_error(errmsg);
-							VSSLog("Errro zeroing image hash data. " + errmsg + " (code: " + convert(err) + ")", LL_ERROR);
 							return false;
 						}
-
 						changed_bytes += URBT_BLOCKSIZE;
 					}
 				}
@@ -6614,8 +7428,8 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 			IScopedLock lock(cbt_shadow_id_mutex);
 			++index_hdat_sequence_ids[strlower(volume)];
 		}
-		
-		std::auto_ptr<IFsFile> hdat_file(Server->openFile("urbackup\\hdat_file_" + conv_filename(strlower(volume)) + ".dat", MODE_RW_CREATE_DELETE));
+
+		std::unique_ptr<IFsFile> hdat_file(Server->openFile("urbackup\\hdat_file_" + conv_filename(strlower(volume)) + ".dat", MODE_RW_CREATE_DELETE));
 
 		if (hdat_file.get() == NULL)
 		{
@@ -6630,6 +7444,7 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 		VSSLog("Zeroing file hash data of volume " + volume + "...", LL_DEBUG);
 
 		char zero_chunk[sizeof(_u16) + chunkhash_single_size] = {};
+		char zero_chunk_read[sizeof(zero_chunk)];
 
 		DWORD curr_byte = 0;
 		bool last_bit_set = false;
@@ -6644,11 +7459,9 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 				{
 					if (last_bit_set)
 					{
-						if (hdat_file->Write(((int64)curr_byte * 8) * sizeof(zero_chunk), zero_chunk, sizeof(zero_chunk)) != sizeof(zero_chunk))
+						int64 zero_pos = ((int64)curr_byte * 8) * sizeof(zero_chunk);
+						if (!punchHoleOrZero(hdat_file.get(), zero_pos, zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
 						{
-							std::string errmsg;
-							int64 err = os_last_error(errmsg);
-							VSSLog("Errro zeroing file hash data. " + errmsg + " (code: " + convert(err) + ") -1", LL_ERROR);
 							return false;
 						}
 					}
@@ -6673,21 +7486,18 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 							if (last_pos > 0)
 							{
 								--last_pos;
-								if (hdat_file->Write(last_pos * sizeof(zero_chunk), zero_chunk, sizeof(zero_chunk)) != sizeof(zero_chunk))
+
+								int64 zero_pos = last_pos * sizeof(zero_chunk);
+								if (!punchHoleOrZero(hdat_file.get(), zero_pos, zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
 								{
-									std::string errmsg;
-									int64 err = os_last_error(errmsg);
-									VSSLog("Errro zeroing file hash data. " + errmsg + " (code: " + convert(err) + ") -2", LL_ERROR);
 									return false;
 								}
 							}
 						}
 
-						if (hdat_file->Write(((int64)curr_byte * 8 + bit) * sizeof(zero_chunk), zero_chunk, sizeof(zero_chunk)) != sizeof(zero_chunk))
+						int64 zero_pos = ((int64)curr_byte * 8 + bit) * sizeof(zero_chunk);
+						if (!punchHoleOrZero(hdat_file.get(), zero_pos, zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
 						{
-							std::string errmsg;
-							int64 err = os_last_error(errmsg);
-							VSSLog("Errro zeroing file hash data. " + errmsg + " (code: " + convert(err) + ")", LL_ERROR);
 							return false;
 						}
 						last_zeroed = true;
@@ -6721,8 +7531,717 @@ bool IndexThread::finishCbt(std::string volume, int shadow_id, std::string snap_
 
 	return true;
 #else
-	return false;
+	std::string fs_dev = getMountDevice(volume);
+	if (fs_dev.empty())
+	{
+		VSSLog("Cannot get device of mount " + volume + ". CBT disabled.", LL_INFO);
+		return false;
+	}
+
+	if (cbt_file.empty())
+	{
+		Server->deleteFile("urbackup/hdat_file_" + conv_filename(fs_dev) + ".dat");
+		Server->deleteFile("urbackup/hdat_img_" + conv_filename(fs_dev) + ".dat");
+	}
+
+	std::unique_ptr<IFsFile> hdat_file(Server->openFile("urbackup/hdat_file_" + conv_filename(fs_dev) + ".dat", MODE_RW_CREATE_DELETE));
+	std::unique_ptr<IFsFile> hdat_img(ImageThread::openHdatF(fs_dev, false));
+
+	if (hdat_img.get() == nullptr && hdat_file.get() == nullptr)
+	{
+		VSSLog("Error opening img and file backup hdat file", LL_ERROR);
+		return false;
+	}
+
+	std::string orig_dev = trim(getFile(snap_volume + "-dev"));
+
+	if (orig_dev.empty())
+	{
+		VSSLog("Error getting snapshotted device from " + snap_volume + "-dev", LL_ERROR);
+		return false;
+	}
+
+	std::unique_ptr<IFile> volfile(Server->openFile(orig_dev, MODE_READ_DEVICE));
+
+	if (volfile.get() == nullptr)
+	{
+		VSSLog("Error opening volume file " + orig_dev, LL_ERROR);
+		return false;
+	}
+
+
+	if (hdat_file.get() != nullptr)
+	{
+		hdat_file->Resize(((volfile->Size() + c_checkpoint_dist - 1) / c_checkpoint_dist) * (sizeof(_u16) + chunkhash_single_size));
+	}
+
+	if (hdat_img.get() != nullptr)
+	{
+		hdat_img->Resize(sizeof(shadow_id) + ((volfile->Size() + c_checkpoint_dist - 1) / c_checkpoint_dist) * SHA256_DIGEST_SIZE);
+	}
+
+	if (cbt_file.empty())
+	{
+		int64 current_era = -1;
+
+		if (cbt_type == CbtType_Era)
+		{
+			std::string era_status;
+			if (os_popen("dmsetup status \"" + orig_dev + "\"", era_status)==0)
+			{
+				std::vector<std::string> toks;
+				Tokenize(era_status, toks, " ");
+				if (toks.size() > 1)
+				{
+					current_era = watoi64(toks[2]);
+				}
+			}
+		}
+
+		if (hdat_img.get() != nullptr)
+		{
+			if (hdat_img->Write(0, reinterpret_cast<char*>(&shadow_id), sizeof(shadow_id)) != sizeof(shadow_id))
+			{
+				VSSLog("Error writing shadow id (3)", LL_ERROR);
+				return false;
+			}
+
+			{
+				IScopedLock lock(cbt_shadow_id_mutex);
+				cbt_shadow_ids[strlower(volume)] = shadow_id;
+			}
+		}
+
+		if (hdat_file.get() != nullptr)
+		{
+			IScopedLock lock(cbt_shadow_id_mutex);
+			++index_hdat_sequence_ids[strlower(volume)];
+		}
+
+		if (hdat_img.get() != nullptr)
+		{
+			if (!hdat_img->Sync())
+			{
+				VSSLog("Error syncing hdat_img file -1", LL_ERROR);
+				return false;
+			}
+		}
+
+		if (hdat_file.get() != nullptr)
+		{
+			if (!hdat_file->Sync())
+			{
+				VSSLog("Error syncing hdat_file file -1", LL_ERROR);
+				return false;
+			}
+		}
+
+		if (cbt_type == CbtType_Era
+			&& current_era>0)
+		{
+			if (!finishCbtEra2(hdat_file.get(), current_era))
+			{
+				return false;
+			}
+
+			if (!finishCbtEra2(hdat_img.get(), current_era))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+	bool ret = false;
+	int64 hdat_file_era;
+	int64 hdat_img_era;
+	if (cbt_type == CbtType_Datto)
+	{
+		ret = finishCbtDatto(volfile.get(), hdat_file.get(), hdat_img.get(), volume, shadow_id, snap_volume, for_image_backup, cbt_file);
+	}
+	else if (cbt_type == CbtType_Era)
+	{
+		ret = finishCbtEra(hdat_file.get(), hdat_img.get(), volume, shadow_id, snap_volume, for_image_backup, cbt_file,
+			hdat_file_era, hdat_img_era);
+	}
+
+	if (ret)
+	{
+		if (hdat_img.get() != nullptr)
+		{
+			if (!hdat_img->Sync())
+			{
+				VSSLog("Error syncing hdat_img file", LL_ERROR);
+				return false;
+			}
+		}
+
+		if (hdat_file.get() != nullptr)
+		{
+			if (!hdat_file->Sync())
+			{
+				VSSLog("Error syncing hdat_file file", LL_ERROR);
+				return false;
+			}
+		}
+
+
+		if (cbt_type == CbtType_Era)
+		{
+			if (!finishCbtEra2(hdat_file.get(), hdat_file_era))
+			{
+				return false;
+			}
+
+			if (!finishCbtEra2(hdat_img.get(), hdat_img_era))
+			{
+				return false;
+			}
+		}
+	}
+
+	if (cbt_type == CbtType_Datto)
+	{
+		Server->deleteFile(cbt_file);
+	}
+
+	return ret;
 #endif
+}
+
+#ifndef _WIN32
+bool IndexThread::finishCbtDatto(IFile* volfile, IFsFile* hdat_file, IFsFile* hdat_img, std::string volume, int shadow_id,
+	std::string snap_volume, bool for_image_backup, std::string cbt_file)
+{
+	std::string datto_dev = trim(getFile(snap_volume + "-dev"));
+
+	if (datto_dev.empty())
+	{
+		VSSLog("Error getting datto device from " + snap_volume + "-dev", LL_ERROR);
+		return false;
+	}
+
+	int datto_num = watoi(getafter("/dev/datto", datto_dev));
+
+	int fd = open("/dev/datto-ctl", O_RDONLY);
+	if (fd == -1)
+	{
+		VSSLog("Error opening /dev/datto-ctl", LL_ERROR);
+		return false;
+	}
+
+	dattobd_info dbd_info = {};
+	dbd_info.minor = datto_num;
+
+	int rc = ioctl(fd, IOCTL_DATTOBD_INFO, &dbd_info);
+
+	close(fd);
+
+	if (rc == -1)
+	{
+		VSSLog("Error running IOCTL_DATTOBD_INFO for datto dev " + convert(datto_num), LL_ERROR);
+		return false;
+	}
+
+	std::unique_ptr<IFile> cowfile(Server->openFile(cbt_file, MODE_READ));
+
+	if (cowfile.get() == nullptr)
+	{
+		VSSLog("Error opening datto cow file at " + cbt_file, LL_ERROR);
+		return false;
+	}
+
+
+	char header_buf[4096];
+	if (cowfile->Read(header_buf, static_cast<_u32>(sizeof(header_buf))) != sizeof(header_buf))
+	{
+		VSSLog("Error reading datto header from " + cbt_file, LL_ERROR);
+		return false;
+	}
+
+
+	dattobd_header dbd_header;
+	memcpy(&dbd_header, header_buf, sizeof(dbd_header));
+
+	if (dbd_header.magic != DATTO_MAGIC)
+	{
+		VSSLog("Datto magic wrong at " + cbt_file, LL_ERROR);
+		return false;
+	}
+
+	if (memcmp(dbd_header.uuid, dbd_info.uuid, DATTO_UUID_SIZE) != 0)
+	{
+		VSSLog("Snapshot and cbt file uuids differ (cbt_file=" + cbt_file + " snapshot=" + datto_dev + ")", LL_ERROR);
+		return false;
+	}
+
+	if (dbd_header.seqid + 1 != dbd_info.seqid)
+	{
+		VSSLog("Snapshot not at correct seqid expected " + convert(dbd_info.seqid) + " got " + convert(dbd_header.seqid + 1), LL_ERROR);
+		return false;
+	}
+
+	if (hdat_img != nullptr)
+	{
+		if (hdat_img->Write(0, reinterpret_cast<char*>(&shadow_id), sizeof(shadow_id)) != sizeof(shadow_id))
+		{
+			VSSLog("Error writing shadow id", LL_ERROR);
+			return false;
+		}
+
+		{
+			IScopedLock lock(cbt_shadow_id_mutex);
+			cbt_shadow_ids[strlower(volume)] = shadow_id;
+		}
+	}
+
+	if (hdat_file != nullptr)
+	{
+		IScopedLock lock(cbt_shadow_id_mutex);
+		++index_hdat_sequence_ids[strlower(volume)];
+	}
+
+	const int64 dbd_block_size = 4096;
+	char zero_sha[SHA256_DIGEST_SIZE] = {};
+	char zero_sha_read[sizeof(zero_sha)];
+	char zero_chunk[sizeof(_u16) + chunkhash_single_size] = {};
+	char zero_chunk_read[sizeof(zero_chunk)];
+	bool last_bit_set = false;
+	bool last_zeroed = false;
+	int64 num_blocks = (volfile->Size() + dbd_block_size - 1) / dbd_block_size;
+
+	VSSLog("Zeroing file hash data of volume " + volume + "...", LL_DEBUG);
+
+	for (int64 i = 0; i < num_blocks;)
+	{
+		int64 toread_blocks = (std::min)(num_blocks - i, static_cast<int64>(sizeof(header_buf) / sizeof(int64)));
+		_u32 toread_bytes = static_cast<_u32>(toread_blocks * sizeof(int64));
+		if (cowfile->Read(header_buf, toread_bytes) != toread_bytes)
+		{
+			VSSLog("Error reading change block information from " + cbt_file, LL_ERROR);
+			return false;
+		}
+
+		int64 block_start = i;
+
+		for (; i < block_start + toread_blocks; ++i)
+		{
+			uint64 block_map;
+			memcpy(&block_map, header_buf + (i - block_start) * sizeof(int64), sizeof(block_map));
+
+			int64 cbt_pos = (i * dbd_block_size) / c_checkpoint_dist;
+
+			if (block_map && hdat_img != nullptr)
+			{
+				if (!punchHoleOrZero(hdat_img, sizeof(shadow_id) + cbt_pos * SHA256_DIGEST_SIZE,
+					zero_sha, zero_sha_read, sizeof(zero_sha)))
+				{
+					return false;
+				}
+			}
+
+			if (hdat_file != nullptr)
+			{
+				bool has_bit = (block_map > 0);
+				if (has_bit
+					|| last_bit_set)
+				{
+					if (!last_bit_set
+						&& !last_zeroed)
+					{
+						int64 last_pos = cbt_pos;
+						if (last_pos > 0)
+						{
+							--last_pos;
+							if (!punchHoleOrZero(hdat_file, last_pos * sizeof(zero_chunk), zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
+							{
+								return false;
+							}
+						}
+					}
+
+					if (!punchHoleOrZero(hdat_file, cbt_pos * sizeof(zero_chunk), zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
+					{
+						return false;
+					}
+					last_zeroed = true;
+				}
+				else
+				{
+					last_zeroed = false;
+				}
+				last_bit_set = has_bit;
+			}
+		}
+	}
+
+	return true;
+}
+#endif
+
+bool IndexThread::finishCbtEra(IFsFile* hdat_file, IFsFile* hdat_img, std::string volume, int shadow_id,
+	std::string snap_volume, bool for_image_backup, std::string cbt_file,
+	int64& hdat_file_era, int64& hdat_img_era)
+{
+	hdat_file_era = -1;
+	if(hdat_file!=nullptr)
+		hdat_file_era = watoi64(trim(getFile(hdat_file->getFilename() + ".era")));
+	hdat_img_era = -1;
+	if(hdat_img!=nullptr)
+		hdat_img_era = watoi64(trim(getFile(hdat_img->getFilename() + ".era")));
+
+	std::string dev_file = getMountDevice(volume);
+
+	if (dev_file.empty())
+	{
+		VSSLog("Error getting device of file system at \"" + volume + "\"", LL_WARNING);
+		return false;
+	}
+
+	dev_file += "-a31725acca86421d-clone";
+
+	{
+		std::string era_err;
+		if (os_popen("dmsetup message \"" + dev_file + "\" 0 take_metadata_snap 2>&1", era_err) != 0)
+		{
+			VSSLog("Error taking dm-era metadata snapshot of volume \"" + dev_file + "\": " + trim(era_err), LL_WARNING);
+			return false;
+		}
+	}
+
+	if (hdat_img != nullptr)
+	{
+		if (hdat_img->Write(0, reinterpret_cast<char*>(&shadow_id), sizeof(shadow_id)) != sizeof(shadow_id))
+		{
+			VSSLog("Error writing shadow id", LL_ERROR);
+			return false;
+		}
+
+		{
+			IScopedLock lock(cbt_shadow_id_mutex);
+			cbt_shadow_ids[strlower(volume)] = shadow_id;
+		}
+	}
+
+	if (hdat_file != nullptr)
+	{
+		IScopedLock lock(cbt_shadow_id_mutex);
+		++index_hdat_sequence_ids[strlower(volume)];
+	}
+
+	VSSLog("Zeroing file hash data of volume " + volume + "...", LL_DEBUG);
+
+#ifndef _WIN32
+#define _popen popen
+#define _pclose pclose
+#endif
+#ifdef __ANDROID__
+	POFILE* pin = NULL;
+#endif
+	FILE* in = nullptr;
+
+	std::string cmd = "era_dump --logical \"" + cbt_file + "\"";
+#ifdef __ANDROID__
+	pin = and_popen(cmd.c_str(), "r");
+	if (pin != NULL) in = pin->fp;
+#else
+	in = _popen(cmd.c_str(), "re");
+	if(in==nullptr)
+		in = _popen(cmd.c_str(), "r");
+#endif
+
+	if (in == nullptr)
+	{
+		VSSLog("Error running command \"era_dump --logical "+cbt_file+"\"", LL_WARNING);
+		return false;
+	}
+
+	char buf[4096];
+	size_t read;
+	bool xml_node_close;
+	std::string xml_node_name;
+	str_map xml_node_attrs;
+	std::string xml_node_attr_key;
+	std::string xml_node_attr_val;
+	enum XmlState
+	{
+		XmlState_Text,
+		XmlState_NodeName1,
+		XmlState_NodeNameX,
+		XmlState_NodeAttrKey,
+		XmlState_NodeAttrValueQuote,
+		XmlState_NodeAttrValue
+	} xml_state = XmlState_Text;
+
+	enum XmlLoc
+	{
+		XmlLoc_Init,
+		XmlLoc_EraArray
+	} xml_loc = XmlLoc_Init;
+
+	int64 current_era = -1;
+	int64 block_size = -1;
+
+	char zero_sha[SHA256_DIGEST_SIZE] = {};
+	char zero_sha_read[sizeof(zero_sha)];
+	char zero_chunk[sizeof(_u16) + chunkhash_single_size] = {};
+	char zero_chunk_read[sizeof(zero_chunk)];
+	bool last_bit_set = false;
+	bool last_zeroed = false;
+
+	do
+	{
+		read = fread(buf, 1, sizeof(buf), in);
+		for (size_t i = 0; i < read;++i)
+		{
+			bool node_finished = false;
+
+			char ch = buf[i];
+			switch (xml_state)
+			{
+			case XmlState_Text:
+				if (ch == '<')
+				{
+					xml_node_name.clear();
+					xml_state = XmlState_NodeName1;
+				}
+				break;
+			case XmlState_NodeName1:
+			{
+				if (ch == '/')
+				{
+					xml_node_close = true;
+					xml_state = XmlState_NodeNameX;
+				}
+				else if (ch == '>')
+				{
+					xml_state = XmlState_Text;
+					node_finished = true;
+				}
+				else
+				{
+					xml_node_close = false;
+					if (ch != ' ' && ch != '\t')
+						xml_node_name += ch;
+					xml_state = XmlState_NodeNameX;
+				}
+			} break;
+			case XmlState_NodeNameX:
+			{
+				if (ch == '>')
+				{
+					xml_state = XmlState_Text;
+					node_finished = true;
+				}
+				else if (ch != ' ' && ch != '\t')
+				{
+					xml_node_name += ch;
+				}
+				else if (!xml_node_name.empty()
+					&& (ch == ' ' || ch == '\t'))
+				{
+					xml_state = XmlState_NodeAttrKey;
+					xml_node_attr_key.clear();
+					xml_node_attrs.clear();
+				}
+			}break;
+			case XmlState_NodeAttrKey:
+			{
+				if (ch == '>')
+				{
+					xml_state = XmlState_Text;
+					node_finished = true;
+				}
+				else if (ch == '=')
+					xml_state = XmlState_NodeAttrValueQuote;
+				else if (ch != ' ' && ch != ' ')
+					xml_node_attr_key += ch;				
+			} break;
+			case XmlState_NodeAttrValueQuote:
+			{
+				if (ch == '>')
+				{
+					xml_state = XmlState_Text;
+					node_finished = true;
+				}
+				else if (ch == '"')
+				{
+					xml_node_attr_val.clear();
+					xml_state = XmlState_NodeAttrValue;
+				}
+			} break;
+			case XmlState_NodeAttrValue:
+			{
+				if (ch != '"')
+				{
+					xml_node_attr_val += ch;
+				}
+				else
+				{
+					xml_node_attrs[xml_node_attr_key] = xml_node_attr_val;
+					xml_state = XmlState_NodeAttrKey;
+					xml_node_attr_key.clear();
+				}
+			}break;
+
+			}
+
+			if (node_finished)
+			{
+				if (xml_loc == XmlLoc_Init &&
+					xml_node_name == "superblock"
+					&& !xml_node_close)
+				{
+					current_era = watoi64(xml_node_attrs["current_era"]);
+					block_size = watoi64(xml_node_attrs["block_size"])*512;
+
+					// take_metadata_snap increases era by one
+					if(current_era>0)
+						current_era--;
+
+					if (block_size > c_checkpoint_dist)
+					{
+						VSSLog("Era block size too large (" + PrettyPrintBytes(block_size) + "). Must be smaller or equal to " + PrettyPrintBytes(c_checkpoint_dist), LL_WARNING);
+						return false;
+					}
+					else if (block_size == 0)
+					{
+						VSSLog("Era block size not defined", LL_WARNING);
+						return false;
+					}
+					else if (current_era <= 0)
+					{
+						VSSLog("Current era not defined", LL_WARNING);
+						return false;
+					}
+				}
+				else if (xml_node_name == "era_array")
+				{
+					xml_loc = xml_node_close ? XmlLoc_Init : XmlLoc_EraArray;
+				}
+				else if (xml_loc == XmlLoc_EraArray &&
+						xml_node_name == "era")
+				{
+					if (current_era<=0)
+					{
+						VSSLog("Did not get superblock before era block", LL_WARNING);
+						return false;
+					}
+
+					int64 block_nr = watoi64(xml_node_attrs["block"]);
+					int64 block_era = watoi64(xml_node_attrs["era"]);
+
+					int64 cbt_pos = (block_nr * block_size) / c_checkpoint_dist;
+
+					if (block_era >= hdat_img_era && hdat_img != nullptr)
+					{
+						if (!punchHoleOrZero(hdat_img, sizeof(shadow_id) + cbt_pos * SHA256_DIGEST_SIZE,
+								zero_sha, zero_sha_read, sizeof(zero_sha)))
+						{
+							return false;
+						}
+					}
+
+					if (hdat_file != nullptr)
+					{
+						bool has_bit = (block_era >= hdat_file_era);
+						if (has_bit
+							|| last_bit_set)
+						{
+							if (!last_bit_set
+								&& !last_zeroed)
+							{
+								int64 last_pos = cbt_pos;
+								if (last_pos > 0)
+								{
+									--last_pos;
+									if (!punchHoleOrZero(hdat_file, last_pos * sizeof(zero_chunk), zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
+									{
+										return false;
+									}
+								}
+							}
+
+							if (!punchHoleOrZero(hdat_file, cbt_pos * sizeof(zero_chunk), zero_chunk, zero_chunk_read, sizeof(zero_chunk)))
+							{
+								return false;
+							}
+							last_zeroed = true;
+						}
+						else
+						{
+							last_zeroed = false;
+						}
+						last_bit_set = has_bit;
+					}
+				}
+			}
+		}
+	}
+	while (read == sizeof(buf));
+
+
+	int rc;
+#ifdef __ANDROID__
+	rc = and_pclose(pin);
+#else
+	rc = _pclose(in);
+#endif
+	if (rc != 0)
+	{
+		VSSLog("Error running command \"era_dump --logical " + cbt_file + "\" rc " + convert(rc), LL_WARNING);
+		return false;
+	}
+		
+	std::string era_err;
+	if (os_popen("dmsetup message \"" + dev_file + "\" 0 drop_metadata_snap 2>&1", era_err) != 0)
+	{
+		VSSLog("Error dropping dm-era metadata snapshot of volume \""+ dev_file +"\": "+trim(era_err), LL_WARNING);
+		return false;
+	}
+
+	if (hdat_file != nullptr)
+		hdat_file_era = current_era;
+	if (hdat_img != nullptr)
+		hdat_img_era = current_era;
+
+	return true;
+}
+
+
+bool IndexThread::finishCbtEra2(IFsFile* hdat, int64 hdat_era)
+{
+	if (hdat != nullptr)
+	{
+		std::unique_ptr<IFile> hdat_file_era_new(Server->openFile(hdat->getFilename() + ".era.new", MODE_WRITE));
+
+		if (hdat_file_era_new.get() == nullptr)
+		{
+			VSSLog("Error opening file at " + hdat->getFilename() + ".era.new. " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+
+		if (hdat_file_era_new->Write(convert(hdat_era)) != convert(hdat_era).size())
+		{
+			VSSLog("Error writing to " + hdat->getFilename() + ".era.new", LL_ERROR);
+			return false;
+		}
+
+		if (!hdat_file_era_new->Sync())
+		{
+			VSSLog("Error syncing " + hdat->getFilename() + ".era.new. " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+
+		if (!os_rename_file(hdat->getFilename() + ".era.new",
+				hdat->getFilename() + ".era"))
+		{
+			VSSLog("Error renaming " + hdat->getFilename() + ".era.new to "+hdat->getFilename() + ".era. " + os_last_error_str(), LL_ERROR);
+			return false;
+		}
+	}
+
+	return true;
 }
 
 bool IndexThread::disableCbt(std::string volume)
@@ -6757,6 +8276,19 @@ bool IndexThread::disableCbt(std::string volume)
 	return !FileExists("urbackup\\hdat_file_" + conv_filename(volume) + ".dat")
 		&& !FileExists(ImageThread::hdatFn(volume));
 #else
+	Server->Log("Disabling CBT on volume \"" + volume + "\"", LL_DEBUG);
+
+	std::string mountfn = getMountDevice(volume);
+	if(!mountfn.empty())
+	{
+		Server->deleteFile("urbackup/hdat_file_"+conv_filename(mountfn)+".dat");
+		Server->deleteFile("urbackup/hdat_img_"+conv_filename(mountfn)+".dat");
+	}
+	else
+	{
+		Server->deleteFile("urbackup/hdat_file_"+conv_filename(volume)+".dat");
+		Server->deleteFile("urbackup/hdat_img_"+conv_filename(volume)+".dat");
+	}
 	return true;
 #endif
 }
@@ -6816,7 +8348,7 @@ void IndexThread::updateCbt()
 	std::set<std::string> vols;
 
 	std::string settings_fn = "urbackup/data/settings.cfg";
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
 	std::string volumes;
 	if (curr_settings.get() != NULL)
 	{
@@ -6854,6 +8386,9 @@ void IndexThread::updateCbt()
 
 	for (size_t i = 0; i < backup_dirs.size(); ++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		std::string cvol = trim(backup_dirs[i].path);
 		if (!normalizeVolume(cvol))
 			continue;
@@ -6897,9 +8432,9 @@ void IndexThread::createMd5sumsFile(const std::string & path, std::string vol)
 	normalizeVolume(vol);
 
 	std::string fn = "md5sums-"+conv_filename(vol)+"-"+db->Read("SELECT strftime('%Y-%m-%d %H-%M', 'now', 'localtime') AS fn")[0]["fn"]+".txt";
-	std::auto_ptr<IFile> output_f(Server->openFile(fn, MODE_WRITE));
+	std::unique_ptr<IFile> output_f(Server->openFile(fn, MODE_WRITE));
 
-	if (output_f.get() == NULL)
+	if (output_f.get() == nullptr)
 	{
 		Server->Log("Error opening md5sums file. " + os_last_error_str(), LL_ERROR);
 	}
@@ -6922,9 +8457,9 @@ void IndexThread::createMd5sumsFile(const std::string & path, const std::string&
 		}
 		else if (!files[i].isspecialf)
 		{
-			std::auto_ptr<IFile> f(Server->openFile(os_file_prefix(path + os_file_sep() + files[i].name), MODE_READ_SEQUENTIAL_BACKUP));
+			std::unique_ptr<IFile> f(Server->openFile(os_file_prefix(path + os_file_sep() + files[i].name), MODE_READ_SEQUENTIAL_BACKUP));
 
-			if (f.get() == NULL)
+			if (f.get() == nullptr)
 			{
 				Server->Log("Error opening file \"" + path + os_file_sep() + files[i].name + "\" for creating md5sums. " + os_last_error_str(), LL_ERROR);
 			}
@@ -7011,6 +8546,9 @@ bool IndexThread::getAbsSymlinkTarget( const std::string& symlink, const std::st
 
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if(backup_dirs[i].group!=index_group)
 			continue;
 
@@ -7101,7 +8639,7 @@ void IndexThread::addSymlinkBackupDir( const std::string& target, std::string& o
 
 	SBackupDir backup_dir;
 
-	cd->addBackupDir(name, target, index_server_default, index_flags, index_group, 1);
+	cd->addBackupDir(name, target, index_server_default, index_flags, index_group, 1, index_facet_id);
 
 	backup_dir.id=static_cast<int>(db->getLastInsertID());
 
@@ -7131,6 +8669,9 @@ bool IndexThread::backupNameInUse( const std::string& name )
 {
 	for(size_t i=0;i<backup_dirs.size();++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		if(backup_dirs[i].tname==name)
 		{
 			return true;
@@ -7143,6 +8684,12 @@ void IndexThread::removeUnconfirmedSymlinkDirs(size_t off)
 {
 	for(size_t i=off;i<backup_dirs.size();)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+		{
+			++i;
+			continue;
+		}
+
 		if(index_group == backup_dirs[i].group)
 		{
 			if(backup_dirs[i].symlinked
@@ -7162,7 +8709,7 @@ void IndexThread::removeUnconfirmedSymlinkDirs(size_t off)
 				removeDir(starttoken, backup_dirs[i].tname);
 				removeDir(std::string(), backup_dirs[i].tname);
 
-				if(filesrv!=NULL)
+				if(filesrv!=nullptr)
 				{
 					filesrv->removeDir(backup_dirs[i].tname, starttoken);
 					filesrv->removeDir(backup_dirs[i].tname, std::string());
@@ -7368,6 +8915,18 @@ int64 IndexThread::getChangeIndicator(const SFile & file)
 }
 
 #ifndef _WIN32
+namespace
+{
+	struct FLockFile
+	{
+		FLockFile(std::string fn, bool perm)
+			: fn(fn), perm(perm) {}
+
+		std::string fn;
+		bool perm;
+	};
+}
+
 bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool for_imagebackup, bool * &onlyref, bool* not_configured)
 {
 	std::string scriptname;
@@ -7380,11 +8939,11 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 		scriptname="create_volume_snapshot";
 	}
 
-	std::string scriptlocation = get_snapshot_script_location(scriptname);
+	std::string scriptlocation = get_snapshot_script_location(scriptname, index_clientsubname);
 
 	if (scriptlocation.empty())
 	{
-		if (not_configured != NULL)
+		if (not_configured != nullptr)
 		{
 			*not_configured = true;
 		}
@@ -7408,13 +8967,33 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 	std::vector<std::string> lines;
 	Tokenize(loglines, lines, "\n");
 	std::string snapshot_target;
+	std::string cbt_info;
+	std::string cbt_file;
+	
+	std::vector<FLockFile> flock_files;
 	for(size_t i=0;i<lines.size();++i)
 	{
 		std::string line = trim(lines[i]);
 
-		if(next(line, 0, "SNAPSHOT="))
+		if(next(line, 0, "CBT="))
+		{
+			cbt_info = line.substr(4);
+		}
+		else if(next(line, 0, "CBT_FILE="))
+		{
+			cbt_file = line.substr(9);
+		}
+		else if(next(line, 0, "SNAPSHOT="))
 		{
 			snapshot_target = line.substr(9);
+		}
+		else if (next(line, 0, "FLOCK="))
+		{
+			flock_files.push_back(FLockFile(line.substr(6), false));
+		}
+		else if (next(line, 0, "FLOCK_PERM="))
+		{
+			flock_files.push_back(FLockFile(line.substr(11), true));
 		}
 		else
 		{
@@ -7424,7 +9003,7 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 
 	if (trim(snapshot_target) == "none")
 	{
-		if (not_configured != NULL)
+		if (not_configured != nullptr)
 		{
 			*not_configured = true;
 		}
@@ -7435,6 +9014,45 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 	{
 		VSSLog("Could not find snapshot target. Please include a snapshot target output in the script (e.g. echo SNAPSHOT=/mnt/snap/xxxx)", LL_ERROR);
 		return false;
+	}
+
+	for (size_t i = 0; i < flock_files.size(); ++i)
+	{
+		std::string flock_fp = flock_files[i].fn;
+		std::unique_ptr<IFsFile> flock_f(Server->openFile(flock_fp, MODE_RW));
+		if (flock_f.get() == nullptr)
+		{
+			VSSLog("Error opening file to lock: " + flock_fp + ". " + os_last_error_str(), LL_WARNING);
+		}
+		else
+		{
+			IFsFile::os_file_handle fd = flock_f->getOsHandle(true);
+
+			struct flock fl = {};
+			fl.l_type = F_WRLCK;
+			fl.l_whence = SEEK_SET;
+			fl.l_start = 0;
+			fl.l_len = 0;
+
+			int rc = fcntl(fd, F_SETLK, &fl);
+
+			if (rc != 0)
+			{
+				VSSLog("Error locking file (F_SETLK) " + flock_fp + ". " + os_last_error_str(), LL_WARNING);
+			}
+
+			rc = flock(fd, LOCK_EX);
+
+			if (rc != 0)
+			{
+				VSSLog("Error locking file (flock) " + flock_fp + ". " + os_last_error_str(), LL_WARNING);
+			}
+
+			if (flock_files[i].perm)
+				flock_fds_perm.push_back(fd);
+			else
+				dir->ref->flock_fds.push_back(fd);
+		}
 	}
 
 	dir->target.erase(0,wpath.size());
@@ -7450,6 +9068,10 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 	if(dir->fileserv)
 	{
 		shareDir(starttoken, dir->dir, dir->target);
+	}
+	if(for_imagebackup)
+	{
+		dir->target=snapshot_target;
 	}
 
 	SShadowCopy tsc;
@@ -7473,21 +9095,52 @@ bool IndexThread::start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool f
 
 	VSSLog("Shadowcopy path: "+tsc.path, LL_DEBUG);
 
-	if(onlyref!=NULL)
+	if(!cbt_info.empty())
+	{
+		str_map cbt_params;
+		ParseParamStrHttp(cbt_info, &cbt_params);
+
+		std::string cbt_type = cbt_params["type"];
+
+		if (cbt_type == "datto"
+			&& !cbt_file.empty())
+		{
+			VSSLog("Using datto change information from " + cbt_file, LL_INFO);
+			dir->ref->cbt = true;
+			dir->ref->cbt_type = CbtType_Datto;
+			dir->ref->cbt_file = cbt_file;
+		}
+		else if (cbt_type == "era")
+		{
+			VSSLog("Using era change information from device " + cbt_file, LL_INFO);
+			dir->ref->cbt = true;
+			dir->ref->cbt_type = CbtType_Era;
+			dir->ref->cbt_file = cbt_file;
+		}
+
+		if (cbt_params["reset"] == "1")
+		{
+			VSSLog("Resetting CBT information", LL_INFO);
+			dir->ref->cbt = true;
+			dir->ref->cbt_file.clear();
+		}
+	}
+
+	if(onlyref!=nullptr)
 	{
 		*onlyref=false;
 	}
 	return true;
 }
 
-std::string IndexThread::get_snapshot_script_location(const std::string & name)
+std::string IndexThread::get_snapshot_script_location(const std::string & name, const std::string& index_clientsubname)
 {
 	std::string conffile = SYSCONFDIR "/urbackup/snapshot.cfg";
 	if (!FileExists(conffile))
 	{
 		return std::string();
 	}
-	std::auto_ptr<ISettingsReader> settings(Server->createFileSettingsReader(conffile));
+	std::unique_ptr<ISettingsReader> settings(Server->createFileSettingsReader(conffile));
 
 	std::string ret;
 	if (!index_clientsubname.empty()
@@ -7506,13 +9159,22 @@ std::string IndexThread::get_snapshot_script_location(const std::string & name)
 
 bool IndexThread::get_volumes_mounted_locally()
 {
-	std::string ret = strlower(get_snapshot_script_location("volumes_mounted_locally"));
+	std::string ret = strlower(get_snapshot_script_location("volumes_mounted_locally", index_clientsubname));
 
 	return ret != "0" && ret != "false" && ret != "no";
 }
 
 
 #endif //!_WIN32
+
+bool IndexThread::isWindowsLocked()
+{
+#ifdef _WIN32
+	return is_win_locked();
+#else
+	return false;
+#endif
+}
 
 std::string IndexThread::escapeDirParam( const std::string& dir )
 {
@@ -7531,7 +9193,7 @@ int IndexThread::getShadowId(const std::string & volume, IFile* hdat_img)
 	}
 	else
 	{
-		if (hdat_img != NULL)
+		if (hdat_img != nullptr)
 		{
 			int shadow_id;
 			if (hdat_img->Read(0, reinterpret_cast<char*>(&shadow_id), sizeof(shadow_id)) == sizeof(shadow_id))
@@ -7548,6 +9210,14 @@ int IndexThread::getShadowId(const std::string & volume, IFile* hdat_img)
 #ifndef _WIN32
 std::string IndexThread::lookup_shadowcopy(int sid)
 {
+	std::vector<SShadowCopy> scs = cd->getShadowcopies();
+	for (size_t i = 0; i < scs.size(); ++i)
+	{
+		if (scs[i].id == sid)
+		{
+			return scs[i].path;
+		}
+	}
 	return std::string();
 }
 
@@ -7569,12 +9239,20 @@ void IndexThread::addScRefs(VSS_ID ssetid, std::vector<SCRef*>& out)
 
 void IndexThread::openCbtHdatFile(SCRef* ref, const std::string& sharename, const std::string & volume)
 {
-	if (ref!=NULL
+	if (ref!=nullptr
 		&& ref->cbt)
 	{
+#ifdef _WIN32
 		std::string vol = volume;
 		normalizeVolume(vol);
 		vol = strlower(vol);
+#else
+		std::string vol = getMountDevice(volume);
+		if(vol.empty())
+		{
+			return;
+		}
+#endif
 
 		index_hdat_file.reset(Server->openFile("urbackup/hdat_file_" + conv_filename(vol) + ".dat", MODE_RW_CREATE_DELETE));
 		index_hdat_fs_block_size = -1;
@@ -7595,11 +9273,11 @@ void IndexThread::openCbtHdatFile(SCRef* ref, const std::string& sharename, cons
 #endif
 		size_t* seq_id = &index_hdat_sequence_ids[strlower(vol)];
 		if (index_hdat_file.get()
-			&& filesrv != NULL
+			&& filesrv != nullptr
 			&& index_hdat_fs_block_size>0)
 		{
 			IFsFile* f = Server->openFile(index_hdat_file->getFilename(), MODE_RW_DELETE);
-			if (f != NULL)
+			if (f != nullptr)
 			{
 				filesrv->setCbtHashFile(starttoken + "|" + sharename, std::string(),
 					IFileServ::CbtHashFileInfo(f, index_hdat_fs_block_size, seq_id, *seq_id));
@@ -7609,10 +9287,10 @@ void IndexThread::openCbtHdatFile(SCRef* ref, const std::string& sharename, cons
 		client_hash.reset(new ClientHash(index_hdat_file.get(), false, index_hdat_fs_block_size,
 			seq_id, *seq_id));
 
-		if (phash_queue != NULL)
+		if (phash_queue != nullptr)
 		{
 			IFsFile* f = Server->openFile(index_hdat_file->getFilename(), MODE_RW_DELETE);
-			if (f != NULL)
+			if (f != nullptr)
 			{
 				CWData data;
 				data.addChar(ID_CBT_DATA);
@@ -7637,9 +9315,9 @@ void IndexThread::openCbtHdatFile(SCRef* ref, const std::string& sharename, cons
 	else
 	{
 		index_hdat_file.reset();
-		client_hash.reset(new ClientHash(NULL, false, 0, NULL, 0));
+		client_hash.reset(new ClientHash(nullptr, false, 0, nullptr, 0));
 
-		if (phash_queue != NULL)
+		if (phash_queue != nullptr)
 		{
 			CWData data;
 			data.addChar(ID_INIT_HASH);
@@ -7669,8 +9347,8 @@ void IndexThread::readSnapshotGroups()
 	image_snapshot_groups.clear();
 	file_snapshot_groups.clear();
 
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
-	if (curr_settings.get() != NULL)
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	if (curr_settings.get() != nullptr)
 	{
 		readSnapshotGroup(curr_settings.get(), "image_snapshot_groups", image_snapshot_groups);
 		readSnapshotGroup(curr_settings.get(), "file_snapshot_groups", file_snapshot_groups);
@@ -7723,6 +9401,9 @@ void IndexThread::readSnapshotGroup(ISettingsReader *curr_settings, const std::s
 				std::vector<std::string> groups_mem;
 				for (size_t i = 0; i < backup_dirs.size(); ++i)
 				{
+					if (backup_dirs[i].facet != index_facet_id)
+						continue;
+
 					if (backup_dirs[i].group == index_group)
 					{
 						std::string vol = backup_dirs[i].path;
@@ -7806,7 +9487,7 @@ std::vector<std::string> IndexThread::getSnapshotGroup(std::string volume, bool 
 std::string IndexThread::otherVolumeInfo(SCDirs * dir, bool onlyref)
 {
 	if (onlyref
-		|| dir->ref==NULL)
+		|| dir->ref==nullptr)
 	{
 		return std::string();
 	}
@@ -7840,8 +9521,8 @@ void IndexThread::postSnapshotProcessing(SCDirs* scd, bool full_backup)
 		std::sort(open_files.begin(), open_files.end());
 	}
 
-	if (scd!=NULL 
-		&& scd->ref != NULL)
+	if (scd!=nullptr 
+		&& scd->ref != nullptr)
 	{
 		for (size_t k = 0; k < sc_refs.size(); ++k)
 		{
@@ -7849,7 +9530,7 @@ void IndexThread::postSnapshotProcessing(SCDirs* scd, bool full_backup)
 			{
 				if (sc_refs[k]->cbt)
 				{
-					sc_refs[k]->cbt = finishCbt(sc_refs[k]->target, -1, sc_refs[k]->volpath, false);
+					sc_refs[k]->cbt = finishCbt(sc_refs[k]->target, -1, sc_refs[k]->volpath, false, sc_refs[k]->cbt_file, sc_refs[k]->cbt_type);
 				}
 
 				postSnapshotProcessing(sc_refs[k], full_backup);
@@ -7881,6 +9562,9 @@ void IndexThread::postSnapshotProcessing(SCRef * ref, bool full_backup)
 	std::vector<int> db_tgroup;
 	for (size_t i = 0; i < backup_dirs.size(); ++i)
 	{
+		if (backup_dirs[i].facet != index_facet_id)
+			continue;
+
 		std::string path = backup_dirs[i].path;
 #ifdef _WIN32
 		path = strlower(path);
@@ -7925,18 +9609,36 @@ void IndexThread::postSnapshotProcessing(SCRef * ref, bool full_backup)
 
 void IndexThread::initParallelHashing(const std::string & async_ticket)
 {
-	if (phash_queue != NULL
+	if (phash_queue != nullptr
 		&& phash_queue->deref())
 	{
 		delete phash_queue;
 	}
+
+	std::string settings_fn = "urbackup/data/settings.cfg";
+
+	if (!index_clientsubname.empty())
+	{
+		settings_fn = "urbackup/data/settings_" + conv_filename(index_clientsubname) + ".cfg";
+	}
+
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	size_t client_hash_threads = 1;
+	if (curr_settings.get() != nullptr)
+	{
+		client_hash_threads = curr_settings->getValue("client_hash_threads", 1);
+	}
+
+	if (client_hash_threads > 0)
+		--client_hash_threads;
+
 	std::string fn = "phash_" + bytesToHex(async_ticket);
 	phash_queue = new SQueueRef(Server->openTemporaryFile(), this, fn);
 	phash_queue->ref();
 	phash_queue_write_pos = 0;
 	os_create_dir(Server->getServerWorkingDir() + "urbackup" + os_file_sep() + "phash");
 	filesrv->shareDir("phash_{9c28ff72-5a74-487b-b5e1-8f1c96cd0cf4}", Server->getServerWorkingDir() + "/urbackup/phash", std::string(), true);
-	ParallelHash* phash = new ParallelHash(phash_queue->ref(), sha_version);
+	ParallelHash* phash = new ParallelHash(phash_queue->ref(), sha_version, client_hash_threads);
 	filesrv->registerScriptPipeFile(fn, phash);
 }
 
@@ -7950,8 +9652,8 @@ bool IndexThread::addToPhashQueue(CWData & data)
 
 bool IndexThread::commitPhashQueue()
 {
-	if (phash_queue == NULL
-		|| phash_queue->phash_queue==NULL)
+	if (phash_queue == nullptr
+		|| phash_queue->phash_queue==nullptr)
 		return true;
 
 	bool ret = phash_queue->phash_queue->Write(phash_queue_write_pos, phash_queue_buffer.data(), static_cast<_u32>(phash_queue_buffer.size())) == phash_queue_buffer.size();

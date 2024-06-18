@@ -11,8 +11,8 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2000-2016 The OpenLDAP Foundation.
- * Portions Copyright 2001-2017 Howard Chu, Symas Corp.
+ * Copyright 2000-2019 The OpenLDAP Foundation.
+ * Portions Copyright 2001-2018 Howard Chu, Symas Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -62,6 +62,7 @@ typedef MDB_ID *MDB_IDL;
 
 #define MDB_IDL_DB_MAX		(MDB_IDL_DB_SIZE-1)
 #define MDB_IDL_UM_MAX		(MDB_IDL_UM_SIZE-1)
+#define MDB_IDL_DIRTY_MAX	256 /*1MiB of memory*/
 
 #define MDB_IDL_SIZEOF(ids)		(((ids)[0]+1) * sizeof(MDB_ID))
 #define MDB_IDL_IS_ZERO(ids) ( (ids)[0] == 0 )

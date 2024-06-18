@@ -39,7 +39,12 @@ enum SStatusError
 	se_none,
 	se_ident_error,
 	se_authentication_error,
-	se_too_many_clients
+	se_too_many_clients,
+	se_uid_changed,
+	se_authenticating,
+	se_settings,
+	se_startup,
+	se_unknown
 };
 
 enum ERestore
@@ -58,7 +63,8 @@ struct SProcess
 		 hashqueuesize(0), starttime(0), pcdone(-1), eta_ms(0),
 		 eta_set_time(0), stop(false), details(details),
 		speed_bpms(0), can_stop(false), total_bytes(-1),
-		done_bytes(0), detail_pc(-1), paused(false)
+		done_bytes(0), detail_pc(-1), paused(false),
+		backupid(0)
 	{
 
 	}
@@ -75,12 +81,14 @@ struct SProcess
 	std::string details;
 	int detail_pc;
 	double speed_bpms;
+	int64 speed_set_time = 0;
 	std::deque<double> past_speed_bpms;
 	logid_t logid;
 	bool can_stop;
 	int64 total_bytes;
 	int64 done_bytes;
 	bool paused;
+	int backupid;
 
 	bool operator==(const SProcess& other) const
 	{
@@ -253,7 +261,7 @@ public:
 	void Exit(void) { do_exit=true; }
 
 private:
-	bool do_exit;
+	volatile bool do_exit;
 };
 
 class ScopedActiveThread

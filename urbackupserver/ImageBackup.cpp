@@ -1,6 +1,6 @@
 /*************************************************************************
 *    UrBackup - Client/Server backup system
-*    Copyright (C) 2011-2016 Martin Raiber
+*    Copyright (C) 2011-2021 Martin Raiber
 *
 *    This program is free software: you can redistribute it and/or modify
 *    it under the terms of the GNU Affero General Public License as published by
@@ -387,7 +387,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 			return false;
 		}
 
-		std::auto_ptr<IFsFile> mbr_file(Server->openFile(os_file_prefix(imagefn + ".mbr"), MODE_WRITE));
+		std::unique_ptr<IFsFile> mbr_file(Server->openFile(os_file_prefix(imagefn + ".mbr"), MODE_WRITE));
 
 		if (mbr_file.get() != NULL)
 		{
@@ -410,7 +410,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 
 			FileClient fc(false, client_main->getIdentity(), client_main->getProtocolVersions().filesrv_protocol_version,
 				client_main->isOnInternetConnection(), client_main);
-			_u32 rc = client_main->getClientFilesrvConnection(&fc, server_settings.get(), 10000);
+			_u32 rc = client_main->getClientFilesrvConnection(&fc, server_settings.get(), 60000);
 			if (rc != ERR_CONNECTED)
 			{
 				ServerLogger::Log(logid, "Error getting MBR zip data - CONNECT error", LL_ERROR);
@@ -546,7 +546,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 	}
 
 	CTCPStack tcpstack(client_main->isOnInternetConnection());
-	IPipe *cc=client_main->getClientCommandConnection(server_settings.get(), 10000);
+	IPipe *cc=client_main->getClientCommandConnection(server_settings.get(), 60000);
 	if(cc==NULL)
 	{
 		ServerLogger::Log(logid, "Connecting to \""+clientname+"\" for image backup failed", LL_ERROR);
@@ -591,7 +591,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 	}
 	else
 	{
-		std::auto_ptr<IFile> hashfile(Server->openFile(os_file_prefix(pParentvhd + ".hash")));
+		std::unique_ptr<IFile> hashfile(Server->openFile(os_file_prefix(pParentvhd + ".hash")));
 		if(hashfile.get()==NULL)
 		{
 			ServerLogger::Log(logid, "Error opening hashfile ("+ pParentvhd + ".hash). "+os_last_error_str(), LL_ERROR);
@@ -600,7 +600,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 			Server->destroy(cc);
 			return false;
 		}
-		std::auto_ptr<IFile> prevbitmap;
+		std::unique_ptr<IFile> prevbitmap;
 		std::string prevbitmap_str;
 		if (transfer_prev_cbitmap)
 		{
@@ -675,7 +675,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 	IVHDFile *r_vhdfile=NULL;
 	IFile *hashfile=NULL;
 	IFile *parenthashfile=NULL;
-	std::auto_ptr<IFile> bitmap_file;
+	std::unique_ptr<IFile> bitmap_file;
 	int64 blockcnt=0;
 	int64 numblocks=0;
 	int64 blocks=0;
@@ -763,6 +763,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 					if(ServerStatus::getProcess(clientname, status_id).stop)
 					{
 						ServerLogger::Log(logid, "Server admin stopped backup. (2)", LL_ERROR);
+						ServerStatus::setROnline(clientname, true);
 						goto do_image_cleanup;
 					}
 					ServerStatus::setROnline(clientname, false);
@@ -789,7 +790,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 					else
 					{
 						Server->Log(clientname +": Trying to reconnect in doImage", LL_DEBUG);
-						cc = client_main->getClientCommandConnection(server_settings.get(), 10000);
+						cc = client_main->getClientCommandConnection(server_settings.get(), 60000);
 						if (cc == NULL)
 						{
 							Server->wait(60000);
@@ -820,6 +821,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 				if(!reconnected)
 				{
 					ServerLogger::Log(logid, "Timeout while trying to reconnect", LL_ERROR);
+					ServerStatus::setROnline(clientname, true);
 					goto do_image_cleanup;
 				}
 
@@ -868,7 +870,7 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 						ts += "&clientsubname=" + EscapeParamString(clientsubname);
 					}
 					ts += "&zero_skipped=1";
-					std::auto_ptr<IFile> prevbitmap;
+					std::unique_ptr<IFile> prevbitmap;
 					if (transfer_prev_cbitmap)
 					{
 						prevbitmap.reset(Server->openFile(os_file_prefix(pParentvhd + ".cbitmap")));
@@ -1051,21 +1053,39 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 					{
 						image_format = IFSImageFactory::ImageFormat_RawCowFile;
 					}
+					else if (image_file_format == image_file_format_vhdx)
+					{
+						image_format = IFSImageFactory::ImageFormat_VHDX;
+					}
+					else if (image_file_format == image_file_format_vhdxz)
+					{
+						image_format = IFSImageFactory::ImageFormat_CompressedVHDX;
+					}
 					else //default
 					{
 						image_format = IFSImageFactory::ImageFormat_CompressedVHD;
+					}
+
+					if ((image_format == IFSImageFactory::ImageFormat_VHDX ||
+						image_format == IFSImageFactory::ImageFormat_CompressedVHDX) &&
+						drivesize + mbr_size > 64LL * 1024 * 1024 * 1024 * 1024)
+					{
+						ServerLogger::Log(logid, "Volume is too large for VHDX files with " + PrettyPrintBytes(drivesize + mbr_size) +
+							". VHDX files have a maximum size of 64TiB. Please use another image file format.", LL_ERROR);
+						goto do_image_cleanup;
 					}
 
 					if(!has_parent)
 					{
 						r_vhdfile=image_fak->createVHDFile(os_file_prefix(imagefn), false, drivesize+mbr_size,
 							(unsigned int)vhd_blocksize*blocksize, true,
-							image_format);
+							image_format, server_settings->getSettings()->image_compress_threads);
 					}
 					else
 					{
 						r_vhdfile=image_fak->createVHDFile(os_file_prefix(imagefn), pParentvhd, false,
-							true, image_format, drivesize + mbr_size);
+							true, image_format, drivesize + mbr_size,
+							server_settings->getSettings()->image_compress_threads);
 					}
 
 					if(r_vhdfile==NULL || !r_vhdfile->isOpen())
@@ -1156,7 +1176,8 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 						}
 
 						if (vhd_size>0 && vhd_size >= 2040LL * 1024 * 1024 * 1024
-							&& image_file_format != image_file_format_cowraw)
+							&& (image_file_format == image_file_format_vhd
+								|| image_file_format == image_file_format_vhdz) )
 						{
 							ServerLogger::Log(logid, "Data on volume is too large for VHD files with " + PrettyPrintBytes(vhd_size) +
 								". VHD files have a maximum size of 2040GB. Please use another image file format.", LL_ERROR);
@@ -1548,15 +1569,18 @@ bool ImageBackup::doImage(const std::string &pLetter, const std::string &pParent
 								int64 image_size = t_file->RealSize();
 								Server->destroy(t_file);
 
-								std::auto_ptr<IFile> sync_f;
+								std::unique_ptr<IFile> sync_f;
 								if (!vhdfile_err)
 								{
 									if (!os_sync(imagefn))
 									{
-										ServerLogger::Log(logid, "Syncing file system failed. Image backup is not completely on disk. " + os_last_error_str(), LL_ERROR);
-										vhdfile_err = true;
+										ServerLogger::Log(logid, "Syncing file system failed. Image backup may not be completely on disk. " + os_last_error_str(), BackupServer::canSyncFs() ? LL_ERROR : LL_DEBUG);
+
+										if(BackupServer::canSyncFs())
+											vhdfile_err = true;
 									}
-									else
+
+									if(!vhdfile_err)
 									{
 										sync_f.reset(Server->openFile(os_file_prefix(imagefn + ".sync"), MODE_WRITE));
 
@@ -2101,6 +2125,14 @@ std::string ImageBackup::constructImagePath(const std::string &letter, std::stri
 	{
 		imgpath+=".vhd";
 	}
+	else if (image_file_format == image_file_format_vhdx)
+	{
+		imgpath += ".vhdx";
+	}
+	else if (image_file_format == image_file_format_vhdxz)
+	{
+		imgpath += ".vhdxz";
+	}
 	else if(image_file_format==image_file_format_cowraw)
 	{
 		imgpath+=".raw";
@@ -2114,7 +2146,7 @@ std::string ImageBackup::constructImagePath(const std::string &letter, std::stri
 		{
 			if (BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs)
 			{
-				std::auto_ptr<IFile> touch_f(Server->openFile(image_folder, MODE_WRITE));
+				std::unique_ptr<IFile> touch_f(Server->openFile(image_folder, MODE_WRITE));
 				if (touch_f.get()==NULL)
 				{
 					ServerLogger::Log(logid, "Could not touch file " + image_folder + ". " + os_last_error_str(), LL_ERROR);
@@ -2199,7 +2231,7 @@ std::string ImageBackup::constructImagePath(const std::string &letter, std::stri
 		{
 			if (BackupServer::getSnapshotMethod(true) == BackupServer::ESnapshotMethod_Zfs)
 			{
-				std::auto_ptr<IFile> touch_f(Server->openFile(image_folder, MODE_WRITE));
+				std::unique_ptr<IFile> touch_f(Server->openFile(image_folder, MODE_WRITE));
 				if (touch_f.get() == NULL)
 				{
 					ServerLogger::Log(logid, "Could not touch file " + image_folder + ". " + os_last_error_str(), LL_ERROR);

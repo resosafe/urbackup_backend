@@ -26,15 +26,17 @@
 #include "CUDPThread.h"
 #include "PipeSessions.h"
 #include "PipeFileExt.h"
+#include "FileMetadataPipe.h"
 
-IMutex *FileServ::mutex=NULL;
-std::vector<std::string> FileServ::identities;
+IMutex *FileServ::mutex=nullptr;
+std::vector<FileServ::SIdentity> FileServ::identities;
 bool FileServ::pause=false;
 std::map<std::string, FileServ::SScriptMapping> FileServ::script_mappings;
-IFileServ::ITokenCallbackFactory* FileServ::token_callback_factory = NULL;
+IFileServ::ITokenCallbackFactory* FileServ::token_callback_factory = nullptr;
 std::map<std::string, std::string> FileServ::fn_redirects;
-std::map<std::string, size_t> FileServ::active_shares;
-FileServ::IReadErrorCallback* FileServ::read_error_callback = NULL;
+std::map<std::pair<std::string, size_t>, size_t> FileServ::active_shares;
+size_t FileServ::active_generation = 0;
+FileServ::IReadErrorCallback* FileServ::read_error_callback = nullptr;
 std::vector<std::string> FileServ::read_error_files;
 std::map<std::pair<std::string, std::string>, IFileServ::CbtHashFileInfo> FileServ::cbt_hash_files;
 
@@ -83,16 +85,17 @@ void FileServ::stopServer(void)
 std::string FileServ::getShareDir(const std::string &name, const std::string& identity)
 {
 	bool allow_exec;
-	return map_file(name, identity, allow_exec, NULL);
+	return map_file(name, identity, allow_exec, nullptr);
 }
 
-void FileServ::addIdentity(const std::string &pIdentity)
+void FileServ::addIdentity(const std::string &pIdentity, bool only_tunneled)
 {
+	SIdentity identity(pIdentity, only_tunneled);
 	IScopedLock lock(mutex);
-	if(std::find(identities.begin(), identities.end(), pIdentity)
+	if(std::find(identities.begin(), identities.end(), identity)
 		== identities.end())
 	{
-		identities.push_back(pIdentity);
+		identities.push_back(identity);
 	}
 }
 
@@ -106,12 +109,13 @@ void FileServ::destroy_mutex(void)
 	Server->destroy(mutex);
 }
 
-bool FileServ::checkIdentity(const std::string &pIdentity)
+bool FileServ::checkIdentity(const std::string &pIdentity, bool tunneled)
 {
 	IScopedLock lock(mutex);
 	for(size_t i=0;i<identities.size();++i)
 	{
-		if(identities[i]==pIdentity)
+		if(identities[i].identity==pIdentity
+			&& (!identities[i].tunneled || tunneled) )
 		{
 			return true;
 		}
@@ -141,14 +145,15 @@ std::string FileServ::getServerName(void)
 
 void FileServ::runClient(IPipe *cp, std::vector<char>* extra_buffer)
 {
-	CClientThread cc(cp, NULL, extra_buffer);
+	CClientThread cc(cp, nullptr, extra_buffer);
 	cc();
 }
 
 bool FileServ::removeIdentity( const std::string &pIdentity )
 {
+	SIdentity identity(pIdentity, false);
 	IScopedLock lock(mutex);
-	std::vector<std::string>::iterator it = std::find(identities.begin(), identities.end(), pIdentity);
+	std::vector<SIdentity>::iterator it = std::find(identities.begin(), identities.end(), identity);
 	if(it!=identities.end())
 	{
 		identities.erase(it);
@@ -169,7 +174,7 @@ bool FileServ::getExitInformation(const std::string& cmd, std::string& stderr_da
 		std::string server_ident = getbetween("|", "|", cmd);
 		pcmd = getafter("urbackup/TAR|" + server_ident + "|", cmd);
 
-		std::string map_res = map_file(pcmd, std::string(), allow_exec, NULL);
+		std::string map_res = map_file(pcmd, std::string(), allow_exec, nullptr);
 		if (map_res.empty())
 		{
 			return false;
@@ -177,7 +182,7 @@ bool FileServ::getExitInformation(const std::string& cmd, std::string& stderr_da
 	}
 	else
 	{
-		pcmd = map_file(cmd, std::string(), allow_exec, NULL);
+		pcmd = map_file(cmd, std::string(), allow_exec, nullptr);
 	}
 
 	if (!allow_exec)
@@ -204,7 +209,7 @@ void FileServ::addScriptOutputFilenameMapping(const std::string& script_output_f
 {
 	IScopedLock lock(mutex);
 
-	script_mappings[script_output_fn] = SScriptMapping(script_fn, tar_file, NULL);
+	script_mappings[script_output_fn] = SScriptMapping(script_fn, tar_file, nullptr);
 }
 
 std::string FileServ::mapScriptOutputNameToScript(const std::string& script_fn, bool& tar_file, IPipeFile*& pipe_file)
@@ -217,7 +222,7 @@ std::string FileServ::mapScriptOutputNameToScript(const std::string& script_fn, 
 		tar_file = it->second.tar_file;
 		pipe_file = it->second.pipe_file;
 		std::string script_fn = it->second.script_fn;
-		if (pipe_file != NULL)
+		if (pipe_file != nullptr)
 		{
 			script_mappings.erase(it);
 		}
@@ -226,7 +231,7 @@ std::string FileServ::mapScriptOutputNameToScript(const std::string& script_fn, 
 	else
 	{
 		tar_file = false;
-		pipe_file = NULL;
+		pipe_file = nullptr;
 		return script_fn;
 	}
 }
@@ -252,15 +257,15 @@ IFileServ::ITokenCallback* FileServ::newTokenCallback()
 {
 	IScopedLock lock(mutex);
 
-	if(token_callback_factory==NULL)
+	if(token_callback_factory==nullptr)
 	{
-		return NULL;
+		return nullptr;
 	}
 
 	return token_callback_factory->getTokenCallback();
 }
 
-void FileServ::incrShareActive(std::string sharename)
+size_t FileServ::incrShareActive(std::string sharename)
 {
 	if (sharename.find("/") != std::string::npos)
 	{
@@ -268,10 +273,11 @@ void FileServ::incrShareActive(std::string sharename)
 	}
 
 	IScopedLock lock(mutex);
-	++active_shares[sharename];
+	++active_shares[std::make_pair(sharename, active_generation)];
+	return active_generation;
 }
 
-void FileServ::decrShareActive(std::string sharename)
+void FileServ::decrShareActive(std::string sharename, size_t gen)
 {
 	if (sharename.find("/") != std::string::npos)
 	{
@@ -280,7 +286,7 @@ void FileServ::decrShareActive(std::string sharename)
 
 	IScopedLock lock(mutex);
 
-	std::map<std::string, size_t>::iterator it = active_shares.find(sharename);
+	std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.find(std::make_pair(sharename, gen));
 
 	if (it != active_shares.end())
 	{
@@ -301,9 +307,38 @@ bool FileServ::hasActiveTransfers(const std::string& sharename, const std::strin
 
 	IScopedLock lock(mutex);
 
-	std::map<std::string, size_t>::iterator it = active_shares.find(server_token + "|" + sharename);
+	for (std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.begin();
+		it != active_shares.end();++it)
+	{
+		if (it->first.first == server_token + "|" + sharename)
+		{
+			return true;
+		}
+	}
 
-	return it != active_shares.end();
+	return false;
+}
+
+bool FileServ::hasActiveTransfersGen(const std::string& sharename, const std::string& server_token, size_t gen)
+{
+	if (PipeSessions::isShareActiveGen(sharename, server_token, gen))
+	{
+		return true;
+	}
+
+	IScopedLock lock(mutex);
+
+	for (std::map<std::pair<std::string, size_t>, size_t>::iterator it = active_shares.begin();
+		it != active_shares.end(); ++it)
+	{
+		if (it->first.first == server_token + "|" + sharename &&
+			it->first.second<=gen)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 bool FileServ::registerFnRedirect(const std::string & source_fn, const std::string & target_fn)
@@ -343,7 +378,7 @@ void FileServ::callErrorCallback(std::string sharename, const std::string & file
 		sharename = getuntil("/", sharename);
 	}
 
-	if (read_error_callback != NULL)
+	if (read_error_callback != nullptr)
 	{
 		read_error_callback->onReadError(sharename, filepath, pos, msg);
 	}
@@ -415,6 +450,18 @@ void FileServ::deregisterScriptPipeFile(const std::string & script_fn)
 	std::map<std::string, SScriptMapping>::iterator it = script_mappings.find(script_fn);
 	if (it != script_mappings.end())
 	{
+		delete it->second.pipe_file;
 		script_mappings.erase(it);
 	}
+}
+
+IFileMetadataPipe* FileServ::getFileMetadataPipe()
+{
+	return new FileMetadataPipe;
+}
+
+size_t FileServ::incrActiveGeneration()
+{
+	IScopedLock lock(mutex);
+	return active_generation++;
 }

@@ -58,6 +58,7 @@ bool BackupServer::can_mount_images = false;
 bool BackupServer::can_reflink = false;
 bool BackupServer::can_hardlink = false;
 IMutex* BackupServer::fs_test_mutex = NULL;
+bool BackupServer::can_syncfs = true;
 
 extern IFSImageFactory *image_fak;
 
@@ -479,6 +480,15 @@ void BackupServer::startClients(FileClient &fc)
 				if( (it->second.changecount>5 && none_fits)
 					|| found_lan)
 				{
+					Server->Log("New client address for "+ curr_info.name+": " + curr_info.addr.toString()+" old address: "+it->second.addr.toString(), LL_INFO);
+					for (size_t j = 0; j < client_info.size(); ++j)
+					{
+						if (client_info[j].name == curr_info.name)
+						{
+							Server->Log("Available address (" + curr_info.name + "): " + client_info[j].addr.toString(), LL_INFO);
+						}
+					}
+
 					it->second.addr=curr_info.addr;
 					it->second.internet_connection=curr_info.internetclient;
 					std::string msg;
@@ -488,14 +498,16 @@ void BackupServer::startClients(FileClient &fc)
 					msg[7+sizeof(FileClient::SAddrHint)]=(curr_info.internetclient?1:0);
 					it->second.pipe->Write(msg);
 
-					Server->Log("New client address: "+it->second.addr.toString(), LL_INFO);
-
 					if(it->second.addr.is_ipv6)
 						ServerStatus::setIPv6(curr_info.name, it->second.addr.addr_ipv6);
 					else
 						ServerStatus::setIP(curr_info.name, it->second.addr.addr_ipv4);
 
 					it->second.offlinecount=0;
+				}
+				else if (!none_fits)
+				{
+					it->second.changecount = 0;
 				}
 			}
 		}
@@ -920,6 +932,34 @@ void BackupServer::testFilesystemLinkAvailability(IDatabase * db)
 	testFilesystemLinkAvailability(db, true);
 }
 
+void BackupServer::testFilesystemSyncFs(IDatabase * db)
+{
+	ServerSettings settings(db);
+
+	std::string backupfolder = settings.getSettings()->backupfolder;
+
+	std::string testfolder = backupfolder + os_file_sep() + "05b89714-7c4d-40fb-a908-e45f326c0624";
+
+	if (!os_directory_exists(testfolder)
+		&& !os_create_dir(testfolder))
+	{
+		Server->Log("Could not create folder at " + testfolder + ". " + os_last_error_str(), LL_DEBUG);
+		return;
+	}
+
+	if (!os_sync(testfolder))
+	{
+		Server->Log("Syncing " + testfolder + " failed. This may cause problems with backup consistency on disk. " + os_last_error_str(), LL_WARNING);
+		can_syncfs = false;
+	}
+	else
+	{
+		can_syncfs = true;
+	}
+
+	os_remove_dir(testfolder);
+}
+
 void BackupServer::testFilesystem(IDatabase * db)
 {
 	IScopedLock lock(fs_test_mutex);
@@ -927,6 +967,7 @@ void BackupServer::testFilesystem(IDatabase * db)
 	testSnapshotAvailability(db);
 	testFilesystemTransactionAvailabiliy(db);
 	testFilesystemLinkAvailability(db);
+	testFilesystemSyncFs(db);
 }
 
 namespace
@@ -964,6 +1005,11 @@ bool BackupServer::canReflink()
 bool BackupServer::canHardlink()
 {
 	return can_hardlink;
+}
+
+bool BackupServer::canSyncFs()
+{
+	return can_syncfs;
 }
 
 void BackupServer::updateDeletePending()
@@ -1121,7 +1167,7 @@ void BackupServer::runServerRecovery(IDatabase * db)
 		db_single_result res;
 		while (cur.next(res))
 		{
-			std::auto_ptr<IFile> f(Server->openFile(os_file_prefix(res["path"])));
+			std::unique_ptr<IFile> f(Server->openFile(os_file_prefix(res["path"])));
 			if (f.get()!=NULL)
 			{
 				delete_missing = true;
@@ -1188,7 +1234,7 @@ void BackupServer::runServerRecovery(IDatabase * db)
 			}
 			else
 			{
-				std::auto_ptr<IFile> sync_f(Server->openFile(os_file_prefix(backuppath + os_file_sep() + ".hashes" + os_file_sep() + sync_fn), MODE_READ));
+				std::unique_ptr<IFile> sync_f(Server->openFile(os_file_prefix(backuppath + os_file_sep() + ".hashes" + os_file_sep() + sync_fn), MODE_READ));
 
 				if (sync_f.get() == NULL)
 				{
@@ -1213,7 +1259,7 @@ void BackupServer::runServerRecovery(IDatabase * db)
 	}
 
 	IQuery* q_set_done = db->Prepare("UPDATE backups SET done=0, complete=0 WHERE id=?");
-	std::auto_ptr<FileCleanups> file_cleanups(new FileCleanups);
+	std::unique_ptr<FileCleanups> file_cleanups(new FileCleanups);
 	for (size_t i = 0; i < to_delete.size(); ++i)
 	{
 		has_delete = true;
@@ -1264,7 +1310,7 @@ void BackupServer::runServerRecovery(IDatabase * db)
 			std::string path = res["path"];
 			std::string backupinfo = "[id=" + res["backupid"] + ", path=" + path + ", backuptime=" + res["backuptime"] + ", clientid=" + res["clientid"] + ", client=" + res["name"] + "]";
 
-			std::auto_ptr<IFile> image_f(Server->openFile(os_file_prefix(path), MODE_READ));
+			std::unique_ptr<IFile> image_f(Server->openFile(os_file_prefix(path), MODE_READ));
 
 			if (image_f.get() == NULL)
 			{
@@ -1300,7 +1346,7 @@ void BackupServer::runServerRecovery(IDatabase * db)
 			}
 			else
 			{
-				std::auto_ptr<IFile> sync_f(Server->openFile(os_file_prefix(res["path"] + ".sync"), MODE_READ));
+				std::unique_ptr<IFile> sync_f(Server->openFile(os_file_prefix(res["path"] + ".sync"), MODE_READ));
 
 				if (sync_f.get() == NULL)
 				{

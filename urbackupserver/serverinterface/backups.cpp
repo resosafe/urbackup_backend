@@ -384,7 +384,7 @@ namespace backupaccess
 			return STokens();
 		}
 
-		std::auto_ptr<ISettingsReader> backup_tokens(Server->createFileSettingsReader(backupfolder+os_file_sep()+clientname+os_file_sep()+path+os_file_sep()+".hashes"+os_file_sep()+".urbackup_tokens.properties"));
+		std::unique_ptr<ISettingsReader> backup_tokens(Server->createFileSettingsReader(backupfolder+os_file_sep()+clientname+os_file_sep()+path+os_file_sep()+".hashes"+os_file_sep()+".urbackup_tokens.properties"));
 
 		if(!backup_tokens.get())
 		{
@@ -452,7 +452,8 @@ namespace backupaccess
 			last_filebackup = watoi(res_last[0]["id"]);
 		}
 
-		IQuery *q=db->Prepare("SELECT id, strftime('"+helper.getTimeFormatString()+"', backuptime) AS t_backuptime, incremental, size_bytes, archived, archive_timeout, path, delete_pending FROM backups WHERE complete=1 AND done=1 AND clientid=? ORDER BY backuptime DESC");
+		IQuery *q=db->Prepare("SELECT id, strftime('"+helper.getTimeFormatString()+"', backuptime) AS t_backuptime, incremental, size_bytes, "
+			"archived, archive_timeout, path, delete_pending, deletion_protected, delete_client_pending FROM backups WHERE complete=1 AND done=1 AND clientid=? ORDER BY backuptime DESC");
 		q->Bind(t_clientid);
 		db_results res=q->Read();
 		JSON::Array backups;
@@ -479,6 +480,8 @@ namespace backupaccess
 			obj.set("backuptime", watoi64(res[i]["t_backuptime"]));
 			obj.set("incremental", watoi(res[i]["incremental"]));
             obj.set("size_bytes", watoi64(res[i]["size_bytes"]));
+			obj.set("deletion_protected", watoi(res[i]["deletion_protected"]));
+			obj.set("delete_client_pending", watoi(res[i]["delete_client_pending"]));
             int archived = watoi(res[i]["archived"]);
             obj.set("archived", watoi(res[i]["archived"]));
 			if (res[i]["delete_pending"] == "1")
@@ -829,7 +832,7 @@ namespace backupaccess
 				}
 				else
 				{
-					std::auto_ptr<IFile> f;
+					std::unique_ptr<IFile> f;
 
 					if(path_info.is_file)
 					{
@@ -960,7 +963,7 @@ namespace backupaccess
 			std::string extension = findextension(filename);
 
 			bool disk_image = false;
-			std::auto_ptr<IFile> mbrfile(Server->openFile(os_file_prefix(path + ".mbr"), MODE_READ));
+			std::unique_ptr<IFile> mbrfile(Server->openFile(os_file_prefix(path + ".mbr"), MODE_READ));
 			if (mbrfile.get() && mbrfile->Size()<10*1024*1024)
 			{
 				std::string mbrdata_header = mbrfile->Read(0LL, 2);
@@ -984,6 +987,10 @@ namespace backupaccess
 							ret.set("volume_name", mbr.volume_name);
 							ret.set("fs_type", mbr.fsn);
 							ret.set("serial_number", mbr.serial_number);
+							if (mbr.volume_name.find("LINUX:") == 0)
+							{
+								ret.set("linux_image_restore", true);
+							}
 						}
 					}
 				}
@@ -993,7 +1000,7 @@ namespace backupaccess
 				}
 			}
 
-			std::auto_ptr<IVHDFile> vhdfile;
+			std::unique_ptr<IVHDFile> vhdfile;
 			if (extension == "vhd"
 				|| extension == "vhdz")
 			{
@@ -1204,6 +1211,15 @@ namespace
 		return result;
 	}
 
+	bool removeFileBackup(IDatabase* db, int clientid, int backupid)
+	{
+		ServerSettings settings(db);
+		bool result = false;
+		Server->getThreadPool()->executeWait(new ServerCleanupThread(CleanupAction(settings.getSettings()->backupfolder, 
+			clientid, backupid, false, &result)));
+		return result;
+	}
+
 	std::string deleteOrMarkImageBackup(IDatabase* db, int backupid, int clientid, bool mark_only)
 	{
 		ServerCleanupDao cleanup_dao(db);
@@ -1296,6 +1312,70 @@ namespace
 		return std::string();
 	}
 
+	std::string deleteOrMarkFileBackup(IDatabase* db, int backupid, int clientid, bool mark_only)
+	{
+		ServerCleanupDao cleanup_dao(db);
+		if (cleanup_dao.getFileBackupClientId(backupid).value != clientid)
+		{
+			return "wrong_clientid";
+		}
+
+		if (ServerCleanupThread::findArchivedFileBackupRef(&cleanup_dao, backupid))
+		{
+			return "archived_ref";
+		}
+
+		if (!mark_only)
+		{
+
+			if (ServerCleanupThread::findIncompleteFileBackupRef(&cleanup_dao, backupid))
+			{
+				return "incomplete_ref";
+			}
+		}
+
+		IQuery* q = db->Prepare("UPDATE backup_images SET delete_pending=1 WHERE id=? AND clientid=?");
+
+		std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanup_dao.getFileBackupRefs(backupid);
+		for (size_t i = 0; i < refs.size(); ++i)
+		{
+			std::vector<ServerCleanupDao::SFileBackupRef> new_refs = cleanup_dao.getFileBackupRefs(refs[i].id);
+			refs.insert(refs.end(), new_refs.begin(), new_refs.end());
+
+			if (mark_only)
+			{
+				q->Bind(refs[i].id);
+				q->Bind(clientid);
+				q->Write();
+				q->Reset();
+			}
+			else
+			{
+				if (!removeFileBackup(db, clientid, refs[i].id))
+				{
+					return "remove_image_failed";
+				}
+			}
+		}
+
+		if (mark_only)
+		{
+			q->Bind(backupid);
+			q->Bind(clientid);
+			q->Write();
+			q->Reset();
+		}
+		else
+		{
+			if (!removeFileBackup(db, clientid, backupid))
+			{
+				return "remove_image_failed";
+			}
+		}
+
+		return std::string();
+	}
+
 	void unmarkImageBackup(IDatabase* db, int backupid, int clientid)
 	{
 		ServerCleanupDao cleanup_dao(db);
@@ -1328,6 +1408,34 @@ namespace
 		for (size_t i = 0; i < refs.size(); ++i)
 		{
 			std::vector<ServerCleanupDao::SImageRef> new_refs = cleanup_dao.getImageRefsReverse(refs[i].id);
+			refs.insert(refs.end(), new_refs.begin(), new_refs.end());
+
+			q->Bind(refs[i].id);
+			q->Bind(clientid);
+			q->Write();
+			q->Reset();
+		}
+
+		q->Bind(backupid);
+		q->Bind(clientid);
+		q->Write();
+		q->Reset();
+	}
+
+	void unmarkFileBackup(IDatabase* db, int backupid, int clientid)
+	{
+		ServerCleanupDao cleanup_dao(db);
+		if (cleanup_dao.getFileBackupClientId(backupid).value != clientid)
+		{
+			return;
+		}
+
+		IQuery* q = db->Prepare("UPDATE backups SET delete_pending=0 WHERE id=? AND clientid=?");
+
+		std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanup_dao.getFileBackupRefsReverse(backupid);
+		for (size_t i = 0; i < refs.size(); ++i)
+		{
+			std::vector<ServerCleanupDao::SFileBackupRef> new_refs = cleanup_dao.getFileBackupRefsReverse(refs[i].id);
 			refs.insert(refs.end(), new_refs.begin(), new_refs.end());
 
 			q->Bind(refs[i].id);
@@ -1576,11 +1684,11 @@ ACTION_IMPL(backups)
 						}
 						else
 						{
-							IQuery *q = db->Prepare("UPDATE backups SET delete_pending=1 WHERE id=? AND clientid=?");
-							q->Bind(delete_id);
-							q->Bind(t_clientid);
-							q->Write();
-							q->Reset();
+							std::string err = deleteOrMarkFileBackup(db, delete_id, t_clientid, true);
+							if (!err.empty())
+							{
+								ret.set("delete_err", err);
+							}
 						}
 					}
 					if (CURRP.find("stop_delete") != CURRP.end())
@@ -1593,10 +1701,7 @@ ACTION_IMPL(backups)
 						}
 						else
 						{
-							IQuery *q = db->Prepare("UPDATE backups SET delete_pending=0 WHERE id=? AND clientid=?");
-							q->Bind(stop_delete_id);
-							q->Bind(t_clientid);
-							q->Write();
+							unmarkFileBackup(db, stop_delete_id, t_clientid);
 						}
 					}
 					if (CURRP.find("delete_now") != CURRP.end())
@@ -1613,12 +1718,10 @@ ACTION_IMPL(backups)
 						}
 						else
 						{
-							ServerSettings settings(db);
-							bool result = false;
-							Server->getThreadPool()->executeWait(new ServerCleanupThread(CleanupAction(settings.getSettings()->backupfolder, t_clientid, delete_now_id, false, &result)));
-							if (!result)
+							std::string err = deleteOrMarkFileBackup(db, delete_now_id, t_clientid, false);
+							if (!err.empty())
 							{
-								ret.set("delete_now_err", "delete_file_backup_failed");
+								ret.set("delete_now_err", err);
 							}
 						}
 					}
@@ -1732,7 +1835,31 @@ ACTION_IMPL(backups)
 						{
 							bool has_mount_timeout;
 							std::string mount_errmsg;
-							backuppath = ImageMount::get_mount_path(-1*backupid, t_clientid, 0, true, mounted_image, -1, has_mount_timeout, mount_errmsg);
+							int partition = 0;
+							std::string path;
+							std::vector<IFSImageFactory::SPartition> partitions;
+							backupaccess::get_image_info(db, -1*backupid, t_clientid,
+								0, path, partitions);
+
+							if (partitions.size() > 1)
+							{
+								while (!u_path.empty()
+									&& u_path[0] == '/')
+								{
+									u_path.erase(0, 1);
+								}
+								if (next(u_path, 0, "partition "))
+								{
+									std::string part = getbetween("partition ", "/", u_path);
+									if (part.empty())
+									{
+										part = getafter("partition ", u_path);
+									}
+									partition = watoi(part) - 1;
+									u_path = u_path.substr(10 + part.size());
+								}
+							}
+							backuppath = ImageMount::get_mount_path(-1*backupid, t_clientid, partition, true, mounted_image, -1, has_mount_timeout, mount_errmsg);
 							path_info = backupaccess::get_image_path_info(u_path, clientname, backupfolder, backupid, backuppath);
 						}
 
@@ -1790,7 +1917,7 @@ ACTION_IMPL(backups)
 							if(!create_clientdl_thread(clientname, t_clientid, t_clientid, path_info.full_path, path_info.full_metadata_path, CURRP["filter"],
 								path_info.rel_path.empty(), path_info.rel_path, restore_id, status_id, log_id, std::string(),
 								std::vector< std::pair<std::string, std::string> >(), true, true, greplace(os_file_sep(), "/", path_info.rel_path), true,
-								restore_flags, ticket, tokens, path_info.backup_tokens))
+								restore_flags, ticket, tokens, path_info.backup_tokens, false))
 							{
 								ret.set("err", "internal_error");
                                 helper.Write(ret.stringify(false));

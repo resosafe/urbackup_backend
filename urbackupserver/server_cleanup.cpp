@@ -42,6 +42,10 @@
 #include <algorithm>
 #include "create_files_index.h"
 #include "../urbackupcommon/WalCheckpointThread.h"
+#include "../clouddrive/ObjectCollector.h"
+#include "../clouddrive/IKvStoreFrontend.h"
+#include "../clouddrive/IClouddriveFactory.h"
+#include "../urbackupcommon/backup_url_parser.h"
 #include "copy_storage.h"
 #include <assert.h>
 #include <set>
@@ -61,6 +65,8 @@ void cleanupLastActs();
 
 const unsigned int min_cleanup_interval=12*60*60;
 
+extern IClouddriveFactory* clouddrive_fak;
+
 void ServerCleanupThread::initMutex(void)
 {
 	mutex=Server->createMutex();
@@ -78,7 +84,7 @@ void ServerCleanupThread::destroyMutex(void)
 }
 
 ServerCleanupThread::ServerCleanupThread(CleanupAction cleanup_action)
-	: cleanup_action(cleanup_action), cleanupdao(NULL), backupdao(NULL)
+	: cleanup_action(cleanup_action)
 {
 	logid = ServerLogger::getLogId(LOG_CATEGORY_CLEANUP);
 }
@@ -102,7 +108,8 @@ void ServerCleanupThread::operator()(void)
 		{
 		case ECleanupAction_DeleteFilebackup:
 		{
-			bool b = deleteFileBackup(cleanup_action.backupfolder, cleanup_action.clientid, cleanup_action.backupid, cleanup_action.force_remove);
+			bool b = deleteFileBackup(cleanup_action.backupfolder, cleanup_action.clientid, cleanup_action.backupid, cleanup_action.force_remove,
+				true);
 			if (cleanup_action.result != NULL)
 			{
 				*cleanup_action.result = b;
@@ -814,7 +821,8 @@ bool ServerCleanupThread::deleteImage(logid_t logid, std::string clientname, std
 {
 	std::string image_extension = findextension(path);
 
-	if (image_extension != "raw")
+	if (image_extension != "raw"
+		|| !BackupServer::isImageSnapshotsEnabled())
 	{
 		bool b = true;
 		if (!deleteAndTruncateFile(logid, path))
@@ -834,6 +842,7 @@ bool ServerCleanupThread::deleteImage(logid_t logid, std::string clientname, std
 		}
 		deleteAndTruncateFile(logid, path + ".cbitmap");
 		deleteAndTruncateFile(logid, path + ".sync");
+		deleteAndTruncateFile(logid, path + ".bitmap");
 
 		if (b && ExtractFileName(ExtractFilePath(path)) != clientname)
 		{
@@ -875,13 +884,33 @@ int ServerCleanupThread::max_removable_incr_images(ServerSettings& settings, int
 	return max_allowed_del_refs;
 }
 
-bool ServerCleanupThread::cleanup_images_client(int clientid, int64 minspace, std::vector<int> &imageids, bool cleanup_only_one)
+int ServerCleanupThread::max_removable_incr_file_backups(ServerSettings& settings, int backupid, int del_in_stack)
+{
+	int incr_file_num = cleanupdao->getIncrNumFileBackupsForBackup(backupid);
+	incr_file_num -= del_in_stack;
+	if (incr_file_num < 0)
+		incr_file_num = 0;
+	int min_incr_file_num = static_cast<int>(settings.getSettings()->min_file_incr);
+
+	int max_allowed_del_refs = 0;
+
+	if (min_incr_file_num < incr_file_num)
+	{
+		max_allowed_del_refs = incr_file_num - min_incr_file_num;
+	}
+
+	return max_allowed_del_refs;
+}
+
+bool ServerCleanupThread::cleanup_one_imagebackup_client(int clientid, int64 minspace, int& imagebid)
 {
 	ServerSettings settings(db, clientid);
 
+	std::string val_info = "max_image_full";
 	int max_image_full=settings.getSettings()->max_image_full;
 	if(minspace!=-1)
 	{
+		val_info = "min_image_full";
 		max_image_full=settings.getSettings()->min_image_full;
 	}
 
@@ -889,7 +918,7 @@ bool ServerCleanupThread::cleanup_images_client(int clientid, int64 minspace, st
 
 	int backupid;
 	int full_image_num=(int)getImagesFullNum(clientid, backupid, notit);
-	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(full_image_num)+" full image backups max="+convert(max_image_full), LL_DEBUG);
+	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(full_image_num)+" full image backups "+ val_info +"="+convert(max_image_full), LL_DEBUG);
 	while(full_image_num>max_image_full
 		&& full_image_num>0)
 	{
@@ -928,30 +957,26 @@ bool ServerCleanupThread::cleanup_images_client(int clientid, int64 minspace, st
 			}
 			else
 			{
-				imageids.push_back(backupid);
-
-				if (cleanup_only_one)
-				{
-					return true;
-				}
+				imagebid = backupid;
+				return true;
 			}
 		}
-
-		int r=hasEnoughFreeSpace(minspace, &settings);
-		if( r==-1 || r==1 )
-			return true;
 				
 		full_image_num=(int)getImagesFullNum(clientid, backupid, notit);
 	}
 
 	notit.clear();
 
+	val_info = "max_image_incr";
 	int max_image_incr=settings.getSettings()->max_image_incr;
-	if(minspace!=-1)
-		max_image_incr=settings.getSettings()->min_image_incr;
+	if (minspace != -1)
+	{
+		val_info = "min_image_incr";
+		max_image_incr = settings.getSettings()->min_image_incr;
+	}
 
 	int incr_image_num=(int)getImagesIncrNum(clientid, backupid, notit);
-	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(incr_image_num)+" incremental image backups max="+convert(max_image_incr), LL_DEBUG);
+	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(incr_image_num)+" incremental image backups "+val_info +"="+convert(max_image_incr), LL_DEBUG);
 	while(incr_image_num>max_image_incr
 		&& incr_image_num>0)
 	{
@@ -990,18 +1015,10 @@ bool ServerCleanupThread::cleanup_images_client(int clientid, int64 minspace, st
 			}
 			else
 			{
-				imageids.push_back(backupid);
-
-				if (cleanup_only_one)
-				{
-					return true;
-				}
+				imagebid = backupid;
+				return true;
 			}
 		}
-
-		int r=hasEnoughFreeSpace(minspace, &settings);
-		if( r==-1 || r==1 )
-			return true;
 				
 		incr_image_num=(int)getImagesIncrNum(clientid, backupid, notit);
 	}
@@ -1066,12 +1083,14 @@ void ServerCleanupThread::cleanup_images(int64 minspace)
 		{
 			int clientid = res[i];
 
-			std::vector<int> imageids;
-			if (cleanup_images_client(clientid, minspace, imageids, true))
+			int imagebid;
+			if (cleanup_one_imagebackup_client(clientid, minspace, imagebid))
 			{
 				int r = hasEnoughFreeSpace(minspace, &settings);
 				if (r == -1 || r == 1)
 					return;
+
+				deleted_something = true;
 			}
 		}
 
@@ -1107,7 +1126,8 @@ bool ServerCleanupThread::removeImage(int backupid, ServerSettings* settings,
 
 		for(size_t i=0;i<refs.size();++i)
 		{
-			if(max_removable_incr_images(*settings, refs[i].id, del_incr_in_stack)<=0)
+			if(!force_remove && 
+				max_removable_incr_images(*settings, refs[i].id, del_incr_in_stack)<=0)
 			{
 				ServerLogger::Log(logid, "Cannot delete image because incremental image backups referencing this image are not allowed to be deleted", LL_INFO);
 				return false;
@@ -1202,6 +1222,19 @@ bool ServerCleanupThread::findUncompleteImageRef(ServerCleanupDao* cleanupdao, i
 	return false;
 }
 
+bool ServerCleanupThread::findIncompleteFileBackupRef(ServerCleanupDao* cleanupdao, int backupid)
+{
+	std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanupdao->getFileBackupRefs(backupid);
+
+	for (size_t i = 0; i < refs.size(); ++i)
+	{
+		if (refs[i].complete != 1
+			|| findIncompleteFileBackupRef(cleanupdao, refs[i].id))
+			return true;
+	}
+	return false;
+}
+
 bool ServerCleanupThread::findLockedImageRef(ServerCleanupDao* cleanupdao, int backupid)
 {
 	std::vector<ServerCleanupDao::SImageRef> refs = cleanupdao->getImageRefs(backupid);
@@ -1232,6 +1265,19 @@ bool ServerCleanupThread::findArchivedImageRef(ServerCleanupDao* cleanupdao, int
 	{
 		if (refs[i].archived==1
 			|| findArchivedImageRef(cleanupdao, refs[i].id))
+			return true;
+	}
+	return false;
+}
+
+bool ServerCleanupThread::findArchivedFileBackupRef(ServerCleanupDao* cleanupdao, int backupid)
+{
+	std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanupdao->getFileBackupRefs(backupid);
+
+	for (size_t i = 0; i < refs.size(); ++i)
+	{
+		if (refs[i].archived == 1
+			|| findArchivedFileBackupRef(cleanupdao, refs[i].id))
 			return true;
 	}
 	return false;
@@ -1297,15 +1343,19 @@ bool ServerCleanupThread::cleanup_one_filebackup_client(int clientid, int64 mins
 
 	int max_file_full=settings.getSettings()->max_file_full;
 	int max_file_incr=settings.getSettings()->max_file_incr;
+	std::string full_val_info = "max_file_full";
+	std::string incr_val_info = "max_file_incr";
 	if(minspace!=-1)
 	{
 		max_file_full=settings.getSettings()->min_file_full;
 		max_file_incr=settings.getSettings()->min_file_incr;
+		full_val_info = "min_file_full";
+		incr_val_info = "min_file_incr";
 	}
 
 	int backupid;
 	int full_file_num=(int)getFilesFullNum(clientid, backupid);
-	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(full_file_num)+" full file backups max="+convert(max_file_full), LL_DEBUG);
+	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(full_file_num)+" full file backups "+ full_val_info +"="+convert(max_file_full), LL_DEBUG);
 	while(full_file_num>max_file_full
 		&& full_file_num>0
 		&& !(full_file_num==1
@@ -1319,7 +1369,7 @@ bool ServerCleanupThread::cleanup_one_filebackup_client(int clientid, int64 mins
 		{
 			ServerLogger::Log(logid, "Deleting full file backup ( id="+convert(res_info.id)+", backuptime="+res_info.backuptime+", path="+res_info.path+" ) from client \""+clientname.value+"\" ( id="+convert(clientid)+" ) ...", LL_INFO);
 		}
-		bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid);
+		bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid, false, false);
 		filebid=backupid;
 				
 		ServerLogger::Log(logid, "Done.", LL_INFO);
@@ -1333,7 +1383,7 @@ bool ServerCleanupThread::cleanup_one_filebackup_client(int clientid, int64 mins
 	}
 
 	int incr_file_num=(int)getFilesIncrNum(clientid, backupid);
-	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(incr_file_num)+" incremental file backups max="+convert(max_file_incr), LL_DEBUG);
+	ServerLogger::Log(logid, "Client with id="+convert(clientid)+" has "+convert(incr_file_num)+" incremental file backups "+ incr_val_info +"="+convert(max_file_incr), LL_DEBUG);
 	while(incr_file_num>max_file_incr
 		&& incr_file_num>0)
 	{
@@ -1343,7 +1393,7 @@ bool ServerCleanupThread::cleanup_one_filebackup_client(int clientid, int64 mins
 		{
 			ServerLogger::Log(logid, "Deleting incremental file backup ( id="+convert(res_info.id)+", backuptime="+res_info.backuptime+", path="+res_info.path+" ) from client \""+clientname.value+"\" ( id="+convert(clientid)+" ) ...", LL_INFO);
 		}
-		bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid);
+		bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid, false, false);
 		filebid=backupid;
 
 		ServerLogger::Log(logid, "Done.", LL_INFO);
@@ -1448,7 +1498,8 @@ size_t ServerCleanupThread::getFilesIncrNum(int clientid, int &backupid_top)
 	return no_err_res.size();
 }
 
-bool ServerCleanupThread::deleteFileBackup(const std::string &backupfolder, int clientid, int backupid, bool force_remove)
+bool ServerCleanupThread::deleteFileBackup(const std::string &backupfolder, int clientid, int backupid,
+	bool force_remove, bool remove_references, int del_incr_in_stack)
 {
 	ServerStatus::updateActive();
 
@@ -1494,6 +1545,41 @@ bool ServerCleanupThread::deleteFileBackup(const std::string &backupfolder, int 
 		return false;
 	}
 
+	if (remove_references)
+	{
+		std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanupdao->getFileBackupRefs(backupid);
+
+		ServerSettings settings(db, clientid);
+
+		for (ServerCleanupDao::SFileBackupRef& ref : refs)
+		{
+			if (!force_remove &&
+				max_removable_incr_file_backups(settings, ref.id, del_incr_in_stack) <= 0)
+			{
+				ServerLogger::Log(logid, "Cannot delete file backup because incremental file backups referencing this file backup are not allowed to be deleted", LL_INFO);
+				return false;
+			}
+
+			bool b = deleteFileBackup(backupfolder, clientid, ref.id, force_remove,
+				remove_references, del_incr_in_stack + 1);
+			if (!b)
+			{
+				ServerLogger::Log(logid, "Cannot delete file backup because incremental file backup backup referencing this file backup cannot be deleted", LL_ERROR);
+				return false;
+			}
+		}
+	}
+	else if (!remove_references && !force_remove)
+	{
+		std::vector<ServerCleanupDao::SFileBackupRef> refs = cleanupdao->getFileBackupRefs(backupid);
+
+		if (!refs.empty())
+		{
+			ServerLogger::Log(logid, "Cannot delete file backup because incremental file backups referencing this file backup exist", LL_INFO);
+			return false;
+		}
+	}
+
 	std::string path=backupfolder+os_file_sep()+clientname+os_file_sep()+backuppath;
 
 	if (!os_directory_exists(os_file_prefix(path))
@@ -1501,6 +1587,13 @@ bool ServerCleanupThread::deleteFileBackup(const std::string &backupfolder, int 
 	{
 		backuppath += ".startup-del";
 		path += ".startup-del";
+	}
+
+	if (os_get_file_type(os_file_prefix(path + os_file_sep() + ".hashes" 
+		+ os_file_sep() + ".local_backup_7267f182-4341-4cda-ada1-4c0c554322d8"))
+		& EFileType_File)
+	{
+		return delete_local_backup(backupfolder, clientid, backupid, force_remove);
 	}
 
 	bool b=false;
@@ -1567,8 +1660,6 @@ bool ServerCleanupThread::deleteFileBackup(const std::string &backupfolder, int 
 	if(del || force_remove)
 	{
 		removeFileBackupSql(backupid);
-
-
 	}
 
 	ServerStatus::updateActive();
@@ -1605,7 +1696,7 @@ void ServerCleanupThread::removeClient(int clientid)
 		{
 			int backupid=res_filebackups[0];
 			ServerLogger::Log(logid, "Removing file backup with id \""+convert(backupid)+"\"", LL_INFO);
-			bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid, true);
+			bool b=deleteFileBackup(settings.getSettings()->backupfolder, clientid, backupid, true, true);
 			if(b)
 				ServerLogger::Log(logid, "Removing file backup with id \""+convert(backupid)+"\" successful.", LL_INFO);
 			else
@@ -1723,7 +1814,7 @@ namespace
 			src_file_destroy.reset(src_file);
 		}
 
-		std::auto_ptr<IFile> dst_file(Server->openFile(os_file_prefix(dst), MODE_WRITE));
+		std::unique_ptr<IFile> dst_file(Server->openFile(os_file_prefix(dst), MODE_WRITE));
 
 		bool copy_ok = true;
 		if (src_file != NULL
@@ -2096,21 +2187,33 @@ bool ServerCleanupThread::enforce_quota(int clientid, std::ostringstream& log)
 
 			if(state==0)
 			{
-				std::vector<int> imageids;
-				cleanup_images_client(clientid, target_minspace, imageids, true);
-				if(!imageids.empty())
+				int imagebid;
+				bool enough_space = false;
+				while (true)
 				{
-					log << "Removed " << imageids.size() << " image with id ";
-					for(size_t i=0;i<imageids.size();++i) log << imageids[i] << " ";
-					log << std::endl;
+					if (cleanup_one_imagebackup_client(clientid, target_minspace, imagebid))
+					{
+						log << "Removed image backupd with id " << imagebid << std::endl;
+						did_remove_something = true;
+						//TODO: wait here for btrfs subvol remove to finish
+						if (hasEnoughFreeSpace(target_minspace, &client_settings))
+						{
+							enough_space = true;
+							break;
+						}
+					}
+					else
+					{
+						++nopc;
+						break;
+					}
+				}
 
-					did_remove_something=true;
+				if (enough_space)
+				{
 					break;
 				}
-				else
-				{
-					++nopc;
-				}
+				
 			}
 			else
 			{
@@ -2121,6 +2224,7 @@ bool ServerCleanupThread::enforce_quota(int clientid, std::ostringstream& log)
 
 					did_remove_something=true;
 					nopc=0;
+					//TODO: wait here for btrfs subvol remove to finish
 					if(hasEnoughFreeSpace(target_minspace, &client_settings))
 					{
 						break;
@@ -2382,7 +2486,7 @@ void ServerCleanupThread::delete_incomplete_file_backups( void )
 	{
 		const ServerCleanupDao::SIncompleteFileBackup& backup = incomplete_file_backups[i];
 		ServerLogger::Log(logid, "Deleting incomplete file backup ( id="+convert(backup.id)+", backuptime="+backup.backuptime+", path="+backup.path+" ) from client \""+backup.clientname+"\" ( id="+convert(backup.clientid)+" ) ...", LL_INFO);
-		if(!deleteFileBackup(settings.getSettings()->backupfolder, backup.clientid, backup.id))
+		if(!deleteFileBackup(settings.getSettings()->backupfolder, backup.clientid, backup.id, true, true))
 		{
 			ServerLogger::Log(logid, "Error deleting file backup", LL_WARNING);
 		}
@@ -2404,7 +2508,7 @@ void ServerCleanupThread::delete_pending_file_backups()
 	{
 		const ServerCleanupDao::SIncompleteFileBackup& backup = delete_pending_file_backups[i];
 		ServerLogger::Log(logid, "Deleting manually marked to be deleted file backup ( id=" + convert(backup.id) + ", backuptime=" + backup.backuptime + ", path=" + backup.path + " ) from client \"" + backup.clientname + "\" ( id=" + convert(backup.clientid) + " ) ...", LL_INFO);
-		if (!deleteFileBackup(settings.getSettings()->backupfolder, backup.clientid, backup.id))
+		if (!deleteFileBackup(settings.getSettings()->backupfolder, backup.clientid, backup.id, false, true))
 		{
 			ServerLogger::Log(logid, "Error deleting file backup", LL_WARNING);
 		}
@@ -2719,6 +2823,243 @@ void ServerCleanupThread::setClientlistDeletionAllowed(bool b)
 {
 	IScopedLock lock(mutex);
 	allow_clientlist_deletion = b;
+}
+
+namespace
+{
+	class CleanupFrontend : public IKvStoreFrontend
+	{
+	public:
+		virtual void incr_total_del_ops() {}
+
+		virtual std::string prefixKey(const std::string& key) {
+			std::string md5sum = Server->GenerateHexMD5(key);
+			return md5sum.substr(0, 3) + "/" + md5sum.substr(3, 2) + "/" + key;
+		}
+
+		virtual std::string encodeKey(int64 cd_id, const std::string& key, int64 transid) {
+			if (cd_id == 0)
+				return std::to_string(transid) + "_" + 
+					bytesToHex(reinterpret_cast<const unsigned char*>(key.c_str()), key.size());
+
+			return std::to_string(cd_id) + "_" + std::to_string(transid) + "_" + 
+				bytesToHex(reinterpret_cast<const unsigned char*>(key.c_str()), key.size());
+		}
+
+		virtual bool log_del_mirror(const std::string& fn) {
+			return false;
+		}
+	};
+}
+
+bool ServerCleanupThread::delete_local_backup(const std::string& backupfolder, int clientid, int backupid, bool force_remove)
+{
+	ServerCleanupDao::CondString cond_clientname = cleanupdao->getClientName(clientid);
+	if (!cond_clientname.exists)
+	{
+		ServerLogger::Log(logid, "Error getting clientname in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+	std::string& clientname = cond_clientname.value;
+
+	ServerCleanupDao::CondString cond_perm_uid = cleanupdao->getClientPermUid(clientid);
+	if (!cond_perm_uid.exists)
+	{
+		ServerLogger::Log(logid, "Error getting perm_uid in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+	std::string perm_uid = bytesToHex(cond_perm_uid.value);	
+
+	if (cleanupdao->getFileBackupClientId(backupid).value != clientid)
+	{
+		ServerLogger::Log(logid, "Clientid does not match clientid in backup in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	ServerCleanupDao::CondString cond_backuppath = cleanupdao->getFileBackupPath(backupid);
+
+	if (!cond_backuppath.exists)
+	{
+		ServerLogger::Log(logid, "Error getting backuppath in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	std::string backuppath = cond_backuppath.value;
+
+	if (backuppath.empty())
+	{
+		ServerLogger::Log(logid, "Error backuppath empty in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	if (backupfolder.empty())
+	{
+		ServerLogger::Log(logid, "Error backupfolder empty in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	if (clientname.empty())
+	{
+		ServerLogger::Log(logid, "Error clientname empty in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	std::string path = backupfolder + os_file_sep() + clientname + os_file_sep() + backuppath;
+
+	if (!os_directory_exists(os_file_prefix(path))
+		&& os_directory_exists(os_file_prefix(path + ".startup-del")))
+	{
+		backuppath += ".startup-del";
+		path += ".startup-del";
+	}
+
+	if (getFile(path + os_file_sep() + ".hashes" + os_file_sep() + ".local_backup_7267f182-4341-4cda-ada1-4c0c554322d8") != "1")
+	{
+		ServerLogger::Log(logid, "No a local backup in ServerCleanupThread::delete_local_backup", LL_ERROR);
+		return false;
+	}
+
+	bool deletion_protected = cleanupdao->getFileBackupDeletionProtected(backupid).value != 0;
+
+
+	if (deletion_protected)
+	{
+		std::vector<SFile> files = getFiles(path);
+
+		ServerSettings settings(db, clientid);
+
+		std::string dest_url = settings.getSettings()->backup_dest_url;
+
+		dest_url = greplace("$CLIENTUID$", perm_uid, dest_url);
+		dest_url = greplace("$CLIENTNAME$", clientname, dest_url);
+
+		for (SFile cleanup_file : files)
+		{
+			if (!cleanup_file.isdir &&
+				next(cleanup_file.name, 0, "del_objs_"))
+			{
+				CleanupFrontend cleanup_frontend;
+				ObjectCollector object_collector(&cleanup_frontend, path + os_file_sep() + cleanup_file.name);
+
+				if (object_collector.get_has_error())
+				{
+					ServerLogger::Log(logid, "Error reading " + path + os_file_sep() + cleanup_file.name, LL_ERROR);
+					return false;
+				}
+
+				object_collector.finalize();
+
+				str_map secret_params;
+				ParseParamStrHttp(settings.getSettings()->backup_dest_secret_params, &secret_params);
+
+				IClouddriveFactory::CloudSettings cloud_settings;
+
+				if (!parse_backup_url(dest_url,
+					settings.getSettings()->backup_dest_params, secret_params,
+					cloud_settings))
+				{
+					ServerLogger::Log(logid, "Error parsing backup dest url to delete objects: " + settings.getSettings()->backup_dest_url, LL_ERROR);
+					return false;
+				}
+
+				std::unique_ptr<IKvStoreBackend> backend(clouddrive_fak->createBackend(nullptr, cloud_settings));
+
+				if (!backend)
+				{
+					ServerLogger::Log(logid, "Error creating backend to delete objects", LL_ERROR);
+					return false;
+				}
+
+				for (size_t i = 0; i < object_collector.key_next_funs.size(); ++i)
+				{
+					if (object_collector.locinfo_next_funs[i] != nullptr)
+					{
+						if (!backend->del(object_collector.key_next_funs[i],
+							object_collector.locinfo_next_funs[i], true))
+						{
+							ServerLogger::Log(logid, "Error deleting objects of backup (with locinfo)", LL_ERROR);
+							return false;
+						}
+						object_collector.locinfo_next_funs[i](IKvStoreBackend::key_next_action_t::clear, nullptr);
+					}
+					else
+					{
+						if (!backend->del(object_collector.key_next_funs[i], true))
+						{
+							ServerLogger::Log(logid, "Error deleting objects of backup", LL_ERROR);
+							return false;
+						}
+					}
+
+					object_collector.key_next_funs[i](IKvStoreBackend::key_next_action_t::clear, nullptr);
+				}
+
+				if (object_collector.task_id == 2) //remove transaction
+				{
+					if (object_collector.trans_ids.size() != 1)
+					{
+						ServerLogger::Log(logid, "Remove transaction task without transaction info", LL_ERROR);
+						return false;
+					}
+
+					int64 trans_id = object_collector.trans_ids[0];
+
+					std::vector<std::string> add_backend_keys;
+
+					if (object_collector.completed != 0)
+					{
+						if (object_collector.cd_id == 0)
+							add_backend_keys.push_back(cleanup_frontend.prefixKey(convert(trans_id) + "_complete"));
+						else
+							add_backend_keys.push_back(cleanup_frontend.prefixKey(convert(object_collector.cd_id) + "_" + convert(trans_id) + "_complete"));
+					}
+
+					if (object_collector.active == 0)
+					{
+						if (object_collector.cd_id == 0)
+							add_backend_keys.push_back(cleanup_frontend.prefixKey(convert(trans_id) + "_inactive"));
+						else
+							add_backend_keys.push_back(cleanup_frontend.prefixKey(convert(object_collector.cd_id) + "_" + convert(trans_id) + "_inactive"));
+					}
+
+					if (!add_backend_keys.empty())
+					{
+						size_t idx = 0;
+						backend->del([&add_backend_keys, &idx](IKvStoreBackend::key_next_action_t action, std::string* key) {
+							if (action == IKvStoreBackend::key_next_action_t::clear) {
+								add_backend_keys.clear();
+								assert(key == nullptr);
+								return true;
+							}
+
+							if (action == IKvStoreBackend::key_next_action_t::reset) {
+								idx = 0;
+								assert(key == nullptr);
+								return true;
+							}
+
+							assert(action == IKvStoreBackend::key_next_action_t::next);
+
+							if (idx >= add_backend_keys.size())
+								return false;
+							*key = add_backend_keys[idx];
+							++idx;
+							return true;
+							}, true);
+					}
+				}
+			}
+		}
+
+		cleanupdao->resetFileBackupDeletionProtected(backupid);
+		cleanupdao->resetFileBackupIncrementalRef(backupid);
+	}
+
+	cleanupdao->setFileBackupDeleteClientPending(backupid);
+
+	ServerStatus::updateActive();
+
+	return true;
 }
 
 bool ServerCleanupThread::backup_ident()

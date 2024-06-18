@@ -102,6 +102,37 @@ namespace
 		std::string session;
 	};
 
+	class RestoreTokenKeepaliveThread : public IThread
+	{
+	public:
+		RestoreTokenKeepaliveThread(std::string token)
+			: do_quit(false), token(token)
+		{
+
+		}
+
+		void operator()()
+		{
+			while (!do_quit)
+			{
+				ServerChannelThread::SRestoreToken token_info;
+				ServerChannelThread::get_restore_token(token, token_info);
+
+				Server->wait(10000);
+			}
+
+			delete this;
+		}
+
+		void doQuit() {
+			do_quit = true;
+		}
+
+	private:
+		volatile bool do_quit;
+		std::string token;
+	};
+
 	class FileservClientThread : public IThread
 	{
 	public:
@@ -128,6 +159,9 @@ namespace
 }
 
 int ServerChannelThread::img_id_offset=0;
+IMutex* ServerChannelThread::restore_token_mutex = NULL;
+std::map<std::string, ServerChannelThread::SRestoreToken> ServerChannelThread::restore_tokens;
+std::map<std::string, ServerChannelThread::SRestoreToken> ServerChannelThread::restore_tokens_used;
 
 void ServerChannelThread::initOffset()
 {
@@ -147,10 +181,39 @@ void ServerChannelThread::initOffset()
     }
 }
 
+void ServerChannelThread::init_mutex()
+{
+	restore_token_mutex = Server->createMutex();
+}
+
 bool ServerChannelThread::isOnline()
 {
 	IScopedLock lock(mutex);
 	return input != NULL;
+}
+
+void ServerChannelThread::add_restore_token(const std::string& token, int backupid)
+{
+	assert(restore_token_mutex != NULL);
+
+	IScopedLock lock(restore_token_mutex);
+
+	SRestoreToken token_info;
+	token_info.backupid = backupid;
+	restore_tokens[token] = token_info;
+
+	timeout_restore_tokens_used();
+}
+
+void ServerChannelThread::remove_restore_token(const std::string& token)
+{
+	IScopedLock lock(restore_token_mutex);
+
+	std::map<std::string, SRestoreToken>::iterator it = restore_tokens.find(token);
+	if (it != restore_tokens.end())
+	{
+		restore_tokens.erase(it);
+	}
 }
 
 ServerChannelThread::ServerChannelThread(ClientMain *client_main, const std::string& clientname, int clientid,
@@ -160,7 +223,8 @@ ServerChannelThread::ServerChannelThread(ClientMain *client_main, const std::str
 	client_main(client_main), clientname(clientname), clientid(clientid), settings(NULL),
 		internet_mode(internet_mode), allow_restore(allow_restore), keepalive_thread(NULL), server_token(server_token),
 	virtual_client(virtual_client), allow_shutdown(true),
-	parent(parent), next_reauth_time(0), reauth_tries(0)
+	parent(parent), next_reauth_time(0), reauth_tries(0), restore_token_keepalive_thread(NULL),
+	startup_timestamp(0)
 {
 	do_exit=false;
 	mutex=Server->createMutex();
@@ -212,7 +276,7 @@ void ServerChannelThread::run()
 				curr_ident = client_main->getIdentity();
 				tcpstack.reset();
 				tcpstack.setAddChecksum(client_main->isOnInternetConnection());
-				tcpstack.Send(input, curr_ident +"1CHANNEL capa="+convert(constructCapabilities())+"&token="+server_token+"&restore_version=1&virtual_client="+EscapeParamString(virtual_client));
+				tcpstack.Send(input, curr_ident +"1CHANNEL capa="+convert(constructCapabilities())+"&token="+server_token+"&restore_version=1&startup=1&virtual_client="+EscapeParamString(virtual_client));
 
 				lasttime=Server->getTimeMS();
 				lastpingtime=lasttime;
@@ -286,6 +350,11 @@ void ServerChannelThread::run()
 	if(keepalive_thread!=NULL)
 	{
 		keepalive_thread->doQuit();
+	}
+
+	if (restore_token_keepalive_thread != NULL)
+	{
+		restore_token_keepalive_thread->doQuit();
 	}
 
 	if (!fileclient_threads.empty())
@@ -366,6 +435,13 @@ std::string ServerChannelThread::processMsg(const std::string &msg)
 		ParseParamStrHttp(s_params, &params);
 		client_main->setConnectionMetered(params["metered"] == "1");
 	}
+	else if (next(msg, 0, "LOCKED "))
+	{
+		std::string s_params = msg.substr(7);
+		str_map params;
+		ParseParamStrHttp(s_params, &params);
+		client_main->setWindowsLocked(params["locked"] == "1");
+	}
 	else if(next(msg, 0, "LOGIN ") && allow_restore)
 	{
 		std::string s_params=msg.substr(6);
@@ -427,25 +503,34 @@ std::string ServerChannelThread::processMsg(const std::string &msg)
 		str_map params;
 		ParseParamStrHttp(s_params, &params);
 	}
-	else if(next(msg, 0, "DOWNLOAD IMAGE ") && allow_restore && hasDownloadImageRights())
+	else if(next(msg, 0, "DOWNLOAD IMAGE ") && allow_restore)
 	{
 		std::string s_params=msg.substr(15);
 		str_map params;
 		ParseParamStrHttp(s_params, &params);
 
+		if (hasDownloadImageRights(params))
 		{
-			IScopedLock lock(mutex);
-			allow_shutdown = false;
+			{
+				IScopedLock lock(mutex);
+				allow_shutdown = false;
+			}
+
+			add_extra_channel();
+			DOWNLOAD_IMAGE(params);
+			remove_extra_channel();
+			Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER)->destroyAllQueries();
+
+			{
+				IScopedLock lock(mutex);
+				allow_shutdown = true;
+			}
 		}
-
-		add_extra_channel();
-		DOWNLOAD_IMAGE(params);
-		remove_extra_channel();
-		Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER)->destroyAllQueries();
-
+		else if (params.find("token") != params.end())
 		{
-			IScopedLock lock(mutex);
-			allow_shutdown = true;
+			Server->Log("Image restore token timeout", LL_DEBUG);
+			_i64 r = -1;
+			input->Write((char*)&r, sizeof(_i64), 30000);
 		}
 	}
 	else if(next(msg, 0, "DOWNLOAD FILES TOKENS "))
@@ -509,6 +594,29 @@ std::string ServerChannelThread::processMsg(const std::string &msg)
 				ServerLogger::Log(log_id, msg.substr(second_sep+1), loglevel);
 			}
 		}
+	}
+	else if (next(msg, 0, "STARTUP "))
+	{
+		std::string s_params = msg.substr(8);
+		str_map params;
+		ParseParamStrHttp(s_params, &params);
+		STARTUP(params);
+	}
+	else if (next(msg, 0, "BACKUP PERCENT "))
+	{
+		std::string s_params = msg.substr(15);
+		str_map params;
+		ParseParamStrHttp(s_params, &params);
+
+		BACKUP_PERCENT(params);
+	}
+	else if (next(msg, 0, "BACKUP DONE "))
+	{
+		std::string s_params = msg.substr(12);
+		str_map params;
+		ParseParamStrHttp(s_params, &params);
+
+		BACKUP_DONE(params);
 	}
 	else
 	{
@@ -666,7 +774,7 @@ void ServerChannelThread::SALT(str_map& params)
 	}
 }
 
-bool ServerChannelThread::hasDownloadImageRights()
+bool ServerChannelThread::hasDownloadImageRights(const str_map& params)
 {
 	if(!needs_login())
 	{
@@ -674,16 +782,16 @@ bool ServerChannelThread::hasDownloadImageRights()
 		return true;
 	}
 
+	if (params.find("token") != params.end())
+	{
+		SRestoreToken token_info;
+		return get_restore_token(params.at("token"), token_info);
+	}
+
 	str_map GET;
 	str_map PARAMS;
 	GET["ses"]=session;
 	Helper helper(Server->getThreadID(), &GET, &PARAMS);
-
-	if(helper.getSession()==NULL)
-	{
-		Server->Log("Channel session timeout", LL_ERROR);
-		return false;
-	}
 
 	if(helper.getSession()==NULL)
 	{
@@ -775,7 +883,7 @@ void ServerChannelThread::GET_BACKUPIMAGES(const std::string& clientname)
 		q->Reset();
 		for(size_t j=0;j<res2.size();++j)
 		{
-			r+="#|"+convert(img_id_offset+watoi(res2[j]["id"]))+"|"+(res2[j]["timestamp"])+"|"+(res2[j]["backuptime"])+"\n";
+			r+="#|"+convert(img_id_offset+watoi(res2[j]["id"]))+"|"+(res2[j]["timestamp"])+"|"+(res2[j]["backuptime"])+"|"+(res[i]["letter"])+"\n";
 		}
 	}
 	tcpstack.Send(input, r);
@@ -960,12 +1068,45 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 
 	ServerBackupDao backup_dao(db);
 
-	int img_id=watoi(params["img_id"])-img_id_offset;
-	
-	IQuery *q=db->Prepare("SELECT path, version, clientid, letter FROM backup_images WHERE id=? AND strftime('%s', backuptime)=?");
-	q->Bind(img_id);
-	q->Bind(params["time"]);
-	db_results res=q->Read();
+	bool check_client_permissions = true;
+	db_results res;
+	int img_id;
+	if (params.find("token") != params.end())
+	{
+		SRestoreToken token_info;
+		std::string restore_token = params["token"];
+		if (!get_restore_token(restore_token, token_info))
+		{
+			_i64 r = -1;
+			input->Write((char*)&r, sizeof(_i64), img_send_timeout);
+			return;
+		}
+
+		if (restore_token_keepalive_thread != NULL)
+		{
+			restore_token_keepalive_thread->doQuit();
+		}
+		restore_token_keepalive_thread = new RestoreTokenKeepaliveThread(restore_token);
+		Server->getThreadPool()->execute(restore_token_keepalive_thread, "restore token keepalive");
+
+		check_client_permissions = false;
+
+		IQuery* q = db->Prepare("SELECT path, version, clientid, letter FROM backup_images WHERE id=?");
+		q->Bind(token_info.backupid);
+		res = q->Read();
+
+		img_id = token_info.backupid;
+	}
+	else
+	{
+		img_id = watoi(params["img_id"]) - img_id_offset;
+
+		IQuery* q = db->Prepare("SELECT path, version, clientid, letter FROM backup_images WHERE id=? AND strftime('%s', backuptime)=?");
+		q->Bind(img_id);
+		q->Bind(params["time"]);
+		res = q->Read();
+	}
+
 	if(res.empty())
 	{
 		Server->Log("Image to download not found (img_id=" + convert(img_id) + " time=" + params["time"] + ")", LL_DEBUG);
@@ -978,24 +1119,27 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 	}
 	else
 	{
-		std::string clientname = get_clientname(db, watoi(res[0]["clientid"]));
-
-		if(clientname.empty()
-			|| !has_restore_permission(clientname, watoi(res[0]["clientid"])))
+		if (check_client_permissions)
 		{
-			Server->Log("No permission to download image of client with id " + res[0]["clientid"], LL_DEBUG);
-			_i64 r=-1;
-			if (!input->Write((char*)&r, sizeof(_i64), img_send_timeout))
+			std::string clientname = get_clientname(db, watoi(res[0]["clientid"]));
+
+			if (clientname.empty()
+				|| !has_restore_permission(clientname, watoi(res[0]["clientid"])))
 			{
-				reset();
+				Server->Log("No permission to download image of client with id " + res[0]["clientid"], LL_DEBUG);
+				_i64 r = -1;
+				if (!input->Write((char*)&r, sizeof(_i64), img_send_timeout))
+				{
+					reset();
+				}
+				return;
 			}
-			return;
 		}
 
 		int img_version=watoi(res[0]["version"]);
 		if(params["mbr"]=="true")
 		{
-			std::auto_ptr<IFile> f(Server->openFile(os_file_prefix(res[0]["path"]+".mbr"), MODE_READ));
+			std::unique_ptr<IFile> f(Server->openFile(os_file_prefix(res[0]["path"]+".mbr"), MODE_READ));
 			if(f.get()==NULL)
 			{
 				_i64 r=little_endian(-1);
@@ -1292,7 +1436,7 @@ void ServerChannelThread::DOWNLOAD_FILES( str_map& params )
 		std::vector<std::string> tokens;
 
 		if(create_clientdl_thread(backupid, clientname, clientid, restore_id, status_id, log_id,
-			params["restore_token"], map_paths, clean_other, ignore_other_fs, follow_symlinks, restore_flags, tokens))
+			params["restore_token"], map_paths, clean_other, ignore_other_fs, follow_symlinks, restore_flags, tokens, false))
 		{
 			JSON::Object ret;
 			ret.set("ok", true);
@@ -1432,7 +1576,7 @@ void ServerChannelThread::DOWNLOAD_FILES_TOKENS(str_map& params)
 		if(!create_clientdl_thread(clientname, clientid, clientid, path_info.full_path, path_info.full_metadata_path, filename, 
 			path_info.rel_path.empty(), path_info.rel_path, restore_id, status_id, log_id, params["restore_token"],
 			map_paths, clean_other, ignore_other_fs, greplace(os_file_sep(), "/", path_info.rel_path), follow_symlinks, restore_flags,
-			ticket, tokens, path_info.backup_tokens))
+			ticket, tokens, path_info.backup_tokens, true))
 		{
 			ret.set("err", 5);
 			break;
@@ -1456,6 +1600,8 @@ void ServerChannelThread::DOWNLOAD_FILES_TOKENS(str_map& params)
 
 void ServerChannelThread::RESTORE_PERCENT( str_map params )
 {
+	ServerStatus::updateActive();
+
 	int64 status_id = watoi64(params["status_id"]);
 	int64 restore_id = watoi64(params["id"]);
 	int pc = watoi(params["pc"]);
@@ -1523,10 +1669,107 @@ void ServerChannelThread::RESTORE_DONE( str_map params )
 
 		ServerLogger::reset(log_id);
 
-		client_main->finishRestore(restore_id);
+		client_main->removeRestore(restore_id);
 		ClientMain::cleanupRestoreShare(clientid, restore_ident.value);
+	}	
+}
+
+void ServerChannelThread::BACKUP_PERCENT(str_map params)
+{
+	ServerStatus::updateActive();
+
+	int64 status_id = watoi64(params["status_id"]);
+	int backupid = watoi(params["id"]);
+	int pc = watoi(params["pc"]);
+	double speed_bpms = atof(params["speed_bpms"].c_str());
+	std::string details = params["details"];
+	int64 total_bytes = watoi64(params["total_bytes"]);
+	int64 done_bytes = watoi64(params["done_bytes"]);
+	int detail_pc = watoi(params["detail_pc"]);
+	int64 eta = watoi(params["eta"]);
+	int64 eta_set_time = Server->getTimeMS() - watoi(params["eta_set_time"]);
+
+	client_main->updateLocalBackupRunning(backupid);
+
+	ServerStatus::setProcessPcDone(clientname, status_id, pc);
+	ServerStatus::setProcessSpeed(clientname, status_id, speed_bpms);
+	ServerStatus::setProcessDoneBytes(clientname, status_id, done_bytes);
+	ServerStatus::setProcessTotalBytes(clientname, status_id, total_bytes);
+	ServerStatus::setProcessEta(clientname, status_id, eta, eta_set_time);
+}
+
+void ServerChannelThread::BACKUP_DONE(str_map params)
+{
+	int64 status_id = watoi64(params["status_id"]);
+	logid_t log_id = std::make_pair(watoi64(params["log_id"]), 0);
+	int backupid = watoi(params["id"]);
+	bool success = params["success"] == "true";
+	int num_issues = watoi(params["issues"]);
+
+	if (!ServerLogger::hasClient(log_id, clientid))
+	{
+		Server->Log("Log doesn't have correct client in BACKUP DONE", LL_ERROR);
+		return;
 	}
+
+	SProcess proc = ServerStatus::getProcess(clientname, status_id);
+
+	if (proc.id == 0)
+	{
+		Server->Log("Backup done process not found", LL_ERROR);
+	}
+
+	if (proc.logid != log_id)
+	{
+		Server->Log("Process doesn't have correct log id in BACKUP DONE", LL_ERROR);
+	}
+
+	if (proc.backupid != backupid)
+	{
+		Server->Log("Process doesn't have correct backup id in BACKUP DONE", LL_ERROR);
+	}
+
+	IDatabase* db = Server->getDatabase(Server->getThreadID(), URBACKUPDB_SERVER);
+	ServerBackupDao backup_dao(db);
+
+	ServerStatus::stopProcess(clientname, status_id);
+		
+	int errors = 0;
+	int warnings = 0;
+	int infos = 0;
+	std::string logdata = ServerLogger::getLogdata(log_id, errors, warnings, infos);
+
+	bool image = proc.action == sa_full_image || proc.action == sa_incr_image;
+	bool incr = proc.action == sa_incr_image || proc.action == sa_incr_file || proc.action == sa_resume_incr_file;
+	bool resumed = proc.action == sa_resume_incr_file || proc.action == sa_resume_full_file;
+
+	backup_dao.saveBackupLog(clientid, errors, warnings, infos, image,
+		incr, resumed, 0);
+
+	backup_dao.saveBackupLogData(db->getLastInsertID(), logdata);
+
+	backup_dao.updateClientLastFileBackup(backupid, num_issues, clientid);
+	backup_dao.updateFileBackupSetComplete(backupid);
 	
+	ServerLogger::reset(log_id);
+
+	client_main->sendToPipe("BACKUP DONE?status_id=" + convert(status_id)
+		+ "&success=" + convert(success ? 1 : 0) + "&should_backoff=0");
+}
+
+void ServerChannelThread::STARTUP(str_map& params)
+{
+	int64 curr_timestamp = watoi64(params["timestamp"]);
+
+	if (curr_timestamp != startup_timestamp)
+	{
+		if (startup_timestamp != 0)
+		{
+			client_main->updateCapa();
+			client_main->sendToPipe("WAKEUP");
+		}
+		startup_timestamp = curr_timestamp;
+	}
 }
 
 void ServerChannelThread::reset()
@@ -1601,6 +1844,69 @@ void ServerChannelThread::remove_extra_channel()
 		extra_channel_threads[extra_channel_threads.size() - 1]->doExit();
 		extra_channel_threads.erase(extra_channel_threads.begin() + extra_channel_threads.size() - 1);
 	}
+}
+
+void ServerChannelThread::timeout_restore_tokens_used()
+{
+	int64 ctime = Server->getTimeMS();
+	for (std::map<std::string, SRestoreToken>::iterator it = restore_tokens_used.begin();
+		it != restore_tokens_used.end();)
+	{
+		if (ctime - it->second.lasttime > 10 * 60 * 1000)
+		{
+			std::map<std::string, SRestoreToken>::iterator it_curr = it;
+			++it;
+			restore_tokens_used.erase(it_curr);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+bool ServerChannelThread::get_restore_token(const std::string& token, SRestoreToken& ret)
+{
+	IScopedLock lock(restore_token_mutex);
+
+	std::map<std::string, SRestoreToken>::iterator it = restore_tokens.find(token);
+	if (it == restore_tokens.end())
+	{
+		it = restore_tokens_used.find(token);
+
+		if (it == restore_tokens_used.end())
+		{
+			return false;
+		}
+		else
+		{
+			const int64 ctime = Server->getTimeMS();
+			if (ctime - it->second.lasttime > 10 * 60 * 1000)
+			{
+				restore_tokens_used.erase(it);
+				return false;
+			}
+
+			it->second.lasttime = ctime;
+		}
+	}
+	else
+	{
+		std::map<std::string, SRestoreToken>::iterator it_used = restore_tokens_used.find(token);
+		if (it_used == restore_tokens_used.end())
+		{
+			it->second.lasttime = Server->getTimeMS();
+			restore_tokens_used[token] = it->second;
+		}
+		else
+		{
+			it_used->second.lasttime = Server->getTimeMS();
+		}
+	}
+
+	ret = it->second;
+
+	return true;
 }
 
 

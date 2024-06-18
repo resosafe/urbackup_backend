@@ -35,14 +35,14 @@
 CTCPFileServ::CTCPFileServ(void)
 	: mSocket(SOCKET_ERROR), mSocketv6(SOCKET_ERROR)
 {
-	udpthread=NULL;
+	udpthread=nullptr;
 	udpticket=ILLEGAL_THREADPOOL_TICKET;
 	m_use_fqdn=false;
 }
 
 CTCPFileServ::~CTCPFileServ(void)
 {
-	if(udpthread!=NULL)
+	if(udpthread!=nullptr)
 	{
 		udpthread->stop();
 		if(udpticket!=ILLEGAL_THREADPOOL_TICKET)
@@ -199,12 +199,12 @@ bool CTCPFileServ::Start(_u16 tcpport,_u16 udpport, std::string pServername, boo
 		}
 	}
 	//start udpsock
-	if(udpthread!=NULL && udpthread->hasError() )
+	if(udpthread!=nullptr && udpthread->hasError() )
 	{
 		delete udpthread;
-		udpthread=NULL;
+		udpthread=nullptr;
 	}
-	if(udpthread==NULL && udpport!=0)
+	if(udpthread==nullptr && udpport!=0)
 	{
 		udpthread=new CUDPThread(udpport,pServername, use_fqdn);
 		if(!udpthread->hasError())
@@ -214,7 +214,7 @@ bool CTCPFileServ::Start(_u16 tcpport,_u16 udpport, std::string pServername, boo
 		else
 		{
 			delete udpthread;
-			udpthread=NULL;
+			udpthread=nullptr;
 			Log("Error starting UDP thread", LL_ERROR);
 			return false;
 		}
@@ -293,7 +293,7 @@ bool CTCPFileServ::TcpStep(void)
 			SOCKET accept_socket = conn[s].fd;
 #endif
 			SOCKET ns;
-			if (accept_socket == mSocketv6)
+			if (accept_socket == mSocket)
 			{
 				sockaddr_in naddr;
 				socklen_t addrsize = sizeof(naddr);
@@ -359,7 +359,20 @@ bool CTCPFileServ::startIpv4(_u16 tcpport)
 	type |= SOCK_CLOEXEC;
 #endif
 	mSocket = socket(AF_INET, type, 0);
-	if (mSocket < 1) return false;
+	if (mSocket == SOCKET_ERROR)
+	{
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+		if (errno == EINVAL)
+		{
+			type &= ~SOCK_CLOEXEC;
+			mSocket = socket(AF_INET, type, 0);
+		}
+#endif
+		if (mSocket == SOCKET_ERROR)
+		{
+			return false;
+		}
+	}
 
 	if (!setSocketSettings(mSocket))
 	{
@@ -388,7 +401,18 @@ bool CTCPFileServ::startIpv4(_u16 tcpport)
 		return false;
 	}
 
-	listen(mSocket, 60);
+	rc = listen(mSocket, 60);
+	if (rc == SOCKET_ERROR)
+	{
+#ifdef LOG_SERVER
+		Server->Log("Binding tcp socket to port " + convert(tcpport) + " failed (listen). Another instance of this application may already be active and bound to this port.", LL_ERROR);
+#else
+		Log("Failed. Listen to tcp socket.", LL_ERROR);
+#endif
+		closesocket(mSocket);
+		mSocket = SOCKET_ERROR;
+		return false;
+	}
 
 	return true;
 }
@@ -432,7 +456,19 @@ bool CTCPFileServ::startIpv6(_u16 tcpport)
 		return false;
 	}
 
-	listen(mSocketv6, 60);
+	rc = listen(mSocketv6, 60);
+
+	if (rc == SOCKET_ERROR)
+	{
+#ifdef LOG_SERVER
+		Server->Log("Binding tcp ipv6 socket to port " + convert(tcpport) + " failed (listen). Another instance of this application may already be active and bound to this port.", LL_ERROR);
+#else
+		Log("Failed. Listen to ipv6 tcp socket.", LL_ERROR);
+#endif
+		closesocket(mSocketv6);
+		mSocketv6 = SOCKET_ERROR;
+		return false;
+	}
 
 	return true;
 }

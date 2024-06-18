@@ -26,9 +26,9 @@
 
 #define CHANGE_JOURNAL
 
-IPipe *DirectoryWatcherThread::pipe=NULL;
-IMutex *DirectoryWatcherThread::update_mutex=NULL;
-ICondition *DirectoryWatcherThread::update_cond=NULL;
+IPipe *DirectoryWatcherThread::pipe=nullptr;
+IMutex *DirectoryWatcherThread::update_mutex=nullptr;
+ICondition *DirectoryWatcherThread::update_cond=nullptr;
 std::vector<std::string> DirectoryWatcherThread::open_files;
 
 
@@ -398,6 +398,7 @@ bool DirectoryWatcherThread::is_stopped(void)
 
 void DirectoryWatcherThread::On_ResetAll(const std::string & vol)
 {
+	DBScopedSynchronous sync_db(db);
 	OnDirMod("##-GAP-##"+strlower(vol));
 }
 

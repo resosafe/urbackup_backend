@@ -73,6 +73,7 @@ struct SChunk
 	bool with_sparse;
 	std::string s_filename;
 	IFileServ::CbtHashFileInfo cbt_hash_file_info;
+	size_t share_active_gen;
 };
 
 struct SLPData
@@ -209,4 +210,6 @@ private:
 	std::vector<char>* extra_buffer;
 
 	bool backup_semantics;
+
+	bool is_tunneled;
 };

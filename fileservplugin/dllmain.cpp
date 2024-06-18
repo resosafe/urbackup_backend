@@ -47,7 +47,7 @@ extern IServer* Server;
 #include "../stringtools.h"
 #include <stdlib.h>
 
-CFileServPluginMgr *fileservpluginmgr=NULL;
+CFileServPluginMgr *fileservpluginmgr=nullptr;
 
 DLLEXPORT void LoadActions(IServer* pServer)
 {
@@ -77,7 +77,7 @@ DLLEXPORT void LoadActions(IServer* pServer)
 
 		IFileServ *fileserv=fileserv_fak->createFileServ(tcpport, udpport);
 		fileserv->shareDir(ExtractFileName(share_dir), share_dir, std::string(), false);
-		fileserv->addIdentity("");
+		fileserv->addIdentity("", false);
 	}
 
 #ifndef STATIC_PLUGIN

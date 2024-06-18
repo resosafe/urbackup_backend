@@ -22,29 +22,30 @@
     <ProjectGuid>{A4E2527B-4886-4163-9411-10BF66A931BE}</ProjectGuid>
     <RootNamespace>urbackup</RootNamespace>
     <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release Server|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>Unicode</CharacterSet>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release Server|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <CharacterSet>Unicode</CharacterSet>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v142</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -129,7 +130,7 @@
     <Link>
       <AdditionalDependencies>zlibd_x86_64.lib;ws2_32.lib;VssApi.Lib;Ktmw32.lib;%(AdditionalDependencies);libzstd_x86_64.lib</AdditionalDependencies>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <SubSystem>Windows</SubSystem>
+      <SubSystem>Console</SubSystem>
       <TargetMachine>MachineX64</TargetMachine>
       <AdditionalLibraryDirectories>$(ZlibLibDir);$(SolutionDir)/deps/libs;$(ZstdLibDir)</AdditionalLibraryDirectories>
     </Link>
@@ -186,10 +187,12 @@
   <ItemGroup>
     <ClCompile Include="..\blockalign_src\crc.cpp" />
     <ClCompile Include="..\blockalign_src\crc32c-adler.cpp" />
+    <ClCompile Include="..\clouddrive\ObjectCollector.cpp" />
     <ClCompile Include="..\common\adler32.cpp" />
     <ClCompile Include="..\common\data.cpp" />
     <ClCompile Include="..\common\miniz.c" />
     <ClCompile Include="..\md5.cpp" />
+    <ClCompile Include="..\urbackupcommon\backup_url_parser.cpp" />
     <ClCompile Include="..\urbackupcommon\bufmgr.cpp" />
     <ClCompile Include="..\urbackupcommon\chunk_hasher.cpp" />
     <ClCompile Include="..\urbackupcommon\CompressedPipe.cpp" />
@@ -212,6 +215,7 @@
     <ClCompile Include="..\urbackupcommon\SparseFile.cpp" />
     <ClCompile Include="..\urbackupcommon\TreeHash.cpp" />
     <ClCompile Include="..\urbackupcommon\WalCheckpointThread.cpp" />
+    <ClCompile Include="..\urbackupcommon\WebSocketPipe.cpp" />
     <ClCompile Include="Alerts.cpp" />
     <ClCompile Include="apps\blockalign.cpp" />
     <ClCompile Include="apps\check_files_index.cpp" />
@@ -246,11 +250,13 @@
     <ClCompile Include="lmdb\mdb.c" />
     <ClCompile Include="lmdb\midl.c" />
     <ClCompile Include="LMDBFileIndex.cpp" />
+    <ClCompile Include="LocalBackup.cpp" />
     <ClCompile Include="LogReport.cpp" />
     <ClCompile Include="Mailer.cpp" />
     <ClCompile Include="PhashLoad.cpp" />
     <ClCompile Include="restore_client.cpp" />
     <ClCompile Include="server.cpp" />
+    <ClCompile Include="ServerDownloadThreadGroup.cpp" />
     <ClCompile Include="serverinterface\add_client.cpp" />
     <ClCompile Include="serverinterface\backups.cpp" />
     <ClCompile Include="serverinterface\create_zip.cpp" />
@@ -263,6 +269,7 @@
     <ClCompile Include="serverinterface\logs.cpp" />
     <ClCompile Include="serverinterface\piegraph.cpp" />
     <ClCompile Include="serverinterface\progress.cpp" />
+    <ClCompile Include="serverinterface\restore_image.cpp" />
     <ClCompile Include="serverinterface\restore_prepare_wait.cpp" />
     <ClCompile Include="serverinterface\salt.cpp" />
     <ClCompile Include="serverinterface\scripts.cpp" />
@@ -298,6 +305,7 @@
     <ClCompile Include="treediff\TreeNode.cpp" />
     <ClCompile Include="treediff\TreeReader.cpp" />
     <ClCompile Include="verify_hashes.cpp" />
+    <ClCompile Include="WebSocketConnector.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\common\adler32.h" />
@@ -331,6 +339,7 @@
     <ClInclude Include="..\urbackupcommon\SparseFile.h" />
     <ClInclude Include="..\urbackupcommon\TreeHash.h" />
     <ClInclude Include="..\urbackupcommon\WalCheckpointThread.h" />
+    <ClInclude Include="..\urbackupcommon\WebSocketPipe.h" />
     <ClInclude Include="action_header.h" />
     <ClInclude Include="actions.h" />
     <ClInclude Include="Alerts.h" />
@@ -365,11 +374,13 @@
     <ClInclude Include="lmdb\lmdb.h" />
     <ClInclude Include="lmdb\midl.h" />
     <ClInclude Include="LMDBFileIndex.h" />
+    <ClInclude Include="LocalBackup.h" />
     <ClInclude Include="LogReport.h" />
     <ClInclude Include="Mailer.h" />
     <ClInclude Include="PhashLoad.h" />
     <ClInclude Include="restore_client.h" />
     <ClInclude Include="server.h" />
+    <ClInclude Include="ServerDownloadThreadGroup.h" />
     <ClInclude Include="serverinterface\actions.h" />
     <ClInclude Include="serverinterface\action_header.h" />
     <ClInclude Include="serverinterface\backups.h" />
@@ -400,6 +411,7 @@
     <ClInclude Include="treediff\TreeNode.h" />
     <ClInclude Include="treediff\TreeReader.h" />
     <ClInclude Include="server_status.h" />
+    <ClInclude Include="WebSocketConnector.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

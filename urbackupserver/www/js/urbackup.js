@@ -5,7 +5,7 @@ g.startup=true;
 g.no_tab_mouse_click=false;
 g.tabberidx=-1;
 g.progress_stop_id=-1;
-g.current_version=2004000000;
+g.current_version=2005001300;
 g.status_show_all=false;
 g.ldap_login=false;
 g.datatable_default_config={};
@@ -32,7 +32,7 @@ g.languages=[
 				{ l: "Svensk", s: "sv" },
 				{ l: "Română", s: "ro" },
 				{ l: "Suomi", s: "fi" },
-				{ l: "Polskie", s: "pl" }
+				{ l: "Polski", s: "pl" }
 			];
 
 g.languages.sort(function (a,b) { if(a.l>b.l) return 1; if(a.l<b.l) return -1; return 0; } );	
@@ -491,6 +491,22 @@ function makeTimeSpanNegative(ts)
 	return ret;
 }
 
+function getParValue(p, val)
+{
+	if(p=="update_freq_incr"){ val=multiplyTimeSpan(val, 60.0*60.0); }
+	if(p=="update_freq_full" || p=="update_freq_image_full" || p=="update_freq_image_incr")
+		{ val=multiplyTimeSpan(val, 60.0*60.0*24.0); }
+	if(p=="startup_backup_delay") val*=60;
+	if(p=="local_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, (1024*1024)/8, true); }
+	if(p=="internet_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, 1024/8, true); }
+	if(p=="global_local_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, (1024*1024)/8, true); }
+	if(p=="global_internet_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, 1024/8, true); }
+	if(p=="update_stats_cachesize") val=Math.round(val*1024);
+	if(p=="internet_file_dataplan_limit" || p=="internet_image_dataplan_limit") val=Math.round(val*1024*1024);
+
+	return val;
+}
+
 function getPar(p)
 {
 	var obj=I(p);
@@ -499,21 +515,9 @@ function getPar(p)
 	{
 		return "&"+p+"="+(obj.checked?"true":"false");
 	}
-	var val=obj.value;
-	if(p=="update_freq_incr"){ val=multiplyTimeSpan(val, 60.0*60.0); if(obj.disabled) val=makeTimeSpanNegative(val); }
-	if(p=="update_freq_full" || p=="update_freq_image_full" || p=="update_freq_image_incr")
-		{ val=multiplyTimeSpan(val, 60.0*60.0*24.0); if(obj.disabled) val=makeTimeSpanNegative(val); }
-	if(p=="startup_backup_delay") val*=60;
-	if(p=="local_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, (1024*1024)/8, true); }
-	if(p=="internet_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, 1024/8, true); }
-	if(p=="global_local_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, (1024*1024)/8, true); }
-	if(p=="global_internet_speed") { if(val=="-" || val=="") val=0; else val=multiplyTimeSpan(val, 1024/8, true); }
-	if(p=="update_stats_cachesize") val=Math.round(val*1024);
-	if(p=="internet_file_dataplan_limit" || p=="internet_image_dataplan_limit") val=Math.round(val*1024*1024);
-		
+	var val = getParValue(p, obj.value);
 	return "&"+p+"="+encodeURIComponent(val+"");
 }
-
 
 function show_progress1(stop_backup)
 {
@@ -1037,6 +1041,7 @@ g.status_action_add_internetclient=2;
 g.status_action_stop_show=3;
 g.status_action_reset_error=4;
 g.status_action_stop_show_new_version=5;
+g.status_action_reset_client_uid=6;
 function show_status1(hostname, action, remove_client, stop_client_remove)
 {
 	if(!startLoading()) return;
@@ -1075,6 +1080,10 @@ function show_status1(hostname, action, remove_client, stop_client_remove)
 		else if(action==g.status_action_stop_show_new_version)
 		{
 			pars+="stop_show_version="+hostname;
+		}
+		else if(action==g.status_action_reset_client_uid)
+		{
+			pars+="reset_client_uid="+hostname;
 		}
 	}
 	else if(remove_client && remove_client.length>0)
@@ -1138,6 +1147,30 @@ function show_status_check2(data)
 				ext_text+="<br>MS-DOS 8.3 compatibility names are created on the backup storage. This can lead to problems. You can disable 8.3 name generation by runnning <br>"
 					+ "<code><pre>fsutil 8dot3name set "+data.dir_error_volume+" 1</pre></code><br>as administrator. UrBackup will stop showing this error after you run this command.";
 			}
+			else if(data.dir_error_hint=="err_file_system_case_insensitive")
+			{
+				ext_text+="<br>UrBackup Server is running on a operating system where file systems are usually case sensitive. Work-arounds for UrBackup to work with case insensitive backup storage are disabled."
+					+"The backup storage is case insensitive, however. This might cause issues.";
+			}
+			else if(data.dir_error_hint=="err_file_system_special_windows_files_disallowed")
+			{
+				ext_text+="<br>UrBackup Server has trouble storing files named 'CON' to backup storage. When running on Windows UrBackup Server has work-arounds to avoid storing such files. "
+					"Those work-arounds are disabled when not running on Windows, however. So if a client has files named like this, there might be issues with backups.";
+			}
+			else if(data.dir_error_hint=="err_long_create_failed")
+			{
+				var max_path_str="";
+				if(data.max_path_str)
+					max_path_str = " "+ data.max_path_str;
+				ext_text+="<br>UrBackup Server has trouble storing files to backup storage with the maximum file name length it was compiled with"+max_path_str+
+					". There might be issues when backing up files/folders with long file name.";
+			}
+			else if(data.dir_error_hint=="err_btrfs_backupfolder_differs")
+			{
+				ext_text+="<br>Backup folder configured for btrfs (suid helper) at /etc/urbackup/backupfolder ("+data.btrfs_backupfolder
+					+") differs from backup folder configured for UrBackup (Settings -> General, "+data.urbackup_backupfolder+") " +
+					"This can lead to issues.";
+			}
 			else
 			{
 				ext_text+="<br>"+data.dir_error_hint;
@@ -1146,7 +1179,11 @@ function show_status_check2(data)
 		
 		if( data.dir_error_ext
 			&& (data.dir_error_ext=="err_cannot_create_symbolic_links"
-				|| data.dir_error_ext=="dos_names_created") )
+				|| data.dir_error_ext=="dos_names_created"
+				|| data.dir_error_ext=="err_file_system_case_insensitive"
+				|| data.dir_error_ext=="err_file_system_special_windows_files_disallowed"
+				|| data.dir_error_ext=="err_long_create_failed"
+				|| data.dir_error_ext=="err_btrfs_backupfolder_differs") )
 		{
 			generic_text=false;
 		}
@@ -1214,9 +1251,7 @@ function show_status2(data)
 			obj.file_ok_t=trans("no_recent_backup");
 		}
 		
-		if(obj.os_simple
-			&& obj.os_simple.length>0
-			&& obj.os_simple!="windows")
+		if(obj.image_not_supported)
 		{
 			obj.image_style="";
 			obj.image_ok_t=trans("not_supported");
@@ -1319,7 +1354,15 @@ function show_status2(data)
 			case 11: obj.status=trans("ident_err")+" <a href=\"help.htm#ident_err\" target=\"_blank\">?</a>"; obj.online_add_status=true; break;
 			case 12: obj.status=trans("too_many_clients_err"); obj.online_add_status=true; break;
 			case 13: obj.status=trans("authentication_err"); obj.online_add_status=true; break;
-			default: obj.status="&nbsp;"
+			case 14:
+				obj.status=trans("uid_changed_err"); obj.online_add_status=true;
+				if(obj.uid && obj.uid.length>0)
+					obj.reset_client_uid=true;
+				break;
+			case 15: obj.status=trans("authenticating"); break;
+			case 16: obj.status=trans("exchanging_settings"); break;
+			case 17: obj.status=trans("client_starting_up"); break;
+			default: obj.status="&nbsp;";
 		}
 		
 		if(data.allow_modify_clients)
@@ -1474,11 +1517,11 @@ function show_status2(data)
 		var client_download_data=build_client_download_select(data.client_downloads);
 		status_client_download_windows=dustRender("status_client_download", {download_clients: client_download_data, os: "windows", os_windows: true});
 		status_client_download_linux=dustRender("status_client_download", {download_clients: client_download_data, os: "linux", os_linux: true});
-		status_client_download_mac=dustRender("status_client_download", {download_clients: client_download_data, os: "mac", os_mac: true});
 		has_client_download=true;
 	}
 	
 	g.server_identity = data.server_identity;
+	g.server_pubkey = data.server_pubkey;
 	
 	ndata=dustRender("status_detail", {rows: rows, ses: g.session,
 		nospc_stalled: nospc_stalled, nospc_fatal: nospc_fatal, endian_info: endian_info,
@@ -1486,7 +1529,7 @@ function show_status2(data)
 		show_select_box: show_select_box,
 		server_identity: data.server_identity, modify_clients: modify_clients,
 		dlt_mod_start: dlt_mod_start, dlt_mod_end: dlt_mod_end, internet_client_added: data.added_new_client, new_authkey: data.new_authkey, new_clientname: data.new_clientname,
-		status_client_download_windows: status_client_download_windows, status_client_download_linux: status_client_download_linux, status_client_download_mac: status_client_download_mac,
+		status_client_download_windows: status_client_download_windows, status_client_download_linux: status_client_download_linux,
 		database_error: database_error, removed_clients_table: removed_clients.length>0, removed_clients: removed_clients,
 		has_client_download: has_client_download, allow_add_client:allow_add_client});
 	
@@ -1708,15 +1751,29 @@ g.checkForNewVersion = function(curr_version_num, curr_version_str)
 	}
 }
 
-function downloadClientURL(clientid, authkey, os)
+function getSiteURL()
 {
 	var site_url = location.protocol+'//'+location.host+location.pathname;
+
+	if(site_url.endsWith("index.htm"))
+	{
+		site_url = site_url.slice(0, -9);
+	}
+	else if(site_url.endsWith("index.html"))
+	{
+		site_url = site_url.slice(0, -10);	
+	}
 	
 	if(site_url.substr(site_url.length-1)!="/")
 	{
 		site_url+="/";
 	}
 
+	return site_url;
+}
+
+function downloadClientURL(clientid, authkey, os)
+{
 	if(authkey)
 	{
 		authkey = "&authkey="+encodeURIComponent(authkey);
@@ -1727,7 +1784,7 @@ function downloadClientURL(clientid, authkey, os)
 	}
 	var ses = g.session;
 	g.session=null;
-	var ret = site_url + getURL("download_client", "clientid="+clientid+authkey+"&os="+os);
+	var ret = getSiteURL() + getURL("download_client", "clientid="+clientid+authkey+"&os="+os);
 	g.session = ses;
 	return ret;
 }
@@ -1862,6 +1919,12 @@ function prepareBackupObj(data, obj, image)
 	
 	if(image && obj.id<0)
 		obj.id*=-1;
+
+	if(obj.deletion_protected)
+		obj.is_deletion_protected=true;
+
+	if(obj.delete_client_pending)
+		obj.can_delete=false;
 	
 	return obj;
 }
@@ -2273,6 +2336,13 @@ function show_backups2(data)
 		g.data_f=ndata;
 	}
 }
+function allowNewClient(clientid)
+{
+	if(confirm(trans("confirm_allow_new_client")))
+	{
+		show_status1(""+clientid, g.status_action_reset_client_uid);
+	}
+}
 function tabMouseOver(obj)
 {
 	g.mouse_over_styles=[];
@@ -2345,6 +2415,11 @@ function tabMouseClickFiles(clientid, backupid, path, mount)
 {
 	if(!startLoading()) return;
 	new getJSON("backups", "sa=files&clientid="+clientid+"&backupid="+backupid+"&path="+path.replace(/\//g,"%2F")+(mount?"&mount=1":""), show_backups2);
+}
+function tabMouseClickLinuxImageRestore(clientid, backupid)
+{
+	if(!startLoading()) return;
+	new getJSON("restore_image", "backupid="+backupid, linux_image_restore1);
 }
 function tabMouseClickFilesDL(clientid, backupid, path)
 {
@@ -2570,7 +2645,7 @@ function build_alert_params(alert_script)
 	
 	return {"options": script_options, "params": params_html};
 }
-function update_alert_params()
+function update_alert_params(nochange)
 {
 	var p = {};
 	for(var i=0;i<g.alert_params.length;++i)
@@ -2595,7 +2670,9 @@ function update_alert_params()
 			}
 		}
 	}
-	I("alert_params").value = $.param(p);
+	g.alert_params = $.param(p);
+	if(!nochange)
+		settingChangeKey("alert_params");
 }
 function update_alert_unit(name)
 {
@@ -2641,6 +2718,468 @@ function show_settings1()
 	g.settings_nav_pos=-1;
 	build_main_nav();
 	I('nav_pos').innerHTML="";
+}
+function getVal(val)
+{
+	if(typeof val.use=="undefined")
+	{
+		if(typeof val.value!="undefined")
+			return val.value;
+
+		if(typeof val!="object")
+			return val;
+		
+		return "";
+	}
+
+	if(val.use==1)
+	{
+		return val.value_group;
+	}
+	else if(val.use==2)
+	{
+		return val.value;
+	}
+	else if(val.use==4)
+	{
+		return val.value_client;
+	}
+	else
+	{
+		return val.value;
+	}
+}
+function getCurrentSettings(settings)
+{
+	var new_settings = {};
+	for (var key in settings)
+	{
+		if (!settings.hasOwnProperty(key))
+		{
+			continue;
+		}
+
+		if(key=="alert_scripts")
+		{
+			new_settings[key]=settings[key];
+			continue;	
+		}
+
+		var val = getVal(settings[key]);
+
+		if(typeof val == "boolean")
+		{
+			val = getCheckboxValue(val);
+		}
+
+		new_settings[key]=val;
+	}
+	return new_settings;
+}
+function unescapeCurrentSettings(settings)
+{
+	for (var key in settings) {
+		if (!settings.hasOwnProperty(key)) {
+			continue;
+		}
+
+		var setting = settings[key];
+
+		if(typeof setting!="object")
+			continue;
+
+		if(typeof setting.value == "string")
+			setting.value = unescapeHTML(setting.value);
+		if(typeof setting.value_client == "string")
+			setting.value_client = unescapeHTML(setting.value_client);
+		if(typeof setting.value_group == "string")
+			setting.value_group = unescapeHTML(setting.value_group);
+	}
+}
+function settingSwitch()
+{
+	var key = $(this).attr("id");
+
+	if(key.indexOf("_btn")==key.length-4)
+	{
+		key = key.substr(0, key.length-4);
+	}
+
+	if(key=="backup_window")
+		key="backup_window_incr_file";
+
+	var use = g.curr_settings[key].use;
+
+	if(use==1)
+		use=2;
+	else if(use==2)
+		use=4;
+	else if(use==4)
+		use=3;
+	else
+	{
+		if(typeof g.curr_settings[key].orig_html!="undefined")
+		{
+			I(key+"_div").innerHTML = g.curr_settings[key].orig_html;
+		}
+		use=1;
+	}
+
+	if($.inArray(key, g.client_settings_list)==-1
+		&& use==4 && $.inArray(key, g.mergable_settings_list)!=-1)
+		use=3;
+	else if($.inArray(key, g.client_settings_list)==-1
+		&& use>2)
+		use=1;
+	if($.inArray(key, g.mergable_settings_list)==-1
+		&& (use==3 || use>4))
+		use=1;
+
+	if(use==2 &&
+		typeof g.curr_settings[key].value == "undefined")
+	{
+		g.curr_settings[key].value = getVal(g.curr_settings[key])
+	}
+
+	g.curr_settings[key].use=use;
+
+	renderSettingSwitch(key);
+
+	if(!I(key+"_group"))
+	{
+		var val = getVal(g.curr_settings[key]);
+
+		if(typeof val == "boolean")
+		{
+			I(key).checked = val;
+		}
+		else
+		{
+			if(key=="archive")
+			{
+				renderArchiveSettings(g.curr_settings_type==0);
+			}
+			else
+			{
+				I(key).value = renderSettingValue(key, val);
+			}
+
+			if(key=="alert_script")
+			{
+				updateAlertScriptParams();
+			}
+
+			if(I(key+"_disable"))
+			{
+				I(key+"_disable").checked=false;
+				settingsCheckboxHandle(key);
+			}
+		}
+	}
+	else
+	{
+		I(key).value = g.curr_settings[key].value;
+
+		if(typeof g.curr_settings[key].value_client != "undefined")
+			I(key+"_client").value = g.curr_settings[key].value_client;
+			
+		I(key+"_group").value = g.curr_settings[key].value_group;
+	}
+}
+function renderSettingValue(key, val)
+{
+	if(key=="update_freq_incr") return multiplyTimeSpan(val, 1/(60.0*60.0));
+	if(key=="update_freq_full") return multiplyTimeSpan(val, 1/(60.0*60.0*24.0));
+	if(key=="update_freq_image_incr") return multiplyTimeSpan(val, 1/(60.0*60.0*24.0));
+	if(key=="update_freq_image_full") return multiplyTimeSpan(val, 1/(60.0*60.0*24.0));
+	if(key=="startup_backup_delay") return val/60;
+	if(key=="local_speed" || key=="internet_speed"
+		|| key=="global_local_speed" || key=="global_internet_speed")
+	{
+		if(val=="0" || val=="-1") return "-";
+		var mult;
+		if(key=="local_speed") mult=(1024*1024)/8;
+		if(key=="internet_speed") mult=(1024)/8;
+		if(key=="global_local_speed") mult=(1024*1024)/8;
+		if(key=="global_internet_speed") mult=(1024)/8;
+		return multiplyTimeSpan(val, 1/mult, true);
+	}
+
+	if(key=="file_hash_collect_cachesize") return val/1024;
+	if(key=="update_stats_cachesize") return val/1024;
+	if(key=="internet_file_dataplan_limit") return val/(1024*1024);
+	if(key=="internet_image_dataplan_limit") return val/(1024*1024);
+	
+	return val;
+}
+function settingChangeKey(key)
+{
+	if(key=="backup_window")
+		key="backup_window_incr_file";
+
+	var use = g.curr_settings[key].use;
+
+	if(use==1 || use==4)
+	{
+		use=2;
+		g.curr_settings[key].use = use;
+		renderSettingSwitch(key);
+	}
+
+	if(typeof use=="undefined"
+		|| (use&2)>0)
+	{
+		if(typeof use=="undefined")
+		{
+			g.curr_settings[key] = {use: 2, value: g.curr_settings[key]};
+		}
+
+		if(key=="alert_params")
+		{
+			g.curr_settings[key].value = g.alert_params;
+		}
+		else if($("#"+key).attr("type")=="checkbox")
+		{
+			g.curr_settings[key].value=I(key).checked ? "true" : "false";
+		}
+		else
+		{
+			g.curr_settings[key].value = getParValue(key, I(key).value);
+		}
+		
+		if(I(key+"_disable")
+			&& I(key+"_disable").checked)
+		{
+			g.curr_settings[key].value = makeTimeSpanNegative(g.curr_settings[key].value);
+		}
+	}
+}
+function settingChange(p_key)
+{
+	key = $(this).attr("id");
+	
+	settingChangeKey(key);
+}
+function renderSettingSwitch(key)
+{
+	var val;
+	if(key=="backup_window")
+	{
+		val = g.curr_settings["backup_window_incr_file"];
+	}
+	else
+	{
+		val = g.curr_settings[key];
+	}
+
+	if(typeof val=="undefined")
+		return;
+		
+	if(typeof val.use=="undefined")
+	{
+		$("#"+key).change(settingChange);
+		$("#"+key).keyup(settingChange);
+		return;
+	}
+
+	if(I(key+"_sw"))
+	{
+		if(val.use==1)
+		{
+			I(key+"_sw").innerHTML = '<button type="button" class="btn btn-default" title="Using setting from group" id="'+key+"_btn"+'">'+
+						'<span class="glyphicon glyphicon-lock" aria-hidden="true"></span>&nbsp;'+
+						'</button>';
+		}
+		else if(val.use==2)
+		{
+			I(key+"_sw").innerHTML = '<button type="button" class="btn btn-default" title="Using setting configured here" id="'+key+"_btn"+'">'+
+						'<span class="glyphicon glyphicon-home" aria-hidden="true"></span>&nbsp;'+
+						'</button>';
+		}
+		else if(val.use==4)
+		{
+			I(key+"_sw").innerHTML = '<button type="button" class="btn btn-default" title="Using setting configured on client" id="'+key+"_btn"+'">'+
+						'<span class="glyphicon glyphicon-road" aria-hidden="true"></span>&nbsp;'+
+						'</button>';
+		}
+		else
+		{
+			I(key+"_sw").innerHTML = '<button type="button" class="btn btn-default" title="Using combination of setting sources" id="'+key+"_btn"+'">'+
+						'<span class="glyphicon glyphicon-duplicate" aria-hidden="true"></span>&nbsp;'+
+						'</button>';
+			renderMergeSetting(key);
+		}
+	}
+
+	if(I(key+"_btn"))
+		$("#"+key+"_btn").click(settingSwitch);
+	
+	$("#"+key).change(settingChange);
+	$("#"+key).keyup(settingChange);
+}
+function mergeSettingSwitch()
+{
+	var key = $(this).attr("id");
+
+	var idx = key.indexOf("_check_");
+	key = key.substr(0, idx);
+	
+	if(!$(this).checked)
+	{
+		var ids = [key+"_check_group",
+					key+"_check_home",
+					key+"_check_client"];
+
+		var num_checked=0;
+
+		for(var i=0;i<ids.length;++i)
+		{
+			if(I(ids[i]) && I(ids[i]).checked)
+				num_checked+=1;
+		}
+
+		if(num_checked==1)
+		{
+			for(var i=0;i<ids.length;++i)
+			{
+				if(!I(ids[i]).checked
+					&& I(ids[i]).checked
+					&& ids[i]!=$(this).attr("id"))
+				{
+					$("#"+ids[i]).prop("checked", true).change();
+				}
+			}
+		}
+	}
+
+	mergeSettingUpdateUse(key);
+}
+function mergeSettingUpdateUse(key)
+{
+	var use=0;
+	if(I(key+"_check_group").checked)
+	{
+		use=use|1;
+	}
+	if(I(key+"_check_home").checked)
+	{
+		use=use|2;
+	}
+	if(I(key+"_check_client") &&
+		I(key+"_check_client").checked)
+	{
+		use=use|4;
+	}
+	g.curr_settings[key].use=use;
+}
+function renderMergeSetting(key)
+{
+	if(key=="archive")
+		return;
+
+	var val = g.curr_settings[key];
+
+	var c='<div class="input-group">';
+	c+='<input type="text" class="form-control" id="'+key+'_group" value="'+escapeHTMLDoubleQuote(val.value_group)+'" disabled="disabled"/>';
+	c+='<div class="checkbox input-group-addon"><input class="input-group-addon" type="checkbox" id="'+key+'_check_group" checked data-toggle="toggle" data-size="mini" data-on="<span class=\'move_left glyphicon glyphicon-lock\'></span> Group" data-off="<span class=\'glyphicon glyphicon-remove\'></span> Group"></input></div>';
+	c+='</div>';
+
+	c+='<div class="input-group">';
+	c+='<input type="text" class="form-control" id="'+key+'" value="'+escapeHTMLDoubleQuote(val.value)+'"/>';
+	c+='<div class="checkbox input-group-addon"><input class="input-group-addon" type="checkbox" id="'+key+'_check_home" checked data-toggle="toggle" data-size="mini" data-on="<span class=\'glyphicon glyphicon-home move_left\'></span> Here" data-off="<span class=\'glyphicon glyphicon-remove\'></span> Here"></input></div>';
+	c+='</div>';
+
+	if(typeof val.value_client != "undefined")
+	{
+		c+='<div class="input-group">';
+		c+='<input type="text" class="form-control" id="'+key+'_client" value="'+escapeHTMLDoubleQuote(val.value_client)+'" disabled="disabled"/>';
+		c+='<div class="checkbox input-group-addon"><input class="input-group-addon" type="checkbox" id="'+key+'_check_client" checked data-toggle="toggle" data-size="mini" data-on="<span class=\'glyphicon glyphicon-road move_left\'></span> Client" data-off="<span class=\'glyphicon glyphicon-remove\'></span> Client"></input></div>';
+		c+='</div>';
+	}
+	/*
+	c+='<div class="input-group">';
+	c+='<input type="checkbox" id="'+key+'_check_home" checked data-toggle="toggle" data-on="<i class=\'glyphicon glyphicon-home\'></i> Here" data-off="<i class=\'glyphicon glyphicon-remove\'></i> Ignore"></input>';
+	c+='<input type="text" class="form-control" id="exclude_files" value="'+escapeHTMLDoubleQuote(val.value_group)+'"/>';
+	c+='</div>';
+
+	c+='<div class="input-group">';
+	c+='<input type="checkbox" id="'+key+'_check_client" checked data-toggle="toggle" data-on="<i class=\'glyphicon glyphicon-home\'></i> Client" data-off="<i class=\'glyphicon glyphicon-remove\'></i> Ignore"></input>';
+	c+='<input type="text" class="form-control" id="exclude_files" value="'+escapeHTMLDoubleQuote(val.value_group)+'" disabled="disabled"/>';
+	c+='</div>';*/
+
+	/*var c='<div class="col-sm-6">'+
+	'<div class="input-group">'+
+	'	<input type="text" class="form-control" id="exclude_files" value="{exclude_files|s}"/>'+
+	'	<div class="input-group-addon"><a href="help.htm#exclude_files" target="_blank">?</a></div>'+
+	'</div>'+
+	'</div>';*/
+
+	g.curr_settings[key].orig_html=I(key+"_div").innerHTML;
+	I(key+"_div").innerHTML=c;
+
+	renderMergeSettingSwitch(key);
+
+	$("#"+key+"_check_group").change(mergeSettingSwitch);
+	$("#"+key+"_check_home").change(mergeSettingSwitch);
+	if(typeof val.value_client != "undefined")
+	{
+		$("#"+key+"_check_client").change(mergeSettingSwitch);
+	}
+
+	$("#"+key+"_check_group").bootstrapToggle();
+	$("#"+key+"_check_home").bootstrapToggle();
+	if(typeof val.value_client != "undefined")
+	{
+		$("#"+key+"_check_client").bootstrapToggle();
+	}
+}
+function renderMergeSettingSwitch(key)
+{
+	var val = g.curr_settings[key];
+
+	var use = val.use;
+
+	if(use&1)
+	{
+		I(key+"_check_group").checked=true;
+	}
+	else
+	{
+		I(key+"_check_group").checked=false;
+	}
+
+	if(use&2)
+	{
+		I(key+"_check_home").checked=true;
+	}
+	else
+	{
+		I(key+"_check_home").checked=false;
+	}
+
+	if(I(key+"_check_client"))
+	{
+		if(use&4)
+		{
+			I(key+"_check_client").checked=true;
+		}
+		else
+		{
+			I(key+"_check_client").checked=false;
+		}
+	}
+}
+function renderSettingSwitchAll()
+{
+	for(var i=0;i<g.settings_list.length;++i)
+	{
+		renderSettingSwitch(g.settings_list[i]);
+	}
+
+	if(I("backup_window_sw"))
+	{
+		renderSettingSwitch("backup_window");
+	}
 }
 function show_settings2(data)
 {
@@ -2910,45 +3449,26 @@ function show_settings2(data)
 	{
 		if(data.sa=="general")
 		{
-			data.settings.no_images=getCheckboxValue(data.settings.no_images);
-			data.settings.no_file_backups=getCheckboxValue(data.settings.no_file_backups);
-			data.settings.allow_overwrite=getCheckboxValue(data.settings.allow_overwrite);
-			data.settings.autoshutdown=getCheckboxValue(data.settings.autoshutdown);
-			data.settings.download_client=getCheckboxValue(data.settings.download_client);
-			data.settings.autoupdate_clients=getCheckboxValue(data.settings.autoupdate_clients);
-			data.settings.show_server_updates=getCheckboxValue(data.settings.show_server_updates);
-			data.settings.backup_database=getCheckboxValue(data.settings.backup_database);
-			data.settings.use_tmpfiles=getCheckboxValue(data.settings.use_tmpfiles);
-			data.settings.use_tmpfiles_images=getCheckboxValue(data.settings.use_tmpfiles_images);
-			data.settings.use_incremental_symlinks=getCheckboxValue(data.settings.use_incremental_symlinks);
-			
-			data.settings.allow_config_paths=getCheckboxValue(data.settings.allow_config_paths);
-			data.settings.allow_starting_full_file_backups=getCheckboxValue(data.settings.allow_starting_full_file_backups);
-			data.settings.allow_starting_incr_file_backups=getCheckboxValue(data.settings.allow_starting_incr_file_backups);
-			data.settings.allow_starting_full_image_backups=getCheckboxValue(data.settings.allow_starting_full_image_backups);
-			data.settings.allow_starting_incr_image_backups=getCheckboxValue(data.settings.allow_starting_incr_image_backups);
-			data.settings.allow_pause=getCheckboxValue(data.settings.allow_pause);
-			data.settings.allow_log_view=getCheckboxValue(data.settings.allow_log_view);
-			data.settings.allow_tray_exit=getCheckboxValue(data.settings.allow_tray_exit);
-			data.settings.allow_file_restore=getCheckboxValue(data.settings.allow_file_restore);
-			data.settings.allow_component_restore=getCheckboxValue(data.settings.allow_component_restore);
-			data.settings.allow_component_config=getCheckboxValue(data.settings.allow_component_config);
-			
-			data.settings.internet_full_file_backups=getCheckboxValue(data.settings.internet_full_file_backups);
-			data.settings.internet_image_backups=getCheckboxValue(data.settings.internet_image_backups);
-			data.settings.internet_mode_enabled=getCheckboxValue(data.settings.internet_mode_enabled);
-			data.settings.internet_encrypt=getCheckboxValue(data.settings.internet_encrypt);
-			data.settings.internet_compress=getCheckboxValue(data.settings.internet_compress);
-			data.settings.silent_update=getCheckboxValue(data.settings.silent_update);
-			data.settings.end_to_end_file_backup_verification=getCheckboxValue(data.settings.end_to_end_file_backup_verification);
-			data.settings.internet_calculate_filehashes_on_client=getCheckboxValue(data.settings.internet_calculate_filehashes_on_client);
-			data.settings.internet_parallel_file_hashing=getCheckboxValue(data.settings.internet_parallel_file_hashing);			
-			data.settings.internet_connect_always=getCheckboxValue(data.settings.internet_connect_always);
-			data.settings.verify_using_client_hashes=getCheckboxValue(data.settings.verify_using_client_hashes);
-			data.settings.internet_readd_file_entries=getCheckboxValue(data.settings.internet_readd_file_entries);
-			data.settings.background_backups=getCheckboxValue(data.settings.background_backups);
-			data.settings.create_linked_user_views=getCheckboxValue(data.settings.create_linked_user_views);
-			data.settings.ignore_disk_errors=getCheckboxValue(data.settings.ignore_disk_errors);
+			g.curr_settings = data.settings;
+			data.settings = getCurrentSettings(data.settings);
+			data.settings.backup_dirs_optional=getCheckboxValue(data.settings.backup_dirs_optional);
+			data.settings.pause_if_windows_unlocked = getCheckboxValue(data.settings.pause_if_windows_unlocked);
+			var internet_server = unescapeHTML(data.settings.internet_server);
+			if(internet_server.indexOf("ws://")!=0 &&
+				internet_server.indexOf("wss://")!=0 &&
+				internet_server.indexOf("urbackup://")!=0 )
+			{
+				if(data.settings.internet_server_port==55415)
+				{
+					internet_server = "urbackup://" + internet_server;
+				}
+				else
+				{
+					internet_server = "urbackup://" + internet_server + ":" + data.settings.internet_server_port;
+				}
+			}
+
+			data.settings.internet_server = internet_server;
 			
 			var transfer_mode_params1=["raw", "hashed"];
 			var transfer_mode_params2=["raw", "hashed", "blockhash"];
@@ -2968,7 +3488,7 @@ function show_settings2(data)
 			data.settings=addSelectSelected(full_image_style_params, "local_full_image_style", data.settings);
 			data.settings=addSelectSelected(full_image_style_params, "internet_full_image_style", data.settings);
 			
-			var image_file_format_params = ["vhdz", "vhd"];
+			var image_file_format_params = ["vhdz", "vhd", "vhdxz", "vhdx"];
 			if(data.cowraw_available)
 			{
 				data.settings.cowraw_available=true;
@@ -2997,8 +3517,7 @@ function show_settings2(data)
 			
 			data.settings.internet_file_dataplan_limit/=1024*1024;
 			data.settings.internet_image_dataplan_limit/=1024*1024;
-			data.settings.update_dataplan_db=getCheckboxValue(data.settings.update_dataplan_db);
-			
+		
 			data.settings.no_compname_start="<!--";
 			data.settings.no_compname_end="-->";
 			
@@ -3008,6 +3527,7 @@ function show_settings2(data)
 			data.settings.main_client = true;
 			data.settings.global_settings=true;
 			data.settings.archive_global=true;
+			g.curr_settings_type = 0;
 			
 			data.settings.client_plural="s";
 			
@@ -3049,50 +3569,12 @@ function show_settings2(data)
 		else if(data.sa=="clientsettings")
 		{
 			is_group = typeof data.settings.groupid === "undefined" ? false : true;
-			
-			if( is_group || (data.settings.allow_overwrite==true
-				&& data.settings.overwrite==true
-				&& data.settings.client_set_settings==true ) )
-			{
-				data.settings.overwrite_warning_start="";
-				data.settings.overwrite_warning_end="";
-			}
-			else
-			{
-				data.settings.overwrite_warning_start="<!--";
-				data.settings.overwrite_warning_end="-->";
-			}
-			
-			data.settings.overwrite=getCheckboxValue(is_group || data.settings.overwrite);
-			data.settings.allow_overwrite=getCheckboxValue(data.settings.allow_overwrite);
-			data.settings.allow_config_paths=getCheckboxValue(data.settings.allow_config_paths);
-			data.settings.allow_starting_full_file_backups=getCheckboxValue(data.settings.allow_starting_full_file_backups);
-			data.settings.allow_starting_incr_file_backups=getCheckboxValue(data.settings.allow_starting_incr_file_backups);
-			data.settings.allow_starting_full_image_backups=getCheckboxValue(data.settings.allow_starting_full_image_backups);
-			data.settings.allow_starting_incr_image_backups=getCheckboxValue(data.settings.allow_starting_incr_image_backups);
-			data.settings.allow_pause=getCheckboxValue(data.settings.allow_pause);
-			data.settings.allow_log_view=getCheckboxValue(data.settings.allow_log_view);
-			data.settings.allow_tray_exit=getCheckboxValue(data.settings.allow_tray_exit);
-			data.settings.allow_file_restore=getCheckboxValue(data.settings.allow_file_restore);
-			data.settings.allow_component_restore=getCheckboxValue(data.settings.allow_component_restore);
-			data.settings.allow_component_config=getCheckboxValue(data.settings.allow_component_config);
-			
-			data.settings.internet_mode_enabled=getCheckboxValue(data.settings.internet_mode_enabled);
-			data.settings.internet_full_file_backups=getCheckboxValue(data.settings.internet_full_file_backups);
-			data.settings.internet_image_backups=getCheckboxValue(data.settings.internet_image_backups);
-			data.settings.internet_encrypt=getCheckboxValue(data.settings.internet_encrypt);
-			data.settings.internet_compress=getCheckboxValue(data.settings.internet_compress);
-			data.settings.silent_update=getCheckboxValue(data.settings.silent_update);
-			data.settings.end_to_end_file_backup_verification=getCheckboxValue(data.settings.end_to_end_file_backup_verification);
-			data.settings.internet_calculate_filehashes_on_client=getCheckboxValue(data.settings.internet_calculate_filehashes_on_client);
-			data.settings.internet_parallel_file_hashing=getCheckboxValue(data.settings.internet_parallel_file_hashing);			
-			data.settings.internet_connect_always=getCheckboxValue(data.settings.internet_connect_always);
-			data.settings.verify_using_client_hashes=getCheckboxValue(data.settings.verify_using_client_hashes);
-			data.settings.internet_readd_file_entries=getCheckboxValue(data.settings.internet_readd_file_entries);
-			data.settings.background_backups=getCheckboxValue(data.settings.background_backups);
-			data.settings.create_linked_user_views=getCheckboxValue(data.settings.create_linked_user_views);
-			data.settings.ignore_disk_errors=getCheckboxValue(data.settings.ignore_disk_errors);
-			
+
+			g.curr_settings = data.settings;
+			data.settings = getCurrentSettings(data.settings);
+			data.settings.backup_dirs_optional=getCheckboxValue(data.settings.backup_dirs_optional);
+			data.settings.pause_if_windows_unlocked = getCheckboxValue(data.settings.pause_if_windows_unlocked);
+					
 			var transfer_mode_params1=["raw", "hashed"];
 			var transfer_mode_params2=["raw", "hashed", "blockhash"];
 			
@@ -3103,7 +3585,7 @@ function show_settings2(data)
 			data.settings=addSelectSelected(transfer_mode_params1, "local_image_transfer_mode", data.settings);
 			data.settings=addSelectSelected(transfer_mode_params1, "internet_image_transfer_mode", data.settings);
 			
-			var image_file_format_params = ["vhdz", "vhd"];
+			var image_file_format_params = ["vhdz", "vhd", "vhdxz", "vhdx"];
 			if(data.cowraw_available)
 			{
 				data.settings.cowraw_available=true;
@@ -3187,11 +3669,13 @@ function show_settings2(data)
 				g.settings_group_changes=[];
 				
 				data.settings.main_client = true;
+				g.curr_settings_type = 1;
 			}
 			else
 			{
 				data.settings.client_settings=true;
 				data.settings.groups = data.navitems.groups;
+				g.curr_settings_type = 2;
 			}
 			
 			g.last_alert_params = data.settings.alert_params;
@@ -3221,6 +3705,8 @@ function show_settings2(data)
 			else data.settings.mail_ssl_only="";
 			if(data.settings.mail_check_certificate=="true") data.settings.mail_check_certificate="checked=\"checked\"";
 			else data.settings.mail_check_certificate="";
+			if(data.settings.mail_use_smtps=="true") data.settings.mail_use_smtps="checked=\"checked\"";
+			else data.settings.mail_use_smtps="";
 			
 			ndata+=dustRender("settings_mail", data.settings);
 			
@@ -3403,14 +3889,15 @@ function show_settings2(data)
 	
 	settingsCheckboxChange();
 	
-	if(data.sa && data.sa=="clientsettings"
-		&& typeof data.settings.groupid === "undefined")
-	{
-		updateUserOverwrite();
-	}
-	else if(data.sa && data.sa=="change_pw_int")
+	if(data.sa && data.sa=="change_pw_int")
 	{
 		changePW();
+	}
+
+	if(data.sa && (data.sa=="clientsettings" ||  data.sa=="general" ) )
+	{
+		unescapeCurrentSettings(g.curr_settings);
+		renderSettingSwitchAll();
 	}
 	
 	if(update_tabber && tabber_set_idx)
@@ -3421,14 +3908,8 @@ function show_settings2(data)
 	if(update_tabber && data.sa && (data.sa=="clientsettings" || data.sa=="general") )
 	{
 		g.archive_item_id=0;
-		
-		for(var i=0;i<data.archive_settings.length;++i)
-		{
-			var obj=data.archive_settings[i];
-			addArchiveItemInt(getTimelengthUnit(obj.archive_every, obj.archive_every_unit), obj.archive_every_unit,
-					getTimelengthUnit(obj.archive_for, obj.archive_for_unit), obj.archive_for_unit, obj.archive_backup_type, obj.next_archival, obj.archive_window, obj.archive_letters, obj.archive_timeleft, 
-					data.sa=="general" || is_group);
-		}
+		g.curr_archive_items = [];
+		renderArchiveSettings(data.sa=="general" || is_group);
 	}
 	
 	$('#settings_tabber').bind('click', function (e) {
@@ -3621,7 +4102,7 @@ function removeClientFromGroup()
 function settingsCheckboxHandle(cbid)
 {
 	if(!I(cbid)) return;
-	
+
 	if(I(cbid+'_disable').checked && I(cbid).disabled==false)
 	{
 		I(cbid).disabled=true;
@@ -3637,8 +4118,16 @@ function settingsCheckboxHandle(cbid)
 		I(cbid+'_disable').checked=true;
 	}
 }
-function settingsCheckboxChange()
+function settingsCheckboxChange(key)
 {
+	if(typeof key!="undefined"
+		&& key.indexOf("_disable")!=-1)
+	{
+		key=key.substr(0, key.indexOf("_disable"));
+		
+		settingChangeKey(key);
+	}
+
 	settingsCheckboxHandle('update_freq_incr');
 	settingsCheckboxHandle('update_freq_full');
 	settingsCheckboxHandle('update_freq_image_incr');
@@ -3660,6 +4149,7 @@ g.settings_list=[
 "max_image_full",
 "allow_overwrite",
 "startup_backup_delay",
+"pause_if_windows_unlocked",
 "backup_window_incr_file",
 "backup_window_full_file",
 "backup_window_incr_image",
@@ -3668,6 +4158,7 @@ g.settings_list=[
 "exclude_files",
 "include_files",
 "default_dirs",
+"backup_dirs_optional",
 "allow_config_paths",
 "allow_starting_full_file_backups",
 "allow_starting_incr_file_backups",
@@ -3721,7 +4212,20 @@ g.settings_list=[
 "internet_image_dataplan_limit",
 "update_dataplan_db",
 "alert_script",
-"alert_params"
+"alert_params",
+"archive",
+"client_settings_tray_access_pw",
+"local_encrypt",
+"local_compress",
+"download_threads",
+"hash_threads",
+"client_hash_threads",
+"image_compress_threads",
+"ransomware_canary_paths",
+"backup_dest_url",
+"backup_dest_params",
+"backup_dest_secret_params",
+"backup_unlocked_window"
 ];
 g.general_settings_list=[
 "backupfolder",
@@ -3744,7 +4248,8 @@ g.general_settings_list=[
 "use_incremental_symlinks",
 "show_server_updates",
 "server_url",
-"internet_expect_endpoint"
+"internet_expect_endpoint",
+"internet_server_bind_port"
 ];
 g.mail_settings_list=[
 "mail_servername",
@@ -3754,11 +4259,11 @@ g.mail_settings_list=[
 "mail_from",
 "mail_ssl_only",
 "mail_check_certificate",
+"mail_use_smtps",
 "mail_admin_addrs"
 ];
 g.internet_settings_list=[
 "internet_server",
-"internet_server_port",
 "internet_server_proxy"
 ];
 g.ldap_settings_list=[
@@ -3775,8 +4280,52 @@ g.ldap_settings_list=[
 "testusername",
 "testpassword"
 ];
+g.mergable_settings_list=[
+"virtual_clients",
+"exclude_files",
+"include_files",
+"default_dirs",
+"image_letters",
+"vss_select_components",
+"archive",
+"ransomware_canary_paths",
+"backup_dest_params",
+"backup_dest_secret_params"
+];
+g.client_settings_list=[
+"update_freq_incr",
+"update_freq_full",
+"update_freq_image_incr",
+"update_freq_image_full",
+"max_file_incr",
+"min_file_incr",
+"max_file_full",
+"min_file_full",
+"min_image_incr",
+"max_image_incr",
+"min_image_full",
+"max_image_full",
+"startup_backup_delay",
+"computername",
+"virtual_clients",
+"exclude_files",
+"include_files",
+"default_dirs",
+"image_letters",
+"internet_speeds",
+"local_speed",
+"internet_mode_enabled",
+"internet_full_file_backups",
+"internet_image_backups",
+"internet_compress",
+"internet_encrypt",
+"internet_connect_always",
+"vss_select_components",
+"local_compress",
+"local_encrypt"
+];
 
-g.time_span_regex = /^([\d.]*(@([mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]\-?[mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]?\s*[,]?\s*)+\/([0-9][0-9]?:?[0-9]?[0-9]?\-[0-9][0-9]?:?[0-9]?[0-9]?\s*[,]?\s*)+\s*)?[;]?)*$/i;
+g.time_span_regex = /^([-]?[\d.]*(@([mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]\-?[mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]?\s*[,]?\s*)+\/([0-9][0-9]?:?[0-9]?[0-9]?\-[0-9][0-9]?:?[0-9]?[0-9]?\s*[,]?\s*)+\s*)?[;]?)*$/i;
 g.time_span_speed_regex = /^([\d.]*[%]?(@([mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]\-?[mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]?\s*[,]?\s*)+\/([0-9][0-9]?:?[0-9]?[0-9]?\-[0-9][0-9]?:?[0-9]?[0-9]?\s*[,]?\s*)+\s*)?[;]?)*$/i;
 
 function validateCommonSettings()
@@ -3784,36 +4333,43 @@ function validateCommonSettings()
 	if(!validate_text_regex([{ id: "update_freq_incr", regexp: g.time_span_regex },
 							 { id: "update_freq_full", regexp: g.time_span_regex },
 							 { id: "update_freq_image_incr", regexp: g.time_span_regex },
-							 { id: "update_freq_image_full", regexp: g.time_span_regex } ]) ) return false;
+							 { id: "update_freq_image_full", regexp: g.time_span_regex } ],
+							 getSettingSaveVal) ) return false;
 	if(!validate_text_int(["max_file_incr", "min_file_incr", "max_file_full", 
 							"min_file_full", "max_image_incr", "min_image_incr", "max_image_full", "min_image_full",
-							"startup_backup_delay"] ) ) return false;
-	if(I('local_speed').value!="-" && !validate_text_regex({ id: "local_speed", regexp: g.time_span_speed_regex})) return false;
-	if(I('internet_speed') && I('internet_speed').value!="-" && I('internet_speed').value!="" && !validate_text_regex({id: "internet_speed", regexp: g.time_span_speed_regex })) return false;
+							"startup_backup_delay"], getSettingSaveVal) ) return false;
+	if(I('local_speed').value!="-" && !validate_text_regex({ id: "local_speed", regexp: g.time_span_speed_regex}, getSettingSaveVal)) return false;
+	if(I('internet_speed') && I('internet_speed').value!="-" && I('internet_speed').value!="" && !validate_text_regex({id: "internet_speed", regexp: g.time_span_speed_regex }, getSettingSaveVal)) return false;
 	var backup_window_regex = /^(([mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]\-?[mon|mo|tu|tue|tues|di|wed|mi|th|thu|thur|thurs|do|fri|fr|sat|sa|sun|so|1-7]?\s*[,]?\s*)+\/([0-9][0-9]?:?[0-9]?[0-9]?\-[0-9][0-9]?:?[0-9]?[0-9]?\s*[,]?\s*)+\s*[;]?\s*)*$/i;
 	if(!validate_text_regex([{ id: "backup_window_incr_file", errid: "backup_window", regexp: backup_window_regex },
 							 { id: "backup_window_full_file", errid: "backup_window", regexp: backup_window_regex },
 							 { id: "backup_window_incr_image", errid: "backup_window", regexp: backup_window_regex },
-							 { id: "backup_window_full_image", errid: "backup_window", regexp: backup_window_regex } ]) ) return false;
-	if(!validate_text_regex([{ id: "image_letters", regexp: /^(ALL)|(ALL_NONUSB)|(all)|(all_nonusb)|([A-Za-z][;,]?)*$/i }] ) ) return false;
+							 { id: "backup_window_full_image", errid: "backup_window", regexp: backup_window_regex } ], getSettingSaveVal) ) return false;
+	if(!validate_text_regex([{ id: "image_letters", regexp: /^(ALL)|(ALL_NONUSB)|(all)|(all_nonusb)|([A-Za-z][;,]?)*$/i }], getSettingSaveVal) ) return false;
 	if(!validate_alert_params()) return;
 	return true;
 }
-function getArchivePars()
+function getSettingSave(key)
 {
-	var pars="";
-	for(var i=0;i<g.archive_item_id;++i)
+	if( (key=="backup_window_incr_file"
+		|| key=="backup_window_full_file"
+		|| key=="backup_window_incr_image"
+		|| key=="backup_window_full_image" )
+		&& I("backup_window"))
 	{
-		pars+=getPar("archive_next_"+i);
-		pars+=getPar("archive_every_"+i);
-		pars+=getPar("archive_every_unit_"+i);
-		pars+=getPar("archive_for_"+i);
-		pars+=getPar("archive_for_unit_"+i);
-		pars+=getPar("archive_backup_type_"+i);
-		pars+=getPar("archive_window_"+i);
-		pars+=getPar("archive_letters_"+i);
+		key= "backup_window_incr_file";
 	}
-	return pars;
+	
+	if(typeof g.curr_settings[key].value!="undefined")
+		return g.curr_settings[key];
+	else if(typeof g.curr_settings[key].use!="undefined")
+		return {use: 2, value: ""};
+	else
+		return {use: 2, value: g.curr_settings[key]};		
+}
+function getSettingSaveVal(key)
+{
+	return getSettingSave(key).value;
 }
 function saveGeneralSettings()
 {
@@ -3836,10 +4392,9 @@ function saveGeneralSettings()
 	{
 		pars+=getPar(g.general_settings_list[i]);
 	}
-	pars+=getArchivePars();
 	for(var i=0;i<g.settings_list.length;++i)
 	{
-		pars+=getPar(g.settings_list[i]);
+		pars+="&"+g.settings_list[i]+"="+encodeURIComponent(getSettingSave(g.settings_list[i]).value);
 	}
 	new getJSON("settings", "sa=general_save"+pars+internet_pars, show_settings2);
 }
@@ -3866,15 +4421,59 @@ function saveLdapSettings()
 }
 function getInternetSettings()
 {	
-	if(!I('internet_server_port')) return "";
-	if(I('internet_server_port').value.indexOf(";")==-1 
-		&& !validate_text_int(["internet_server_port"]) ) return null;
-	if(!validate_text_regex([{ id: "internet_server", regexp: /(((;|^)(([\w-]+(\.[\w-]*)*)|((?!0)(?!.*\.)((1?\d?\d|25[0-5]|2[0-4]\d)(\.)){4})))+$)|(^$)/i }])) return null;
-	if(!validate_text_regex([{ id: "internet_server_proxy", regexp: /(^(http|https):\/\/[\w-]+([\w-]*)+([\w.,@?^=%&amp;:\/~+#-]*[\w@?^=%&amp;\/~+#-])?$)|(^$)/i }])) return null;
+	if(!I('internet_server')) return "";
+
+	var internet_servers = [I("internet_server").value];
+
+	if(internet_servers[0].indexOf(";")!=-1)
+	{
+		internet_servers = internet_servers[0].split(";");
+	}
+	
+	var internet_server_par = "";
+	var internet_server_port = 55415;
+	for(var i=0;i<internet_servers.length;++i)
+	{
+		var internet_server = internet_servers[i];
+
+		var server_regex = /(((;|^)(([\w-]+(\.[\w-]*)*)|((?!0)(?!.*\.)((1?\d?\d|25[0-5]|2[0-4]\d)(\.)){4})))+$)|(^$)|(^(ws|wss):\/\/[\w-]+([\w-]*)+([\w.,@?^=%&amp;:\/~+#-]*[\w@?^=%&amp;\/~+#-])?$)|(^(urbackup):\/\/[\w-]+([\w-]*)+([\w.,@?^=%&amp;:\/~+#-]*[\w@?^=%&amp;\/~+#-])?$)/i;
+
+		if(!server_regex.test(internet_server))
+		{
+			alert(trans("validate_err_notregexp_internet_server"));
+			return null;
+		}
+
+		if(internet_server.indexOf("urbackup://")==0)
+		{
+			var internet_hostname = internet_server.substr(internet_server.indexOf("://")+3);
+			if(internet_hostname.indexOf(":")!=-1)		
+			{
+				internet_port = internet_hostname.substr(internet_hostname.indexOf(":")+1);
+				internet_hostname = internet_hostname.substr(0, internet_hostname.indexOf(":"));
+				if(internet_port.indexOf("/")!=-1)
+				{
+					internet_port = internet_port.substr(0, internet_port.indexOf("/"));
+				}
+				internet_server_port = parseInt(internet_port);
+			}
+			internet_server = internet_hostname;
+		}
+		internet_server_par+=internet_server;
+		if(i+1<internet_servers.length)
+			internet_server_par+=";";
+	}	
+
 	var pars="";
+	pars+="&internet_server="+encodeURIComponent(internet_server_par);
+	pars+="&internet_server_port="+encodeURIComponent(internet_server_port);
+
+	if(!validate_text_regex([{ id: "internet_server_proxy", regexp: /(^(http|https):\/\/[\w-]+([\w-]*)+([\w.,@?^=%&amp;:\/~+#-]*[\w@?^=%&amp;\/~+#-])?$)|(^$)/i }])) return null;
+	
 	for(var i=0;i<g.internet_settings_list.length;++i)
 	{
-		pars+=getPar(g.internet_settings_list[i]);
+		if(g.internet_settings_list[i]!="internet_server")
+			pars+=getPar(g.internet_settings_list[i]);
 	}
 	return pars;
 }
@@ -3914,62 +4513,8 @@ function internetSettings()
 	g.settings_nav_pos=g.internet_nav_pos_offset;
 	new getJSON("settings", "sa=internet", show_settings2);
 }
-function updateUserOverwrite(clientid)
-{
-	var checked=I('overwrite').checked;
-	
-	for(var i=0;i<g.settings_list.length;++i)
-	{
-		if( I(g.settings_list[i]) )
-		{
-			if(!I(g.settings_list[i]).disabled)
-				I(g.settings_list[i]).disabled=!checked;
-		}
-	}
-	
-	I('user_submit').disabled=!checked;
-	
-	//Archive
-	I('archive_add').disabled=!checked;
-	I('archive_every').disabled=!checked;
-	I('archive_for').disabled=!checked;
-	I('archive_window').disabled=!checked;
-	I('archive_every_unit').disabled=!checked;
-	I('archive_for_unit').disabled=!checked;
-	I('archive_backup_type').disabled=!checked;
-	if(checked)
-	{
-		I('archive_letters').disabled=I('archive_backup_type').value.indexOf("image")==-1;
-	}
-	else
-	{
-		I('archive_letters').disabled=!checked;
-	}
-	
-	//Disable checkboxes
-	if(!I('update_freq_incr_disable').disabled)
-		I('update_freq_incr_disable').disabled=!checked;
-		
-	if(!I('update_freq_full_disable').disabled)
-		I('update_freq_full_disable').disabled=!checked;
-		
-	if(!I('update_freq_image_incr_disable').disabled)
-		I('update_freq_image_incr_disable').disabled=!checked;
-		
-	if(!I('update_freq_image_full_disable').disabled)
-		I('update_freq_image_full_disable').disabled=!checked;
-	
-	I('backup_window').disabled=!checked;
-	
-	if(clientid)
-	{
-		saveClientSettings(clientid, true);
-	}
-}
 function changeSettingsGroupMembership(clientid)
 {
-	if(I("overwrite").checked) return;
-	
 	saveClientSettings(clientid, true);
 }
 function saveClientSettings(clientid, skip)
@@ -3994,10 +4539,14 @@ function saveClientSettings(clientid, skip)
 			stopLoading();
 			return;
 		}
-		pars+=getArchivePars();
 		for(var i=0;i<g.settings_list.length;++i)
 		{
-			pars+=getPar(g.settings_list[i]);
+			if(typeof g.curr_settings[g.settings_list[i]]=="undefined"
+				|| typeof g.curr_settings[g.settings_list[i]].value == "undefined")
+				continue;
+
+			pars+="&"+g.settings_list[i]+"="+encodeURIComponent(getSettingSave(g.settings_list[i]).value);
+			pars+="&"+g.settings_list[i]+".use="+getSettingSave(g.settings_list[i]).use;
 		}
 	}
 	else
@@ -4409,22 +4958,22 @@ function transRights()
 	var n=0;
 	while(true)
 	{
-		var right=I('right'+n);
+		var right=getSelectValues('right'+n);
 		var right_trans=I('right_trans'+n);
-		if( right!=null && right_trans!=null )
+		if( right !== null && right_trans!=null )
 		{
 			var t="";
-			if(right.value=="all")
+			if(right === 'all')
 			{
 				t=trans("right_all");
 			}
-			else if(right.value=="none")
+			else if(right === 'none')
 			{
 				t=trans("right_none");
 			}
 			else
 			{
-				var s=right.value.split(",");
+				var s=right;
 				for(var j=0;j<s.length;++j)
 				{
 					var f=false;
@@ -4459,17 +5008,21 @@ function transRights()
 
 function changeUserRights(uid, name)
 {
+
 	var rows="";
-	for(var i=0;i<g.user_rights[uid].length;++i)
+	let rights = g.user_rights[uid];
+	var i;
+	for(i=0;i<rights.length;++i)
 	{
-		var obj=g.user_rights[uid][i];
+		var obj=rights[i];
 		obj.userid=uid;
 		obj.username=name;
 		obj.n=i;
-		
-		
+
+
 		rows+=dustRender("settings_user_rights_change_row", obj);
 	}
+
 	var ndata=dustRender("settings_user_rights_change", {userid: uid, username: name, rows: rows});
 	if(g.data_f!=ndata)
 	{
@@ -4477,6 +5030,25 @@ function changeUserRights(uid, name)
 		I('data_f').innerHTML=ndata;
 		g.data_f=ndata;
 	}
+
+	var clients = []
+
+	new getJSON("settings", "", function (data) {
+		if(data.hasOwnProperty('navitems') && data['navitems'].hasOwnProperty('clients')) {
+			var client_data = data['navitems']['clients'];
+			for (let i = 0; i < client_data.length; i++) {
+				clients.push({
+					id: client_data[i]['id'],
+					name: client_data[i]['name']
+				});
+			}
+			for (i=0;i<rights.length;i++) {
+				addClientsToSelect(clients, `#right${i}`, rights, i)
+			}
+		}
+	});
+
+
 	transRights();
 }
 function deleteDomain(uid, name, n)
@@ -4498,11 +5070,12 @@ function submitChangeUserRights(uid)
 	var rights=[];
 	while(true)
 	{
-		var right=I('right'+n);
+		var right=getSelectValues('right'+n);
+		console.log(right)
 		var domain=I('domain'+n);
 		if( right!=null && domain!=null )
 		{
-			rights.push( { right: right.value, domain: domain.value } );
+			rights.push( { right: right, domain: domain.value } );
 		}
 		else
 		{
@@ -5034,7 +5607,16 @@ function addArchiveItem(global)
 		if(!validate_text_nonempty(["archive_for"])) return;
 	}
 	if(!validate_text_regex([{id: "archive_window", regexp: /^((([0-9]+,?)+)|\*);((([0-9]+,?)+)|\*);((([0-9]+,?)+)|\*);((([0-9]+,?)+)|\*)$/i } ]) ) return;
-	addArchiveItemInt(parseInt(I('archive_every').value), I('archive_every_unit').value, parseInt(I('archive_for').value), I('archive_for_unit').value, I('archive_backup_type').value, -1, I('archive_window').value, I('archive_letters').value, (global?"-":-1), global);
+
+	if(!g.curr_archive_item_id )
+		g.curr_archive_item_id=1;
+	else
+		g.curr_archive_item_id+=1;
+	
+	addArchiveItemInt(parseInt(I('archive_every').value), I('archive_every_unit').value, parseInt(I('archive_for').value), I('archive_for_unit').value, 
+		I('archive_backup_type').value, -1, I('archive_window').value, I('archive_letters').value, (global?"-":-1), g.curr_archive_item_id, global, 2);
+
+	updateArchiveParams();
 }
 function getTimelengthSeconds(tl, unit)
 {
@@ -5106,10 +5688,21 @@ function backupTypeStr(bt)
 }
 function getArchiveTable()
 {
-	archive_table=I('archive_table').childNodes[1];
+	var archive_table=I('archive_table').childNodes[1];
 	return archive_table;
 }
-function addArchiveItemInt(archive_every, archive_every_unit, archive_for, archive_for_unit, archive_backup_type, next_archival, archive_window, archive_letters, archive_timeleft, global)
+function archiveTableClear()
+{
+	for(var i=0;i<g.curr_archive_items.length;++i)
+	{
+		var id = g.curr_archive_items[i].archive_uuid;
+		if(I("archive_item_"+id))
+		{
+			getArchiveTable().removeChild(I("archive_item_"+id));
+		}
+	}
+}
+function addArchiveItemInt(archive_every, archive_every_unit, archive_for, archive_for_unit, archive_backup_type, next_archival, archive_window, archive_letters, archive_timeleft, archive_uuid, global, source)
 {
 	archive_every_i=getTimelengthSeconds(archive_every, archive_every_unit);
 	archive_for_i=getTimelengthSeconds(archive_for, archive_for_unit);
@@ -5121,7 +5714,7 @@ function addArchiveItemInt(archive_every, archive_every_unit, archive_for, archi
 	archive_for=dectorateTimelength(archive_for, archive_for_unit);
 	
 	var new_item=document.createElement('tr');
-	new_item.id="archive_"+g.archive_item_id;
+	new_item.id = "archive_item_"+archive_uuid;
 	
 	var archive_letters_str = archive_letters;
 	if(archive_letters.length==0)
@@ -5133,11 +5726,18 @@ function addArchiveItemInt(archive_every, archive_every_unit, archive_for, archi
 		archive_letters_str = "-";
 		archive_letters="";
 	}
+
+	if(archive_timeleft==null)
+		archive_timeleft="-";
+
+	var source_group = !global && source==1;
+	var source_here = !global && source==2;
 	
-	var row_vals={ id: g.archive_item_id, archive_next: next_archival, archive_every_i: archive_every_i, archive_every: archive_every, archive_every_unit: archive_every_unit,
+	var row_vals={ archive_next: next_archival, archive_every_i: archive_every_i, archive_every: archive_every, archive_every_unit: archive_every_unit,
 			archive_for_i: archive_for_i, archive_for: archive_for, archive_for_unit: archive_for_unit,
 			archive_backup_type: archive_backup_type, archive_backup_type_str: backupTypeStr(archive_backup_type), archive_window: archive_window, archive_letters: archive_letters,
-			archive_letters_str: archive_letters_str, show_archive_timeleft: !global};
+			archive_letters_str: archive_letters_str, archive_uuid: archive_uuid, show_archive_timeleft: !global, source: source, archive_timeleft: archive_timeleft,
+			source_group: source_group, source_here: source_here};
 	
 	if(archive_timeleft!="-")
 	{
@@ -5158,50 +5758,48 @@ function addArchiveItemInt(archive_every, archive_every_unit, archive_for, archi
 	var archive_table=getArchiveTable();
 	
 	archive_table.appendChild(new_item);
-	
-	++g.archive_item_id;
-}
-function replaceArchiveId(old_id, new_id)
-{
-	var archive_timeleft;
-	var show_archive_timeleft=false;
-	if(I('archive_timeleft_'+old_id))
-	{
-		archive_timeleft = I('archive_timeleft_'+old_id).value;
-		show_archive_timeleft=true;
-	}
-	var item=I('archive_'+old_id);
-	item.innerHTML=dustRender("settings_archive_row",  { id: new_id, archive_next: I('archive_next_'+old_id).value, archive_every_i: I('archive_every_'+old_id).value, archive_every: I('archive_every_str_'+old_id).innerHTML,
-			archive_every_unit: I('archive_every_unit_'+old_id).value, archive_for_i: I('archive_for_'+old_id).value, archive_for: I('archive_for_str_'+old_id).innerHTML, archive_for_unit: I('archive_for_unit_'+old_id).value,
-			archive_backup_type: I('archive_backup_type_'+old_id).value, archive_backup_type_str: backupTypeStr(I('archive_backup_type_'+old_id).value), archive_window: I('archive_window_'+old_id).value,
-			archive_timeleft: archive_timeleft, show_archive_timeleft: show_archive_timeleft, archive_letters: I('archive_letters_'+old_id).value, archive_letters_str: I('archive_letters_str_'+old_id).value } );
+
+	g.curr_archive_items.push(row_vals);
 }
 function deleteArchiveItem(id)
 {
-	var archive_table=getArchiveTable();
-	g.archive_item_id=0;
-	var rmobj;
-	var old_id=0;
-	for(var i=0;i<archive_table.childNodes.length;++i)
+	if(I("archive_item_"+id))
 	{
-		var obj=archive_table.childNodes[i];
-		if(obj.nodeName.toLowerCase()=='tr')
+		getArchiveTable().removeChild(I("archive_item_"+id));
+	}
+	
+	var rerender=false;
+
+	for(var i=0;i<g.curr_archive_items.length;++i)
+	{
+		var item=g.curr_archive_items[i];
+		if(item.archive_uuid==id)
 		{
-			if(obj.id=="archive_"+id)
+			if(item.source!=2
+				&& g.curr_settings["archive"].use & 1)
 			{
-				rmobj=obj;
-				++old_id;
+				
+				for(var j=0;j<g.curr_archive_items.length;++j)
+				{
+					if(g.curr_archive_items[j].source!=2)
+						rerender=true;
+					g.curr_archive_items[j].source=2;
+				}
+				g.curr_settings["archive"].use=2;
+				renderSettingSwitch("archive");
 			}
-			else if(obj.id.indexOf("archive_")==0)
-			{
-				replaceArchiveId(old_id, g.archive_item_id);
-				obj.id="archive_"+g.archive_item_id;
-				++g.archive_item_id;
-				++old_id;
-			}
+
+			g.curr_archive_items.splice(i, 1);
+			break;
 		}
 	}
-	archive_table.removeChild(rmobj);
+
+	updateArchiveParams();
+
+	if(rerender)
+	{
+		renderArchiveSettings(g.curr_settings_type==0);
+	}
 }
 function changeArchiveForUnit()
 {
@@ -5417,7 +6015,7 @@ function addNewClient1()
 	if(!startLoading()) return;
 	stopLoading();
 	
-	var ndata=dustRender("add_client", {server_identity: g.server_identity});
+	var ndata=dustRender("add_client", {server_identity: g.server_identity, server_pubkey: g.server_pubkey});
 	
 	if(g.data_f!=ndata)
 	{
@@ -5680,8 +6278,126 @@ function saveReportScript()
 function updateAlertScriptParams()
 {
 	var script_id = I("alert_script").value;
-	g.last_alert_params = I("alert_params").value;
-	aparams = build_alert_params(script_id);
+	var aparams = build_alert_params(script_id);
 	I("alert_script_params_container").innerHTML = aparams.params;
-	update_alert_params();
+	update_alert_params(true);
+}
+function updateArchiveParams()
+{
+	var setting = g.curr_settings["archive"];
+	var home_params = {};
+	var home_param_idx = 0;
+	setting.use = 0;
+	for(var i=0;i<g.curr_archive_items.length;++i)
+	{
+		var item = g.curr_archive_items[i];
+		setting.use = setting.use | item.source;
+
+		var prefix = "c";
+
+		if(g.curr_settings_type==0)
+			prefix = "d";
+		else if(g.curr_settings_type==1)
+			prefix = "g";
+
+		if(item.source==2)
+		{
+			home_params["every_"+prefix+home_param_idx] = item.archive_every_i;
+			home_params["every_unit_"+prefix+home_param_idx] = item.archive_every_unit;
+			home_params["for_"+prefix+home_param_idx] = item.archive_for_i;
+			home_params["for_unit_"+prefix+home_param_idx] = item.archive_for_unit;
+			home_params["backup_type_"+prefix+home_param_idx] = item.archive_backup_type;
+			home_params["window_"+prefix+home_param_idx] = item.archive_window;
+			home_params["letters_"+prefix+home_param_idx] = item.archive_letters;
+			if((item.archive_uuid+"").length>10)
+			{
+				home_params["uuid_c"+home_param_idx] = item.archive_uuid;
+			}
+			home_param_idx+=1;
+		}
+	}
+
+	setting.value = $.param(home_params);
+}
+function addArchiveItemParams(params, idx, global, source)
+{
+	var next_archival =  null;
+	var archive_every = params["every_"+idx];
+	var archive_every_unit = params["every_unit_"+idx];
+	var archive_for = params["for_"+idx];
+	var archive_for_unit = params["for_unit_"+idx];
+	var archive_backup_type = params["backup_type_"+idx];
+	var archive_window = params["window_"+idx];
+	var archive_letters = params["letters_"+idx];
+	var archive_uuid = params["uuid_"+idx];
+	var archive_timeleft = null;
+	if(params["timeleft_"+idx])
+		archive_timeleft = params["timeleft_"+idx];
+	if(params["next_archival_"+idx])
+		next_archival = params["next_archival_"+idx];
+
+	addArchiveItemInt(getTimelengthUnit(archive_every, archive_every_unit), archive_every_unit,
+		getTimelengthUnit(archive_for, archive_for_unit), archive_for_unit, archive_backup_type, next_archival, archive_window, archive_letters, archive_timeleft, 
+		archive_uuid, global, source);
+}
+function renderArchiveSettings(global)
+{
+	var setting = g.curr_settings["archive"];
+
+	archiveTableClear();
+	g.curr_archive_items = [];
+
+	if(setting.use & 1)
+	{
+		params = deparam(setting.value_group);
+
+		var idx=0;
+		while(typeof params["every_d"+idx] != "undefined")
+		{
+			addArchiveItemParams(params, "d"+idx, global, 1);
+			idx+=1;
+		}
+		idx=0;
+		while(typeof params["every_g"+idx] != "undefined")
+		{
+			addArchiveItemParams(params, "g"+idx, global, 1);
+			idx+=1;
+		}
+	}
+	if(typeof setting.use=="undefined" 
+		|| setting.use & 2)
+	{
+		params = deparam(setting.value);
+
+		var prefix="c";
+		if(typeof setting.use=="undefined" )
+			prefix="d";
+
+		var idx=0;
+		while(typeof params["every_"+prefix+idx] != "undefined")
+		{
+			addArchiveItemParams(params, prefix+idx, global, 2);
+			idx+=1;
+		}
+	}
+}
+
+function linux_image_restore1(data)
+{
+	stopLoading();
+
+	if(!data.ok)
+	{
+		alert("Error getting linux image restore information");
+	}
+
+	data.linux_restore_url = getSiteURL()+"x?a=download_client&restore_image=1&os=linux&authkey="+encodeURIComponent(data.authkey)+"&token="+encodeURIComponent(data.token);
+	
+	var ndata=dustRender("restore_linux_img", data);
+	if(g.data_f!=ndata)
+	{
+		$("#data_f").empty();
+		I('data_f').innerHTML=ndata;
+		g.data_f=ndata;
+	}
 }

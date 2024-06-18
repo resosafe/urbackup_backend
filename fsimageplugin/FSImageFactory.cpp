@@ -1,6 +1,6 @@
 /*************************************************************************
 *    UrBackup - Client/Server backup system
-*    Copyright (C) 2011-2016 Martin Raiber
+*    Copyright (C) 2011-2021 Martin Raiber
 *
 *    This program is free software: you can redistribute it and/or modify
 *    it under the terms of the GNU Affero General Public License as published by
@@ -28,6 +28,7 @@
 #endif
 #include "fs/unknown.h"
 #include "vhdfile.h"
+#include "vhdxfile.h"
 #include "../stringtools.h"
 #ifdef _WIN32
 #include <Windows.h>
@@ -35,10 +36,19 @@
 #else
 #include <errno.h>
 #endif
+#include "partclone.h"
 #include "cowfile.h"
 #include "ClientBitmap.h"
 #include <stdlib.h>
 #include "FileWrapper.h"
+
+#ifndef _WIN32
+#include "../config.h"
+#ifdef HAVE_MNTENT_H
+#include <mntent.h>
+#endif
+#endif
+
 
 #ifdef _WIN32
 namespace
@@ -61,6 +71,106 @@ namespace
 	}
 }
 #endif
+
+namespace
+{
+#ifndef _WIN32
+        std::string getFolderMount(const std::string& path)
+        {
+#ifndef HAVE_MNTENT_H
+                return std::string();
+#else
+                FILE *aFile;
+
+                aFile = setmntent("/proc/mounts", "r");
+                if (aFile == NULL) {
+                        return std::string();
+                }
+                struct mntent *ent;
+                std::string maxmount;
+                while (NULL != (ent = getmntent(aFile)))
+                {
+                        if(path.find(ent->mnt_dir)==0 &&
+                                std::string(ent->mnt_dir).size()>maxmount.size())
+                        {
+                                maxmount = ent->mnt_dir;
+                        }
+                }
+                endmntent(aFile);
+
+                return maxmount;
+#endif //HAVE_MNTENT_H
+        }
+#endif //!_WIN32
+
+	std::string replaceMountPoint(std::string fn, std::string snap_mountpoint)
+	{
+#ifdef _WIN32
+		return snap_mountpoint + "/" + fn;
+#else
+		std::string mountpoint = getFolderMount(fn);
+		if(fn.size()>=mountpoint.size())
+		{
+			fn.erase(0, mountpoint.size());
+			return snap_mountpoint + "/" + fn;
+		}
+		else
+		{
+			return snap_mountpoint + "/" + fn;
+		}
+#endif
+	}
+
+
+
+	std::vector<std::string> getSwapFiles(std::string snap_mountpoint)
+	{
+		std::string swaps_str = getStreamFile("/proc/swaps");
+
+		std::vector<std::string> ret;
+		std::vector<std::string> lines;
+		Tokenize(swaps_str, lines, "\n");
+		for(size_t i=1;i<lines.size();++i)
+		{
+			std::vector<std::string> cols;
+			std::string line = lines[i];
+			std::string line_tr;
+			int tr_state=0;
+			for(size_t j=0;j<line.size();++j)
+			{
+				if(tr_state==0)
+				{
+					if(line[j]==' ' || line[j]=='\t')
+					{
+						line_tr+=' ';
+						tr_state=1;
+					}
+					else
+						line_tr+=line[j];
+				}
+				else
+				{
+					if(line[j]!=' ' && line[j]!='\t')
+					{
+						line_tr+=line[j];
+						tr_state=0;
+					}
+				}
+			}
+			Tokenize(line_tr, cols, " ");
+			if(cols.size()>4)
+			{
+				if(cols[1]=="file")
+				{
+					std::string fn = cols[0];
+					ret.push_back(replaceMountPoint(fn, snap_mountpoint));
+				}
+			}
+		}
+
+		return ret;
+	}
+}
 
 namespace
 {
@@ -200,15 +310,30 @@ namespace
 
 void PrintInfo(IFilesystem *fs)
 {
-	Server->Log("FSINFO: blocksize="+convert(fs->getBlocksize())+" size="+convert(fs->getSize())+" has_error="+convert(fs->hasError())+" used_space="+convert(fs->calculateUsedSpace()), LL_DEBUG);
+	Server->Log("FSINFO: blocksize="+convert(fs->getBlocksize())+" size="+convert(fs->getSize())+" has_error="+convert(fs->hasError())+" used_space="+convert(fs->calculateUsedSpace())+" type="+fs->getType(), LL_DEBUG);
 }
 
-IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadaheadMode read_ahead,
+IFilesystem *FSImageFactory::createFilesystem(const std::string &pDevOrig, EReadaheadMode read_ahead,
 	bool background_priority, std::string orig_letter, IFsNextBlockCallback* next_block_callback)
 {
+	std::string pDev = pDevOrig;
+#ifndef _WIN32
+	if(read_ahead==EReadaheadMode_Overlapped)
+	{
+		read_ahead = EReadaheadMode_None;
+	}
+
+	pDev = trim(getFile(pDevOrig+"-dev"));
+	if(pDev.empty())
+	{
+		Server->Log("Error reading device file name from "+pDevOrig+"-dev", LL_ERROR);
+		return nullptr;
+	}
+#endif
+
 	IFile *dev = Server->openFile(pDev, MODE_READ_DEVICE);
 
-	if(dev==NULL)
+	if(dev==nullptr)
 	{
 		int last_error;
 #ifdef _WIN32
@@ -217,7 +342,7 @@ IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadahea
 		last_error=errno;
 #endif
 		Server->Log("Error opening device file ("+pDev+") Errorcode: "+convert(last_error), LL_ERROR);
-		return NULL;
+		return nullptr;
 	}
 	char buffer[4096];
 	_u32 rc=dev->Read(buffer, 4096);
@@ -230,7 +355,7 @@ IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadahea
 		last_error = errno;
 #endif
 		Server->Log("Error reading data from device ("+pDev+"). Errorcode: " + convert(last_error), LL_ERROR);
-		return NULL;
+		return nullptr;
 	}
 
 	Server->destroy(dev);
@@ -349,7 +474,7 @@ IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadahea
 			if(fs2->hasError())
 			{
 				delete fs2;
-				return NULL;
+				return nullptr;
 			}
 			PrintInfo(fs2);
 			return fs2;
@@ -357,6 +482,7 @@ IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadahea
 		PrintInfo(fs);
 		return fs;
 	}
+#ifdef _WIN32
 	else
 	{
 		Server->Log("Unknown filesystem type", LL_DEBUG);
@@ -369,6 +495,35 @@ IFilesystem *FSImageFactory::createFilesystem(const std::string &pDev, EReadahea
 		PrintInfo(fs);
 		return fs;
 	}
+#else
+	else
+	{
+		IFilesystem* fs = new Partclone(pDev, read_ahead, background_priority, next_block_callback);
+		if (fs->hasError())
+		{
+			delete fs;
+			fs = new FSUnknown(pDev, read_ahead, background_priority, next_block_callback);
+			if (fs->hasError())
+			{
+				delete fs;
+				return nullptr;
+			}
+		}
+		PrintInfo(fs);
+
+		std::vector<std::string> swap_files = getSwapFiles(pDevOrig);
+		for(size_t i=0;i<swap_files.size();++i)
+		{
+			fs->excludeFile(swap_files[i]);
+		}
+
+		fs->excludeFiles(pDevOrig, ".datto_3d41c58e-6724-4d47-8981-11c766a08a24_");
+		fs->excludeFiles(pDevOrig, ".overlay_2fefd007-3e48-4162-b2c6-45ccdda22f37_");
+		
+
+		return fs;
+	}
+#endif
 }
 
 bool FSImageFactory::isNTFS(char *buffer)
@@ -384,13 +539,16 @@ bool FSImageFactory::isNTFS(char *buffer)
 }
 
 IVHDFile *FSImageFactory::createVHDFile(const std::string &fn, bool pRead_only, uint64 pDstsize,
-	unsigned int pBlocksize, bool fast_mode, ImageFormat format)
+	unsigned int pBlocksize, bool fast_mode, ImageFormat format, size_t n_compress_threads)
 {
 	switch(format)
 	{
 	case ImageFormat_VHD:
 	case ImageFormat_CompressedVHD:
 		return new VHDFile(fn, pRead_only, pDstsize, pBlocksize, fast_mode, format!=ImageFormat_VHD);
+	case ImageFormat_VHDX:
+	case ImageFormat_CompressedVHDX:
+		return new VHDXFile(fn, pRead_only, pDstsize, pBlocksize, fast_mode, format != ImageFormat_VHDX);
 	case ImageFormat_RawCowFile:
 #if !defined(__APPLE__)
 		return new CowFile(fn, pRead_only, pDstsize);
@@ -398,17 +556,20 @@ IVHDFile *FSImageFactory::createVHDFile(const std::string &fn, bool pRead_only, 
 		return NULL;
 #endif
 	}
-	return NULL;
+	return nullptr;
 }
 
 IVHDFile *FSImageFactory::createVHDFile(const std::string &fn, const std::string &parent_fn,
-	bool pRead_only, bool fast_mode, ImageFormat format, uint64 pDstsize)
+	bool pRead_only, bool fast_mode, ImageFormat format, uint64 pDstsize, size_t n_compress_threads)
 {
 	switch(format)
 	{
 	case ImageFormat_VHD:
 	case ImageFormat_CompressedVHD:
 		return new VHDFile(fn, parent_fn, pRead_only, fast_mode, format!=ImageFormat_VHD, pDstsize);
+	case ImageFormat_VHDX:
+	case ImageFormat_CompressedVHDX:
+		return new VHDXFile(fn, parent_fn, pRead_only, fast_mode, format != ImageFormat_VHDX, pDstsize);
 	case ImageFormat_RawCowFile:
 #if !defined(__APPLE__)
 		return new CowFile(fn, parent_fn, pRead_only, pDstsize);
@@ -417,7 +578,7 @@ IVHDFile *FSImageFactory::createVHDFile(const std::string &fn, const std::string
 #endif
 	}
 
-	return NULL;
+	return nullptr;
 }
 
 void FSImageFactory::destroyVHDFile(IVHDFile *vhd)
@@ -460,16 +621,21 @@ bool FSImageFactory::initializeImageMounting()
 
 std::vector<IFSImageFactory::SPartition> FSImageFactory::readPartitions(IVHDFile * vhd, int64 offset, bool& gpt_style)
 {
+	FileWrapper dev(vhd, offset);
+	return readPartitions(&dev, gpt_style);
+}
+
+std::vector<FSImageFactory::SPartition> FSImageFactory::readPartitions(IFile* dev, bool& gpt_style)
+{
 	gpt_style = false;
 
-	FileWrapper dev(vhd, offset);
-	std::string mbr = dev.Read(0LL, 512, NULL);
-	std::string gpt_header = dev.Read(512LL, 512, NULL);
+	std::string mbr = dev->Read(0LL, 512, nullptr);
+	std::string gpt_header = dev->Read(512LL, 512, nullptr);
 
 	if (next(gpt_header, 0, "EFI PART"))
 	{
-		return readPartitionsGPT(&dev, gpt_header);
 		gpt_style = true;
+		return readPartitionsGPT(dev, gpt_header);
 	}
 	else if (mbr.size() >= 512
 		&& static_cast<unsigned char>(mbr[510]) == 0x55

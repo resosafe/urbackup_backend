@@ -17,7 +17,7 @@ public:
 	void stopServer(void);
 	std::string getServerName(void);
 	std::string getShareDir(const std::string &name, const std::string& identity);
-	void addIdentity(const std::string &pIdentity);
+	void addIdentity(const std::string &pIdentity, bool only_tunneled);
 	bool removeIdentity(const std::string &pIdentity);
 	void setPause(bool b);
 	bool getPause(void);
@@ -35,7 +35,7 @@ public:
 	static void init_mutex(void);
 	static void destroy_mutex(void);
 
-	static bool checkIdentity(const std::string &pIdentity);
+	static bool checkIdentity(const std::string &pIdentity, bool tunneled);
 
 	static std::string mapScriptOutputNameToScript(const std::string& script_fn, bool& tar_file, IPipeFile*& pipe_file);
 
@@ -43,11 +43,13 @@ public:
 
 	static IFileServ::ITokenCallback* newTokenCallback();
 
-	static void incrShareActive(std::string sharename);
+	static size_t incrShareActive(std::string sharename);
 
-	static void decrShareActive(std::string sharename);
+	static void decrShareActive(std::string sharename, size_t gen);
 
 	bool hasActiveTransfers(const std::string& sharename, const std::string& server_token);
+
+	bool hasActiveTransfersGen(const std::string& sharename, const std::string& server_token, size_t gen);
 
 	bool registerFnRedirect(const std::string& source_fn, const std::string& target_fn);
 
@@ -71,12 +73,36 @@ public:
 
 	virtual void deregisterScriptPipeFile(const std::string& script_fn);
 
+	virtual IFileMetadataPipe* getFileMetadataPipe();
+
+	size_t incrActiveGeneration();
+
 private:
 	bool *dostop;
 	THREADPOOL_TICKET serverticket;
 	std::string servername;
 
-	static std::vector<std::string> identities;
+	struct SIdentity
+	{
+		SIdentity()
+			: tunneled(false)
+		{
+
+		}
+
+		SIdentity(std::string identity, bool tunneled)
+			: identity(identity), tunneled(tunneled)
+		{}
+
+		bool operator==(const SIdentity& other)
+		{
+			return identity == other.identity;
+		}
+
+		std::string identity;
+		bool tunneled;
+	};
+	static std::vector<SIdentity > identities;
 	static bool pause;
 
 	struct SScriptMapping
@@ -105,7 +131,9 @@ private:
 
 	static ITokenCallbackFactory* token_callback_factory;
 
-	static std::map<std::string, size_t> active_shares;
+	static std::map<std::pair<std::string, size_t>, size_t> active_shares;
+
+	static size_t active_generation;
 
 	static IReadErrorCallback* read_error_callback;
 
@@ -117,6 +145,7 @@ private:
 
 class ScopedShareActive
 {
+	size_t gen;
 public:
 	ScopedShareActive()
 	{
@@ -128,7 +157,7 @@ public:
 	{
 		if (!sharename.empty())
 		{
-			FileServ::incrShareActive(sharename);
+			gen = FileServ::incrShareActive(sharename);
 		}
 	}
 
@@ -136,7 +165,7 @@ public:
 	{
 		if (!sharename.empty())
 		{
-			FileServ::decrShareActive(sharename);
+			FileServ::decrShareActive(sharename, gen);
 		}
 	}
 
@@ -144,18 +173,19 @@ public:
 	{
 		if (!sharename.empty())
 		{
-			FileServ::decrShareActive(sharename);
+			FileServ::decrShareActive(sharename, gen);
 		}
 		sharename = new_sharename;
 		if (!sharename.empty())
 		{
-			FileServ::incrShareActive(sharename);
+			gen = FileServ::incrShareActive(sharename);
 		}
 	}
 
-	void release()
+	size_t release()
 	{
 		sharename.clear();
+		return gen;
 	}
 
 private:

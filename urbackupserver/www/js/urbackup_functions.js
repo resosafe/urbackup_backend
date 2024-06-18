@@ -63,7 +63,26 @@ function I(a)
 		return $(a);
 	else
 		return document.getElementById(a);
-}		
+}
+
+function getSelectValues(selector) {
+	let select = document.getElementById(selector);
+
+	if (select === null) {
+		return 'none'
+	}
+
+	let options = Array.from(select.options);
+	let selectedOptions = options
+		.filter((x) => x.selected)
+		.map((x) => x.value);
+	if (options.length === selectedOptions.length) {
+		return 'all'
+	} else if (selectedOptions.length === 0) {
+		return 'none'
+	}
+	return selectedOptions
+}
 	
 function bodyOnLoad() {
 	for ( var i = 0 ; i < onloads.length ; i++ )
@@ -219,7 +238,7 @@ getJSON = function(action, parameters, callback)
 	{ url: getURL(action),
 	  dataType: "json",
 	  method: "POST",
-	  contentType:"application/json; charset=utf-8",
+	  contentType:"application/x-www-form-urlencoded; charset=utf-8",
 	  data: parameters
 	}
 	).done(function(data)
@@ -392,7 +411,11 @@ function determine_date_format()
 {
 	//Create a known date string
 	var y = new Date(2013, 9, 25);
-	var lds = y.toLocaleDateString();
+	var lds;
+	if(navigator.languages && navigator.languages.length)
+		lds = y.toLocaleDateString(navigator.languages[0]);
+	else
+		lds = y.toLocaleDateString();
 
 	//search for the position of the year, day, and month
 	var yPosi = lds.search("2013");
@@ -711,11 +734,18 @@ function randomString()
 	return randomstring;
 }
 
-function validate_text_nonempty(a)
+function validate_text_nonempty(a, val_req_fun)
 {
+	if(typeof val_req_fun=="undefined")
+	{
+		val_req_fun = function(aid) {
+			return I(aid).value;
+		};
+	}
+
 	for(var i=0;i<a.length;++i)
 	{
-		if(I(a[i]).value.length==0)
+		if(val_req_fun(a[i]).length==0)
 		{
 			if(trans("validate_err_empty_"+a[i]))
 			{
@@ -746,11 +776,18 @@ function isFloat(x)
 	return true;
 }
 
-function validate_text_int(a, name)
+function validate_text_int(a, name, val_req_fun)
 {
+	if(typeof val_req_fun=="undefined")
+	{
+		val_req_fun = function(aid) {
+			return I(aid).value;
+		};
+	}
+
 	for(var i=0;i<a.length;++i)
 	{
-		if(I(a[i]) && !isInt(I(a[i]).value))
+		if(I(a[i]) && !isInt(val_req_fun(a[i])))
 		{
 			if(trans("validate_err_notint_"+a[i]))
 			{
@@ -777,11 +814,18 @@ function validate_text_int(a, name)
 	return true;
 }
 
-function validate_text_float(a, name)
+function validate_text_float(a, name, val_req_fun)
 {
+	if(typeof val_req_fun=="undefined")
+	{
+		val_req_fun = function(aid) {
+			return I(aid).value;
+		};
+	}
+
 	for(var i=0;i<a.length;++i)
 	{
-		if(!isFloat(I(a[i]).value))
+		if(!isFloat(val_req_fun(a[i])))
 		{
 			if(trans("validate_err_notfloat_"+a[i]))
 			{
@@ -808,11 +852,18 @@ function validate_text_float(a, name)
 	return true;
 }
 
-function validate_text_int_or_empty(a)
+function validate_text_int_or_empty(a, val_req_fun)
 {
+	if(typeof val_req_fun=="undefined")
+	{
+		val_req_fun = function(aid) {
+			return I(aid).value;
+		};
+	}
+
 	for(var i=0;i<a.length;++i)
 	{
-		if(!isInt(I(a[i]).value) && I(a[i]).value!="-" && I(a[i]).value!="")
+		if(!isInt(val_req_fun(a[i])) && val_req_fun(a[i])!="-" && val_req_fun(a[i])!="")
 		{
 			if(trans("validate_err_notint_"+a[i]))
 			{
@@ -829,8 +880,14 @@ function validate_text_int_or_empty(a)
 	return true;
 }
 
-function validate_text_regex(a)
+function validate_text_regex(a, val_req_fun)
 {
+	if(typeof val_req_fun=="undefined")
+	{
+		val_req_fun = function(aid) {
+			return I(aid).value;
+		};
+	}
 	if(typeof a == "object"
 		&& !(a instanceof Array) )
 	{
@@ -838,7 +895,7 @@ function validate_text_regex(a)
 	}
 	for(var i=0;i<a.length;++i)
 	{
-		if(!a[i].regexp.test(I(a[i].id).value))
+		if(!a[i].regexp.test(val_req_fun(a[i].id)))
 		{
 			var errid=a[i].id;
 			if(a[i].errid)
@@ -855,7 +912,7 @@ function validate_text_regex(a)
 			}
 			else
 			{
-				alert("Field format wrong!");
+				alert("Field format wrong. ("+a[i].id+"). Sorry, problem finding error message (translation)");
 			}
 			I(a[i].id).focus();
 			return false;
@@ -933,7 +990,7 @@ function getISODatestamp()
 
 function base64_decode_dash(b)
 {
-	return $.base64.decode(b.replace(/-/g, "="));
+	return decodeURIComponent( escape( $.base64.decode(b.replace(/-/g, "=")) ));
 }
 
 //from https://stackoverflow.com/questions/4003823/javascript-getcookie-functions/4004010#4004010
@@ -971,6 +1028,23 @@ function getCookies() {
 }
 function getCookie(name) {
     return getCookies()[name];
+}
+
+function addClientsToSelect(data, selector, rights, iterator)  {
+	let extra;
+	for (var client in data) {
+		if (data.hasOwnProperty(client)) {
+			extra = '';
+			client = data[client]
+			let right_list = rights[iterator]['right'].split(',');
+
+			if (right_list[0] === 'all' || right_list.includes(String(client['id']))) {
+				extra = 'selected';
+			}
+
+			$(selector).append(`<option ${extra} value="${client['id']}">${client['name']}</option>`);
+		}
+	}
 }
 
 /*

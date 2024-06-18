@@ -566,22 +566,54 @@ bool CDatabase::Import(const std::string &pFile)
 
 bool CDatabase::Dump(const std::string &pFile)
 {
-	callback_data cd;
-	cd.db=db;
+	const char* db_fn = sqlite3_db_filename(db, NULL);
+	if (db_fn == NULL)
+		return false;
+
+	ShellState cd = {};
+	cd.openMode = 1;
+	cd.zDbFilename = db_fn;
 	cd.out=fopen(pFile.c_str(), "wb");
 	if(cd.out==0)
 	{
 		return false;
 	}
 
-	char *cmd=new char[6];
-	cmd[0]='.'; cmd[1]='d'; cmd[2]='u'; cmd[3]='m'; cmd[4]='p'; cmd[5]=0;
-	do_meta_command_r(cmd, &cd);
-	delete []cmd;
+	std::string cmd = ".dump";
+	int rc = do_meta_command_r(&cmd[0], &cd);
 
 	fclose(cd.out);
 
-	return true;
+	if (cd.db != 0)
+		sqlite3_close(cd.db);
+
+	return rc == SQLITE_OK;
+}
+
+bool CDatabase::Recover(const std::string & pFile)
+{
+	const char* db_fn = sqlite3_db_filename(db, NULL);
+	if (db_fn == NULL)
+		return false;
+
+	ShellState cd = {};
+	cd.openMode = 1;
+	cd.zDbFilename = db_fn;
+	cd.out = fopen(pFile.c_str(), "wb");
+	if (cd.out == 0)
+	{
+		return false;
+	}
+
+	std::string cmd = ".recover";
+	int rc = do_meta_command_r(&cmd[0], &cd);
+
+	fclose(cd.out);
+
+	if (cd.db != 0)
+		sqlite3_close(cd.db);
+
+	return rc==SQLITE_OK;
 }
 
 std::string CDatabase::getEngineName(void)

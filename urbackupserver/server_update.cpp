@@ -29,7 +29,7 @@ extern IUrlFactory *url_fak;
 
 namespace
 {
-	std::string urbackup_update_url = "http://update6.urbackup.org/";
+	std::string urbackup_update_url = "http://update.urbackup.org/2.5.x/";
 	std::string urbackup_update_url_alt;
 
 	struct SUpdatePlatform
@@ -64,7 +64,6 @@ void ServerUpdate::update_client()
 	std::vector<SUpdatePlatform> update_files;
 
 	update_files.push_back(SUpdatePlatform("exe", "UrBackupUpdate", "version.txt"));
-	update_files.push_back(SUpdatePlatform("sh", "UrBackupUpdateMac", "version_osx.txt"));
 	update_files.push_back(SUpdatePlatform("sh", "UrBackupUpdateLinux", "version_linux.txt"));
 
 	std::string curr_update_url = urbackup_update_url;
@@ -101,7 +100,7 @@ void ServerUpdate::update_client()
 
 			bool dl_ok = true;
 
-			std::auto_ptr<IFile> sig_file(Server->openFile("urbackup/" + curr.basename + ".sig2.new", MODE_WRITE));
+			std::unique_ptr<IFile> sig_file(Server->openFile("urbackup/" + curr.basename + ".sig2.new", MODE_WRITE));
 			if (sig_file.get() == NULL)
 			{
 				Server->Log("Error opening signature output file urbackup/" + curr.basename + ".sig2.new", LL_ERROR);
@@ -120,7 +119,7 @@ void ServerUpdate::update_client()
 			{
 				Server->Log("Downloading old signature...", LL_INFO);
 
-				std::auto_ptr<IFile> old_sig_file(Server->openFile("urbackup/" + curr.basename + ".sig.new", MODE_WRITE));
+				std::unique_ptr<IFile> old_sig_file(Server->openFile("urbackup/" + curr.basename + ".sig.new", MODE_WRITE));
 				if (old_sig_file.get() == NULL)
 				{
 					Server->Log("Error opening signature output file urbackup/" + curr.basename + ".sig.new", LL_ERROR);
@@ -142,7 +141,7 @@ void ServerUpdate::update_client()
 
 			Server->Log("Getting update file URL...", LL_INFO);
 			std::string update_url = url_fak->downloadString(curr_update_url + curr.basename + ".url", http_proxy, &errmsg);
-			std::auto_ptr<IFile> update_file;
+			std::unique_ptr<IFile> update_file;
 
 			if (update_url.empty())
 			{
@@ -193,13 +192,19 @@ void ServerUpdate::update_client()
 			}
 			else
 			{
-				std::string del_fn = sig_file->getFilename();
-				sig_file.reset();
-				Server->deleteFile(del_fn);
+				if (sig_file.get() != NULL)
+				{
+					std::string del_fn = sig_file->getFilename();
+					sig_file.reset();
+					Server->deleteFile(del_fn);
+				}
 
-				del_fn = update_file->getFilename();
-				update_file.reset();
-				Server->deleteFile(del_fn);
+				if (update_file.get() != NULL)
+				{
+					std::string del_fn = update_file->getFilename();
+					update_file.reset();
+					Server->deleteFile(del_fn);
+				}
 			}
 		}
 	}
@@ -220,7 +225,7 @@ void ServerUpdate::update_server_version_info()
 	std::string errmsg;
 	Server->Log("Downloading server version info...", LL_INFO);
 
-	std::auto_ptr<IFile> server_version_info(Server->openFile("urbackup/server_version_info.properties.new", MODE_WRITE));
+	std::unique_ptr<IFile> server_version_info(Server->openFile("urbackup/server_version_info.properties.new", MODE_WRITE));
 
 	if(!server_version_info.get())
 	{
@@ -260,7 +265,7 @@ void ServerUpdate::update_dataplan_db()
 	std::string errmsg;
 	Server->Log("Downloading dataplan database...", LL_INFO);
 
-	std::auto_ptr<IFile> dataplan_db(Server->openFile("urbackup/dataplan_db.txt.new", MODE_WRITE));
+	std::unique_ptr<IFile> dataplan_db(Server->openFile("urbackup/dataplan_db.txt.new", MODE_WRITE));
 	if (!dataplan_db.get())
 	{
 		Server->Log("Error opening urbackup/dataplan_db.txt.new for writing", LL_ERROR);
@@ -296,10 +301,13 @@ void ServerUpdate::read_update_location()
 		urbackup_update_url_alt = read_update_location;
 		urbackup_update_url = urbackup_update_url_alt;
 
-		if (!urbackup_update_url.empty()
-			&& urbackup_update_url[urbackup_update_url.size() - 1] != '/')
-			urbackup_update_url += "/";
+		if (read_update_location.find("cbt.urbackup.com") != std::string::npos)
+		{
+			if (!urbackup_update_url.empty()
+				&& urbackup_update_url[urbackup_update_url.size() - 1] != '/')
+				urbackup_update_url += "/";
 
-		urbackup_update_url += "2.3.x/";
+			urbackup_update_url += "2.4.x/";
+		}
 	}
 }

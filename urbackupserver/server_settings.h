@@ -12,12 +12,20 @@ namespace
 	const char* image_file_format_vhd = "vhd";
 	const char* image_file_format_vhdz = "vhdz";
 	const char* image_file_format_cowraw = "cowraw";
+	const char* image_file_format_vhdx = "vhdx";
+	const char* image_file_format_vhdxz = "vhdxz";
 
 	const char* full_image_style_full = "full";
 	const char* full_image_style_synthetic = "synthetic";
 
 	const char* incr_image_style_to_full = "to-full";
 	const char* incr_image_style_to_last = "to-last";
+
+	const int c_use_undefined = -1;
+	const int c_use_group = 1;
+	const int c_use_value = 2;
+	const char* c_use_value_str = "2";
+	const int c_use_value_client = 4;
 }
 
 struct SSettings
@@ -46,7 +54,6 @@ struct SSettings
 	int max_image_full;
 	bool no_images;
 	bool no_file_backups;
-	bool overwrite;
 	bool allow_overwrite;
 	bool autoshutdown;
 	int startup_backup_delay;
@@ -137,6 +144,20 @@ struct SSettings
 	int64 internet_image_dataplan_limit;
 	int alert_script;
 	std::string alert_params;
+	std::string archive;
+	std::string client_settings_tray_access_pw;
+	bool local_encrypt;
+	bool local_compress;
+	int download_threads;
+	int hash_threads;
+	int client_hash_threads;
+	int image_compress_threads;
+	std::string ransomware_canary_paths;
+	std::string backup_dest_url;
+	std::string backup_dest_params;
+	std::string backup_dest_secret_params;
+	bool pause_if_windows_unlocked;
+	std::string backup_unlocked_window;
 };
 
 struct SLDAPSettings
@@ -236,14 +257,16 @@ public:
 
 	std::string ldapMapToString(const std::map<std::string, std::string>& ldap_map);
 
-	void createSettingsReaders(std::auto_ptr<ISettingsReader>& settings_default,
-		std::auto_ptr<ISettingsReader>& settings_client, std::auto_ptr<ISettingsReader>& settings_global);
+	static void createSettingsReaders(IDatabase* db, int clientid, std::unique_ptr<ISettingsReader>& settings_default,
+		std::unique_ptr<ISettingsReader>& settings_client, std::unique_ptr<ISettingsReader>& settings_global, int& settings_default_id);
+
+	std::string getImageFileFormatInt(const std::string& image_file_format);
+
+	static void readStringClientSetting(IDatabase* db, int clientid, const std::string &name, const std::string& merge_sep, std::string *output, bool allow_client_value = true);
 
 private:
 	void operator=(const ServerSettings& other){};
 	ServerSettings(const ServerSettings& other){};
-
-	std::string getImageFileFormatInt(const std::string& image_file_format);
 
 	std::vector<STimeSpan> getWindow(std::string window);
 
@@ -253,17 +276,23 @@ private:
 
 	double currentTimeSpanValue(std::string time_span_value);
 
+	void readSettings();
+
 
 	float parseTimeDet(std::string t);
 	STimeSpan parseTime(std::string t);
 	int parseDayOfWeek(std::string dow);
-	void readSettingsDefault(ISettingsReader* settings_default, ISettingsReader* settings_global);
-	void readSettingsClient(ISettingsReader* settings_client);
-	void readBoolClientSetting(ISettingsReader* settings_client, const std::string &name, bool *output);
-	void readStringClientSetting(ISettingsReader* settings_client, const std::string &name, std::string *output);
-	void readIntClientSetting(ISettingsReader* settings_client, const std::string &name, int *output);
-	void readInt64ClientSetting(ISettingsReader* settings_client, const std::string &name, int64 *output);
-	void readSizeClientSetting(ISettingsReader* settings_client, const std::string &name, size_t *output);
+	void readSettingsDefault(ISettingsReader* settings_default, ISettingsReader* settings_global, IQuery* q_get_client_setting);
+	void readSettingsClient(ISettingsReader* settings_client, IQuery* q_get_client_setting);
+
+	void readStringClientSetting(IQuery* q_get_client_setting, const std::string &name, const std::string& merge_sep, std::string *output, bool allow_client_value=true);
+	static void readStringClientSetting(IQuery* q_get_client_setting, int clientid, const std::string &name, const std::string& merge_sep, std::string *output, bool allow_client_value = true);
+	std::string readValClientSetting(IQuery* q_get_client_setting, const std::string &name, bool allow_client_value);
+	void readBoolClientSetting(IQuery* q_get_client_setting, const std::string &name, bool *output, bool allow_client_value = true);
+	void readIntClientSetting(IQuery* q_get_client_setting, const std::string &name, int *output, bool allow_client_value = true);
+	void readInt64ClientSetting(IQuery* q_get_client_setting, const std::string &name, int64 *output, bool allow_client_value = true);
+	void readSizeClientSetting(IQuery* q_get_client_setting, const std::string &name, size_t *output, bool allow_client_value = true);
+
 	void updateInternal(bool* was_updated);
 	std::map<std::string, std::string> parseLdapMap(const std::string& data);
 

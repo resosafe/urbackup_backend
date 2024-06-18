@@ -39,6 +39,39 @@
 #include <sys/ioctl.h>
 
 #ifdef __linux__
+#ifdef HAVE_LINUX_FIEMAP_H
+#include <linux/fiemap.h>
+#else
+namespace
+{
+	struct fiemap_extent
+	{
+		uint64 fe_logical;
+		uint64 fe_physical;
+		uint64 fe_length;
+		uint64 fe_reserved64[2];
+		unsigned int fe_flags;
+		unsigned int fe_reserved[3];
+	};
+
+	struct fiemap
+	{
+		uint64 fm_start;
+		uint64 fm_length;
+		unsigned int fm_flags;
+		unsigned int fm_mapped_extents;
+		unsigned int fm_extent_count;
+		unsigned int fm_reserved;
+		struct fiemap_extent fm_extents[0];
+	};
+#define FIEMAP_MAX_OFFSET (~0ULL)
+#define FIEMAP_EXTENT_LAST 0x00000001
+#define FIEMAP_EXTENT_UNKNOWN 0x00000002
+#define FIEMAP_EXTENT_UNWRITTEN 0x00000800
+#define FIEMAP_EXTENT_SHARED 0x00002000
+#define FS_IOC_FIEMAP _IOWR('f', 11, struct fiemap)
+}
+#endif
 #ifndef FALLOC_FL_KEEP_SIZE
 #define FALLOC_FL_KEEP_SIZE    0x1
 #endif
@@ -466,10 +499,63 @@ IFsFile::SSparseExtent File::nextSparseExtent()
 #endif 
 }
 
-std::vector<IFsFile::SFileExtent> File::getFileExtents(int64 starting_offset, int64 block_size, bool& more_data)
+std::vector<IFsFile::SFileExtent> File::getFileExtents(int64 starting_offset, int64 block_size, bool& more_data, unsigned int flags)
 {
-	//TODO: Implement using FIEMAP?
+#ifdef __linux__
+	std::vector<char> buf;
+	buf.resize(4096 * 4);
+
+	struct fiemap* fiemap = reinterpret_cast<struct fiemap*>(buf.data());
+	fiemap->fm_extent_count = (buf.size() - sizeof(struct fiemap)) / sizeof(struct fiemap_extent);
+	fiemap->fm_start = starting_offset;
+	fiemap->fm_length = FIEMAP_MAX_OFFSET - starting_offset;
+	fiemap->fm_flags = 0;
+
+	if (ioctl(fd, FS_IOC_FIEMAP, fiemap) < 0)
+	{
+		return std::vector<SFileExtent>();
+	}
+
+	std::vector<SFileExtent> ret;
+	ret.resize(fiemap->fm_mapped_extents);
+	more_data = true;
+	for (_u32 i = 0; i < fiemap->fm_mapped_extents; ++i)
+	{
+		struct fiemap_extent& ext = fiemap->fm_extents[i];
+
+		if (i + 1 >= fiemap->fm_mapped_extents)
+		{
+			if (ext.fe_flags & FIEMAP_EXTENT_LAST)
+			{
+				more_data = false;
+			}
+		}
+
+		ret[i].offset = ext.fe_logical;
+		ret[i].size = ext.fe_length;
+		ret[i].volume_offset = ext.fe_physical;
+
+		if (ext.fe_flags & FIEMAP_EXTENT_UNKNOWN)
+		{
+			ret[i].volume_offset = -1;
+		}
+
+		if (ext.fe_flags & FIEMAP_EXTENT_UNWRITTEN)
+		{
+			ret[i].flags |= SFileExtent::FeFlag_Unwritten;
+		}
+	}
+
+	if (starting_offset == 0
+		&& fiemap->fm_mapped_extents == 0)
+	{
+		more_data = false;
+	}
+
+	return ret;
+#else
 	return std::vector<SFileExtent>();
+#endif
 }
 
 IFsFile::os_file_handle File::getOsHandle(bool release_handle)
@@ -480,5 +566,15 @@ IFsFile::os_file_handle File::getOsHandle(bool release_handle)
 		fd = -1;
 	}
 	return ret;
+}
+
+int64 File::getValidDataLength(IVdlVolCache* p_vol_cache)
+{
+	return -1;
+}
+
+IVdlVolCache* File::createVdlVolCache()
+{
+	return NULL;
 }
 #endif

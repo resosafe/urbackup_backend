@@ -70,16 +70,29 @@ FileMetadataPipe::FileMetadataPipe( IPipe* pipe, const std::string& cmd )
 	backup_state(BackupState_StatInit),
 #endif
 	metadata_state(MetadataState_Wait),
-		errpipe(Server->createMemoryPipe()),
-	metadata_file(NULL)
+		errpipe(Server->createMemoryPipe())
 {
 	metadata_buffer.resize(4096);
 	init();
 }
 
+FileMetadataPipe::FileMetadataPipe()
+	: PipeFileBase(std::string()), pipe(nullptr),
+#ifdef _WIN32
+	hFile(INVALID_HANDLE_VALUE),
+	backup_read_state(-1),
+#else
+	backup_state(BackupState_StatInit),
+#endif
+	metadata_state(MetadataState_Wait),
+	errpipe(Server->createMemoryPipe())
+{
+	metadata_buffer.resize(4096);
+}
+
 FileMetadataPipe::~FileMetadataPipe()
 {
-	assert(token_callback.get() == NULL);
+	assert(token_callback.get() == nullptr);
 }
 
 
@@ -91,7 +104,7 @@ bool FileMetadataPipe::getExitCode( int& exit_code )
 
 bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t& read_bytes )
 {
-	if (token_callback.get() == NULL)
+	if (token_callback.get() == nullptr)
 	{
 		token_callback.reset(FileServ::newTokenCallback());
 	}
@@ -145,8 +158,8 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		{
 			metadata_buffer_size = 0;
 			metadata_buffer_off = 0;
-			curr_checksum = urb_adler32(0, NULL, 0);
-			if(callback==NULL)
+			curr_checksum = urb_adler32(0, nullptr, 0);
+			if(callback==nullptr)
 			{
 				metadata_state = MetadataState_Common;
 			}
@@ -160,7 +173,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 
 					read_bytes=0;
 					metadata_file.reset();
-					PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+					PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 					metadata_state = MetadataState_Wait;
 					return false;
 				}
@@ -192,7 +205,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 			meta_data.addVarInt(file_meta.accessed);
 			meta_data.addVarInt(folder_items);
 			meta_data.addVarInt(metadata_id);
-			if(token_callback.get()!=NULL)
+			if(token_callback.get()!=nullptr)
 			{
 				meta_data.addString(token_callback->getFileTokens(local_fn));
 			}
@@ -235,7 +248,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		{
 			metadata_buffer_size = 0;
 			metadata_buffer_off = 0;
-			curr_checksum = urb_adler32(0, NULL, 0);
+			curr_checksum = urb_adler32(0, nullptr, 0);
 			metadata_state = MetadataState_Os;
 		}
 		return true;
@@ -273,7 +286,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 
 		if(fn_off==sizeof(unsigned int))
 		{
-			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			metadata_state = MetadataState_Wait;
 		}
 
@@ -319,7 +332,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		if(fn_off==sizeof(unsigned int))
 		{
 			metadata_file.reset();
-			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			metadata_state = MetadataState_Wait;
 		}
 
@@ -335,7 +348,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		}
 		if (raw_metadata.size() - metadata_buffer_off == 0)
 		{
-			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			metadata_state = MetadataState_Wait;
 		}
 		return true;
@@ -404,7 +417,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		{
 			metadata_buffer_size = 0;
 			metadata_buffer_off = 0;
-			curr_checksum = urb_adler32(0, NULL, 0);
+			curr_checksum = urb_adler32(0, nullptr, 0);
 			metadata_state = MetadataState_RawFileData;
 			sha512_init(&transmit_file_ctx);
 		}
@@ -448,9 +461,9 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 		if (metadata_buffer_size - metadata_buffer_off == 0)
 		{
 			transmit_wait_pipe->Write(std::string());
-			transmit_wait_pipe = NULL;
-			transmit_file = NULL;
-			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+			transmit_wait_pipe = nullptr;
+			transmit_file = nullptr;
+			PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			metadata_state = MetadataState_Wait;
 		}
 		return true;
@@ -488,13 +501,14 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 					msg_data.getStr(&local_fn) &&
 					msg_data.getInt64(&folder_items) &&
 					msg_data.getInt64(&metadata_id) &&
-					msg_data.getStr(&server_token))
+					msg_data.getStr(&server_token) &&
+					msg_data.getInt64(&active_gen))
 				{
 					assert(!public_fn.empty() || !local_fn.empty());
 
 					if (std::find(last_public_fns.begin(), last_public_fns.end(), public_fn) != last_public_fns.end())
 					{
-						PipeSessions::fileMetadataDone(public_fn, server_token);
+						PipeSessions::fileMetadataDone(public_fn, server_token, active_gen);
 						*buf = ID_METADATA_NOP;
 						read_bytes = 1;
 						return true;
@@ -511,24 +525,24 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 
 					if (file_type_flags == 0)
 					{
-						Server->Log("Error getting file type of " + local_fn, LL_ERROR);
+						Server->Log("Error getting file type of " + local_fn+". "+os_last_error_str(), LL_ERROR);
 						*buf = ID_METADATA_NOP;
 						read_bytes = 1;
-						PipeSessions::fileMetadataDone(public_fn, server_token);
+						PipeSessions::fileMetadataDone(public_fn, server_token, active_gen);
 						return true;
 					}
 
 					if (!msg_data.getVoidPtr(reinterpret_cast<void**>(&callback)))
 					{
-						callback = NULL;
+						callback = nullptr;
 					}
 
-					if (callback==NULL && !openFileHandle() )
+					if (callback==nullptr && !openFileHandle() )
 					{
 						Server->Log("Error opening file handle to " + local_fn+". "+os_last_error_str(), LL_ERROR);
 						*buf = ID_METADATA_NOP;
 						read_bytes = 1;
-						PipeSessions::fileMetadataDone(public_fn, server_token);
+						PipeSessions::fileMetadataDone(public_fn, server_token, active_gen);
 						return true;
 					}
 
@@ -553,15 +567,15 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 					*buf = ID_METADATA_V1;
 					read_bytes = 1;
 					fn_off = 0;
-					curr_checksum = urb_adler32(0, NULL, 0);
+					curr_checksum = urb_adler32(0, nullptr, 0);
 
-					if(callback!=NULL)
+					if(callback!=nullptr)
 					{
 						std::string orig_path;
 						_u32 version = 0;
 						metadata_file.reset(callback->getMetadata(public_fn, &orig_path, &metadata_file_off, &metadata_file_size, &version, false));
 
-						if (metadata_file.get() == NULL)
+						if (metadata_file.get() == nullptr)
 						{
 							Server->Log("Error opening metadata file for \"" + public_fn + "\"", LL_ERROR);
 							errpipe->Write("Error opening metadata file for \"" + public_fn + "\"");
@@ -569,7 +583,7 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 							*buf = ID_METADATA_NOP;
 							read_bytes = 1;
 							metadata_state = MetadataState_Wait;
-							PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+							PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 							return true;
 						}
 
@@ -585,7 +599,8 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 				else if (id == METADATA_PIPE_SEND_RAW
 					&& msg_data.getStr(&public_fn)
 					&& msg_data.getStr(&raw_metadata)
-					&& msg_data.getStr(&server_token))
+					&& msg_data.getStr(&server_token)
+					&& msg_data.getInt64(&active_gen))
 				{
 					metadata_state = MetadataState_Raw;
 					metadata_buffer_off = 0;
@@ -595,13 +610,14 @@ bool FileMetadataPipe::readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t
 					&& msg_data.getStr(&public_fn)
 					&& msg_data.getVoidPtr(reinterpret_cast<void**>(&transmit_file))
 					&& msg_data.getVoidPtr(reinterpret_cast<void**>(&transmit_wait_pipe))
-					&& msg_data.getStr(&server_token))
+					&& msg_data.getStr(&server_token)
+					&& msg_data.getInt64(&active_gen) )
 				{
 					metadata_state = MetadataState_RawFileFnSize;
 					*buf = ID_RAW_FILE;
 					read_bytes = 1;
 					fn_off = 0;
-					curr_checksum = urb_adler32(0, NULL, 0);
+					curr_checksum = urb_adler32(0, nullptr, 0);
 
 					return true;
 				}
@@ -659,7 +675,7 @@ void FileMetadataPipe::cleanupOnForceShutdown()
 {
 	if (metadata_state != MetadataState_Wait)
 	{
-		PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+		PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 	}
 
 	metadata_file.reset();
@@ -698,24 +714,27 @@ void FileMetadataPipe::cleanupOnForceShutdown()
 				msg_data.getStr(&local_fn) &&
 				msg_data.getInt64(&folder_items) &&
 				msg_data.getInt64(&metadata_id) &&
-				msg_data.getStr(&server_token))
+				msg_data.getStr(&server_token) &&
+				msg_data.getInt64(&active_gen) )
 			{
-				PipeSessions::fileMetadataDone(public_fn, server_token);
+				PipeSessions::fileMetadataDone(public_fn, server_token, active_gen);
 			}
 			else if (id == METADATA_PIPE_SEND_RAW
 				&& msg_data.getStr(&public_fn)
 				&& msg_data.getStr(&raw_metadata)
-				&& msg_data.getStr(&server_token))
+				&& msg_data.getStr(&server_token)
+				&& msg_data.getInt64(&active_gen))
 			{
-				PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+				PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			}
 			else if (id == METADATA_PIPE_SEND_RAW_FILEDATA
 				&& msg_data.getStr(&public_fn)
 				&& msg_data.getVoidPtr(reinterpret_cast<void**>(&transmit_file))
 				&& msg_data.getVoidPtr(reinterpret_cast<void**>(&transmit_wait_pipe))
-				&& msg_data.getStr(&server_token))
+				&& msg_data.getStr(&server_token)
+				&& msg_data.getInt64(&active_gen))
 			{
-				PipeSessions::fileMetadataDone(public_fn.substr(1), server_token);
+				PipeSessions::fileMetadataDone(public_fn.substr(1), server_token, active_gen);
 			}
 		}
 	}
@@ -731,6 +750,22 @@ void FileMetadataPipe::forceExitWait()
 	errpipe->shutdown();
 
 	waitForExit();
+}
+
+IPipe* FileMetadataPipe::getErrPipe()
+{
+	return errpipe.get();
+}
+
+bool FileMetadataPipe::openOsMetadataFile(const std::string& fn)
+{
+	local_fn = fn;
+	return openFileHandle();
+}
+
+bool FileMetadataPipe::readCurrOsMetadata(char* buf, size_t buf_avail, size_t& read_bytes)
+{
+	return transmitCurrMetadata(buf, buf_avail, read_bytes);
 }
 
 #ifdef _WIN32
@@ -981,7 +1016,7 @@ namespace
 		while(true)
 		{
 			ssize_t bufsize;
-            bufsize = llistxattr(fn.c_str(), NULL, 0);
+            bufsize = llistxattr(fn.c_str(), nullptr, 0);
 
 			if(bufsize==-1)
 			{
@@ -1051,7 +1086,7 @@ namespace
 		while(true)
 		{
 			ssize_t bufsize;
-            bufsize = lgetxattr(fn.c_str(), key.c_str()+sizeof(unsigned int), NULL, 0);
+            bufsize = lgetxattr(fn.c_str(), key.c_str()+sizeof(unsigned int), nullptr, 0);
 
 			if(bufsize==-1)
 			{

@@ -93,14 +93,14 @@ void read_config_file(std::string fn, std::vector<std::string>& real_args)
 	}
 
 	bool destroy_server=false;
-	if(Server==NULL)
+	if(Server==nullptr)
 	{
 		Server = new CServer;
 		destroy_server=true;
 	}
 
 	{
-		std::auto_ptr<ISettingsReader> settings(Server->createFileSettingsReader(fn));
+		std::unique_ptr<ISettingsReader> settings(Server->createFileSettingsReader(fn));
 		std::string val;
 		if(settings->getValue("LOGFILE", &val))
 		{
@@ -192,13 +192,15 @@ void read_config_file(std::string fn, std::vector<std::string>& real_args)
 
 	if(destroy_server)
 	{
-		delete Server;
+		delete static_cast<CServer*>(Server);
 	}
 }
 #endif
 
+#ifndef _WIN32
+int restoreclient_main(int argc, char* argv[]);
+#endif
 
-#ifndef RESTORE_CLIENT
 int main(int argc, char* argv[])
 {
 	if(argc==0)
@@ -206,6 +208,13 @@ int main(int argc, char* argv[])
 		std::cout << "Not enough arguments (zero arguments) -- no program name" << std::endl;
 		return 1;
 	}
+
+#ifndef _WIN32
+	if (ExtractFileName(argv[0]) == "urbackuprestoreclient")
+	{
+		return restoreclient_main(argc, argv);
+	}
+#endif
 
 	for(size_t i=1;i<argc;++i)
 	{
@@ -216,6 +225,21 @@ int main(int argc, char* argv[])
 			show_version();
 			return 0;
 		}
+	}
+
+	if (argc > 0 &&
+		std::string(argv[1]) == "--internal")
+	{
+		std::vector<std::string> real_args;
+
+		real_args.push_back(argv[0]);
+
+		for (size_t i = 2; i < argc; ++i)
+		{
+			real_args.push_back(argv[i]);
+		}
+
+		return run_real_main(real_args);
 	}
 
 	try
@@ -326,7 +350,13 @@ int main(int argc, char* argv[])
 		real_args.push_back("--workingdir");
 		real_args.push_back(VARDIR);
 		real_args.push_back("--script_path");
+#if defined(__APPLE__)
+		// ./UrBackup\ Client.app/Contents/MacOS/bin/urbackupclientctl../../share/urbackup/scripts
+		std::string datadir = ExtractFilePath(ExtractFilePath(argv[0])) + "/share/urbackup/scripts";
+		real_args.push_back( datadir + ":" SYSCONFDIR "/urbackup/scripts");
+#else
 		real_args.push_back( DATADIR "/urbackup/scripts:" SYSCONFDIR "/urbackup/scripts");
+#endif
 		real_args.push_back("--pidfile");
 		real_args.push_back(pidfile_arg.getValue());
 		if(std::find(real_args.begin(), real_args.end(), "--logfile")==real_args.end())
@@ -406,10 +436,9 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 }
-#endif
 
-#ifdef RESTORE_CLIENT
-int main(int argc, char* argv[])
+#ifndef _WIN32
+int restoreclient_main(int argc, char* argv[])
 {
 	if (argc == 0)
 	{
@@ -426,6 +455,21 @@ int main(int argc, char* argv[])
 			show_version();
 			return 0;
 		}
+	}
+
+	if (argc > 0 &&
+		std::string(argv[1]) == "--internal")
+	{
+		std::vector<std::string> real_args;
+
+		real_args.push_back(argv[0]);
+
+		for (size_t i = 2; i < argc; ++i)
+		{
+			real_args.push_back(argv[i]);
+		}
+
+		return run_real_main(real_args);
 	}
 
 	try
@@ -481,6 +525,7 @@ int main(int argc, char* argv[])
 
 		TCLAP::SwitchArg restore_wizard_arg("e", "restore-wizard", "Start restore wizard");
 		TCLAP::SwitchArg restore_client_arg("n", "restore-client", "Start restore client");
+		TCLAP::SwitchArg restore_http_arg("x", "restore-http", "Start restore http server");
 
 		TCLAP::ValueArg<std::string> ping_server_arg("p", "ping-server",
 			"Ping server to notify it of client",
@@ -489,14 +534,36 @@ int main(int argc, char* argv[])
 		TCLAP::SwitchArg image_download_progress_arg("q", "image-download-progress",
 			"Return image download progress for piping to dialog");
 
+		TCLAP::SwitchArg image_download_progress_decorate_arg("z", "image-download-progress-decorate",
+			"More verbose printing of image download progress",
+			cmd, false);
+
+		TCLAP::SwitchArg image_download_arg("s", "image-download",
+			"Start a image download");
+
+		TCLAP::SwitchArg mbr_download_arg("b", "mbr-download",
+			"Start a image download");
+
+		TCLAP::ValueArg<std::string> download_token_arg("k", "download-token",
+			"Token to use to start image/MBR download",
+			false, "", "token", cmd);
+
+		TCLAP::ValueArg<std::string> mbr_read_arg("u", "mbr-read",
+			"Read MBR/GPT from device",
+			false, "", "path");
+
 		std::vector<TCLAP::Arg*> xorArgs;
 		xorArgs.push_back(&restore_mbr_arg);
 		xorArgs.push_back(&mbr_info_arg);
 		xorArgs.push_back(&restore_image_arg);
 		xorArgs.push_back(&restore_wizard_arg);
 		xorArgs.push_back(&restore_client_arg);
+		xorArgs.push_back(&restore_http_arg);
 		xorArgs.push_back(&ping_server_arg);
 		xorArgs.push_back(&image_download_progress_arg);
+		xorArgs.push_back(&mbr_download_arg);
+		xorArgs.push_back(&image_download_arg);
+		xorArgs.push_back(&mbr_read_arg);		
 
 		cmd.xorAdd(xorArgs);
 
@@ -585,6 +652,20 @@ int main(int argc, char* argv[])
 			real_args.push_back("--restore_mode");
 			real_args.push_back("true");
 		}
+		else if (restore_http_arg.isSet())
+		{
+			real_args.push_back("--no-server");
+			real_args.push_back("--restore_http");
+			real_args.push_back("true");
+			real_args.push_back("--http_server");
+			real_args.push_back("true");
+			real_args.push_back("--http_root");
+			real_args.push_back("restorewww");
+#ifndef RESTORE_MODE_DEV
+			real_args.push_back("--http_localhost_only");
+			real_args.push_back("1");
+#endif
+		}
 		else if (ping_server_arg.isSet())
 		{
 			real_args.push_back("--no-server");
@@ -602,6 +683,49 @@ int main(int argc, char* argv[])
 			real_args.push_back("true");
 			real_args.push_back("--restore_cmd");
 			real_args.push_back("download_progress");
+			if (image_download_progress_decorate_arg.getValue())
+			{
+				real_args.push_back("--decorate");
+				real_args.push_back("1");
+			}
+		}
+		else if (image_download_arg.isSet()
+			|| mbr_download_arg.isSet() )
+		{
+			if (!out_device_arg.isSet())
+			{
+				std::cout << "You need to specify a device/file to which to download via --out-device" << std::endl;
+				return 1;
+			}
+
+			if (!download_token_arg.isSet())
+			{
+				std::cout << "You need to specify a token to use via --download-token" << std::endl;
+				return 1;
+			}
+
+			real_args.push_back("--no-server");
+			real_args.push_back("--restore");
+			real_args.push_back("true");
+			real_args.push_back("--restore_cmd");
+			if(mbr_download_arg.isSet())
+				real_args.push_back("download_mbr");
+			else
+				real_args.push_back("download_image");
+			real_args.push_back("--restore_token");
+			real_args.push_back(download_token_arg.getValue());
+			real_args.push_back("--restore_out");
+			real_args.push_back(out_device_arg.getValue());
+		}
+		else if (mbr_read_arg.isSet())
+		{
+			real_args.push_back("--no-server");
+			real_args.push_back("--restore");
+			real_args.push_back("true");
+			real_args.push_back("--restore_cmd");
+			real_args.push_back("read_mbr");
+			real_args.push_back("--device_fn");
+			real_args.push_back(mbr_read_arg.getValue());
 		}
 
 		return run_real_main(real_args);

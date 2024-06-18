@@ -327,7 +327,7 @@ char* CWData::getDataPtr(void)
 	if(data.size()>0)
 		return &data[0];
 	else
-		return NULL;
+		return nullptr;
 }
 
 unsigned long CWData::getDataSize(void)
@@ -420,6 +420,21 @@ void CWData::clear()
 	data.clear();
 }
 
+void CWData::reserve(size_t count)
+{
+	data.reserve(count);
+}
+
+void CWData::resize(size_t count)
+{
+	data.resize(count);
+}
+
+size_t CWData::capacity()
+{
+	return data.capacity();
+}
+
 void CWData::addVarInt( int64 ta )
 {
 	size_t cpos=data.size();
@@ -431,13 +446,13 @@ void CWData::addVarInt( int64 ta )
 
 CRData::CRData(const char* c,size_t datalength, bool pCopy)
 {
-	data=NULL;
+	data=nullptr;
 	set(c,datalength, pCopy);
 }
 
 CRData::CRData(void)
 {
-	data=NULL;
+	data=nullptr;
 	streampos=0;
 	datalen=0;
 }
@@ -453,7 +468,7 @@ void CRData::set(const char* c,size_t datalength, bool pCopy)
 	}
 	else
 	{
-		if( data!=NULL )
+		if( data!=nullptr )
 			delete [] data;
 		data=new char[datalen];
 		memcpy(const_cast<char*>(data), c, datalen);
@@ -588,7 +603,8 @@ bool CRData::getStr2(std::string *ret)
 		return false;
 	}
 
-	if (strlen>10 * 1024 * 1024)
+	if (strlen>10 * 1024 * 1024
+		|| strlen<0)
 	{
 		return false;
 	}

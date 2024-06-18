@@ -15,7 +15,7 @@
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 **************************************************************************/
-
+#define __STDC_LIMIT_MACROS
 #include <iostream>
 #include <limits.h>
 #include <fstream>
@@ -160,7 +160,7 @@ public:
 		fsize = sb.st_size;
 		num_entries = static_cast<size_t>(sb.st_size / sizeof(int32_t));
 
-		view = reinterpret_cast<int*>(mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, hFile, 0));
+		view = reinterpret_cast<int*>(mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, hFile, 0));
 		if (view == MAP_FAILED)
 		{
 			has_error = true;
@@ -359,7 +359,7 @@ public:
 		}
 		
 		map_size = fsize - start_map;
-		view_start = reinterpret_cast<char*>(mmap(NULL, fsize-start_map, PROT_READ, MAP_PRIVATE, hFile, start_map));
+		view_start = reinterpret_cast<char*>(mmap(nullptr, fsize-start_map, PROT_READ, MAP_PRIVATE, hFile, start_map));
 		if (view_start == MAP_FAILED)
 		{
 			has_error = true;
@@ -610,11 +610,10 @@ size_t fill_buffer(size_t toread, size_t offset, std::vector<char>& buffer, std:
     size_t read = 0;
     do
     {
-		std::streamsize r = in_stream.readsome(buffer.data() + offset + read, toread - read);
+		std::streamsize r = in_stream.rdbuf()->sgetn(buffer.data() + offset + read, toread - read);
+		in_stream.rdstate();
+		in_stream.peek();
 		read += static_cast<size_t>(r);
-
-		if (r == 0)
-			in_stream.peek();
 
         if (in_stream.eof())
         {
@@ -1049,7 +1048,7 @@ void show_help()
 	std::cout << "\t-r, --restore" << std::endl;
 	std::cout << "\t  Restore file to its original layout" << std::endl;
 	std::cout << "\t[input file]" << std::endl;
-	std::cout << "\t  File to read and align. If \"-\" input is read from stdout." << std::endl;
+	std::cout << "\t  File to read and align. If \"-\" input is read from stdin." << std::endl;
 	std::cout << "\t[output file]" << std::endl;
 	std::cout << "\t  File where the block aligned output is written." <<std::endl
 		<< "\t  If \"-\" output is written to stdout." << std::endl;
@@ -1077,7 +1076,7 @@ int blockalign(const std::string& name, std::istream& in_stream, std::ostream& o
 		out_stream.write(magic.c_str(), magic.size());
 		out_stream.write(reinterpret_cast<const char*>(&blocksize_avg), sizeof(blocksize_avg));
 
-		if (out_stream.tellp() - start_pos != magic.size() + sizeof(blocksize_avg))
+		if (&out_stream != &std::cout && out_stream.tellp() - start_pos != magic.size() + sizeof(blocksize_avg))
 		{
 			std::cerr << "Out stream position wrong after writing magic" << std::endl;
 			return 1;
@@ -1200,7 +1199,7 @@ int blockalign(const std::string& name, std::istream& in_stream, std::ostream& o
 		int64_t bmsize = blockmap.size();
 		out_stream.write(reinterpret_cast<char*>(&bmsize), sizeof(bmsize));
 
-		if (out_stream.tellp() - ppos != blockmap.size() * sizeof(int32_t) + sizeof(bmsize))
+		if (&out_stream != &std::cout && out_stream.tellp() - ppos != blockmap.size() * sizeof(int32_t) + sizeof(bmsize))
 		{
 			std::cerr << "Out stream position wrong after writing block map" << std::endl;
 			return 1;
@@ -1293,7 +1292,7 @@ int main(int argc, char* argv[])
 
     if (name.empty() && !restore)
     {
-        std::cerr << "Stream name not given as an argument" << std::endl;
+        std::cerr << "Hash output name not given as an argument" << std::endl;
 		show_help();
         return 1;
     }
@@ -1367,8 +1366,7 @@ int main(int argc, char* argv[])
 		ret = 2;
 	}
 
-	if (ret==0
-		&& output == &out_stream)
+	if (ret==0)
 	{
 		out_stream.close();
 

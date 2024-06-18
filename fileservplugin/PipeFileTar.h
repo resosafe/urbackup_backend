@@ -81,7 +81,7 @@ public:
 
 		size_t refcount;
 		IPipeFile* pipe_file;
-		std::auto_ptr<IMutex> mutex;
+		std::unique_ptr<IMutex> mutex;
 		std::set<std::string> paths;
 	};
 
@@ -121,8 +121,11 @@ public:
 	virtual void removeUser();
 	virtual bool hasUser();
 	virtual int64 getPos();
+	virtual bool waitForStderr(int64 timeoutms);
 
 private:
+
+	void hashReadData(int64 spos, const char* buffer, _u32 bsize);
 
 	std::string buildCurrMetadata();
 
@@ -137,7 +140,7 @@ private:
 	sha_def_ctx sha_ctx;
 	int64 hash_pos;
 
-	std::auto_ptr<IMutex> mutex;
+	std::unique_ptr<IMutex> mutex;
 
 	PipeFileStore* pipe_file;
 
@@ -153,3 +156,7 @@ private:
 	std::string identity;
 };
 
+
+#if defined(_WIN32) || defined(__APPLE__) || defined(__FreeBSD__)
+#undef stat64
+#endif

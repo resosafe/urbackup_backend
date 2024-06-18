@@ -6,6 +6,8 @@
 #include <setjmp.h>
 #endif
 
+#include <cstdint> // for uintptr_t data type
+
 // Visual Studio needs VS2008 (1500)
 //  http://msdn.microsoft.com/en-us/library/bb531394%28v=vs.90%29.aspx
 #if defined(_MSC_VER) && (_MSC_VER < 1500)
@@ -44,6 +46,12 @@
 # include <arm_acle.h>
 #endif
 # endif
+#endif
+
+#if CRYPTOPP_BOOL_SSE4_INTRINSICS_AVAILABLE
+#if defined(_MSC_VER) 
+#include <intrin.h>
+#endif
 #endif
 
 #if defined(_MSC_VER) || defined(__BORLANDC__)
@@ -199,7 +207,7 @@ namespace cryptopp_crc
 	//!   In <em>all</em> cases, if <tt>CRYPTOPP_ALLOW_UNALIGNED_DATA_ACCESS</tt> is defined, then the
 	//!   function returns 1.
 	template <class T>
-	inline unsigned int GetAlignmentOf(T *dummy = NULL)	// VC60 workaround
+	inline unsigned int GetAlignmentOf(T *dummy = nullptr)	// VC60 workaround
 	{
 		// GCC 4.6 (circa 2008) and above aggressively uses vectorization.
 #if defined(CRYPTOPP_ALLOW_UNALIGNED_DATA_ACCESS)

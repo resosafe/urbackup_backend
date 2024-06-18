@@ -44,6 +44,12 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef __APPLE__
+#include <iostream>
+#include <sys/xattr.h>
+#include <sys/types.h>
+#endif
+
 const int c_group_vss_components = -1;
 const int c_group_default = 0;
 const int c_group_continuous = 1;
@@ -59,6 +65,7 @@ const unsigned int flag_calc_checksums = 8;
 const unsigned int flag_with_orig_path = 16;
 const unsigned int flag_with_sequence = 32;
 const unsigned int flag_with_proper_symlinks = 64;
+
 
 const uint64 change_indicator_symlink_bit = 0x4000000000000000ULL;
 const uint64 change_indicator_special_bit = 0x2000000000000000ULL;
@@ -80,9 +87,18 @@ private:
 	volatile static bool pause;
 };
 
+enum CbtType
+{
+	CbtType_None,
+	CbtType_Datto,
+	CbtType_Era
+};
+
 struct SCRef
 {
-	SCRef(void): ok(false), dontincrement(false), cbt(false), for_imagebackup(false), with_writers(false) {
+	SCRef(void): ok(false), dontincrement(false), cleanup(false), cbt(false),
+		for_imagebackup(false), with_writers(false),
+		cbt_type(CbtType_None) {
 #ifdef _WIN32
 		backupcom = NULL;
 #endif
@@ -99,11 +115,20 @@ struct SCRef
 	int save_id;
 	bool ok;
 	bool dontincrement;
+	bool cleanup;
+	size_t cleanup_gen;
 	std::vector<std::string> starttokens;
+	std::vector<std::string> sharenames;
 	std::string clientsubname;
 	bool cbt;
 	bool for_imagebackup;
 	bool with_writers;
+	std::string cbt_file;
+	CbtType cbt_type;
+
+#ifndef _WIN32
+	std::vector<IFsFile::os_file_handle> flock_fds;
+#endif
 };
 
 struct SCDirs
@@ -181,6 +206,7 @@ struct SBackupScript
 	std::string outputname;
 	int64 size;
 	std::string orig_path;
+	int64 lastmod;
 
 	bool operator<(const SBackupScript &other) const
 	{
@@ -277,7 +303,7 @@ public:
 
 struct SQueueRef
 {
-	std::auto_ptr<IMutex> mutex;
+	std::unique_ptr<IMutex> mutex;
 	IFile* phash_queue;
 	size_t refcount;
 	IDeregisterFileSrvScriptFn* dereg_fn;
@@ -310,6 +336,11 @@ struct SQueueRef
 	}
 };
 
+#ifdef _WIN32
+struct _URBCT_BITMAP_DATA;
+typedef struct _URBCT_BITMAP_DATA* PURBCT_BITMAP_DATA;
+#endif
+
 class IndexThread : public IThread, public IFileServ::IReadErrorCallback, public IDeregisterFileSrvScriptFn
 {
 public:
@@ -321,6 +352,8 @@ public:
 	static const char IndexThreadAction_PingShadowCopy;
 	static const char IndexThreadAction_AddWatchdir;
 	static const char IndexThreadAction_RemoveWatchdir;
+	static const char IndexThreadAction_RestartFilesrv;
+	static const char IndexThreadAction_Stop;
 	static const char IndexThreadAction_UpdateCbt;
 	static const char IndexThreadAction_ReferenceShadowcopy;
 	static const char IndexThreadAction_SnapshotCbt;
@@ -349,6 +382,9 @@ public:
 	
 	static bool backgroundBackupsEnabled(const std::string& clientsubname);
 
+	static bool pauseIfWindowsUnlocked();
+
+	static std::vector<std::string> buildExcludeList(const std::string& val);
 	static std::vector<std::string> parseExcludePatterns(const std::string& val);
 	static std::vector<SIndexInclude> parseIncludePatterns(const std::string& val);
 
@@ -364,7 +400,7 @@ public:
 
 	static bool normalizeVolume(std::string& volume);
 
-	static void readPatterns(int index_group, std::string index_clientsubname,
+	static void readPatterns(int facet_id, int index_group, std::string index_clientsubname,
 		std::vector<std::string>& exclude_dirs, std::vector<SIndexInclude>& include_dirs,
 		bool& backup_dirs_optional);
 
@@ -381,6 +417,12 @@ public:
 	static bool unrefResult(unsigned int id);
 
 	static void removeResult(unsigned int id);
+
+#ifndef _WIN32
+	static std::string get_snapshot_script_location(const std::string& scriptname, const std::string& index_clientsubname);
+#endif
+
+	static bool isWindowsLocked();
 	
 private:
 	static void addResult(unsigned int id, const std::string& res);
@@ -410,9 +452,9 @@ private:
 
 	enum IndexErrorInfo
 	{
-		IndexErrorInfo_Ok,
-		IndexErrorInfo_Error,
-		IndexErrorInfo_NoBackupPaths
+		IndexErrorInfo_Ok = 0,
+		IndexErrorInfo_Error = 1,
+		IndexErrorInfo_NoBackupPaths = 2
 	};
 
 	IndexErrorInfo indexDirs(bool full_backup, bool simultaneous_other);
@@ -459,9 +501,9 @@ private:
 	void removeUnconfirmedVssDirs();
 	std::string expandPath(BSTR pathStr);
 	void removeBackupcomReferences(IVssBackupComponents *backupcom);
+	bool addFileToCbt(const std::string& fpath, const DWORD& blocksize, const PURBCT_BITMAP_DATA& bitmap_data);
 #else
 	bool start_shadowcopy_lin( SCDirs * dir, std::string &wpath, bool for_imagebackup, bool * &onlyref, bool* not_configured);
-	std::string get_snapshot_script_location(const std::string& name);
 	bool get_volumes_mounted_locally();
 	bool getVssSettings() { return true; }
 #endif
@@ -476,9 +518,9 @@ private:
 
 	SCDirs* getSCDir(const std::string& path, const std::string& clientsubname, bool for_imagebackup);
 
-	int execute_hook(std::string script_name, bool incr, std::string server_token, int* index_group);
+	int execute_hook(std::string script_name, bool incr, std::string server_token, int* index_group, int* error_info=NULL);
 	int execute_prebackup_hook(bool incr, std::string server_token, int index_group);
-	int execute_postindex_hook(bool incr, std::string server_token, int index_group);
+	int execute_postindex_hook(bool incr, std::string server_token, int index_group, IndexErrorInfo error_info);
 	std::string execute_script(const std::string& cmd, const std::string& args);
 
 	int execute_preimagebackup_hook(bool incr, std::string server_token);
@@ -517,6 +559,17 @@ private:
 	static void addFileExceptions(std::vector<std::string>& exclude_dirs);
 
 	static void addHardExcludes(std::vector<std::string>& exclude_dirs);
+    
+#ifdef __APPLE__
+    static std::vector<std::string> macos_exclusions;
+    static std::vector<std::string> macos_overrides;
+    
+    static void addMacOSExcludes(std::vector<std::string>& exclude_dirs);
+    static void logMacOSExclude(const std::string path);
+    static std::string returnExcludeDirsMatch(std::vector<std::string> exclude_dirs, std::string path);
+    static bool isExcludedByXattr(const std::string path);
+    static void logIsExcludedByXattr(const std::string path);
+#endif
 
 	void handleHardLinks(const std::string& bpath, const std::string& vsspath, const std::string& normalized_volume);
 
@@ -566,7 +619,15 @@ private:
 
 	bool prepareCbt(std::string volume);
 
-	bool finishCbt(std::string volume, int shadow_id, std::string snap_volume, bool for_image_backup);
+	bool finishCbt(std::string volume, int shadow_id, std::string snap_volume, bool for_image_backup, std::string cbt_file, CbtType cbt_type);
+
+#ifndef _WIN32
+	bool finishCbtDatto(IFile* volfile, IFsFile* hdat_file, IFsFile* hdat_img, std::string volume, int shadow_id, std::string snap_volume, bool for_image_backup, std::string cbt_file);
+#endif
+
+	bool finishCbtEra(IFsFile* hdat_file, IFsFile* hdat_img, std::string volume, int shadow_id, std::string snap_volume, bool for_image_backup, std::string cbt_file, int64& hdat_file_era, int64& hdat_img_era);
+
+	bool finishCbtEra2(IFsFile* hdat, int64 hdat_era);
 
 	bool disableCbt(std::string volume);
 
@@ -602,9 +663,13 @@ private:
 
 	bool isAllSpecialDir(const SBackupDir& bdir);
 
+	bool punchHoleOrZero(IFile* f, int64 pos, const char* zero_buf, char* zero_read_buf, size_t zero_size);
+
+	void run_sc_refs_cleanup();
+
 	SVolumesCache* volumes_cache;
 
-	std::auto_ptr<ScopedBackgroundPrio> background_prio;
+	std::unique_ptr<ScopedBackgroundPrio> background_prio;
 
 	std::string starttoken;
 
@@ -637,6 +702,8 @@ private:
 	std::map<SCDirServerKey, std::map<std::string, SCDirs*> > scdirs;
 	std::vector<SCRef*> sc_refs;
 
+	bool sc_refs_cleanup;
+
 	int index_c_db;
 	int index_c_fs;
 	int index_c_db_update;
@@ -663,7 +730,7 @@ private:
 		int64 target_generation;
 	};
 
-	std::auto_ptr<ClientHash> client_hash;
+	std::unique_ptr<ClientHash> client_hash;
 
 	std::vector< SBufferItem > modify_file_buffer;
 	size_t modify_file_buffer_size;
@@ -681,6 +748,7 @@ private:
 	EBackupDirServerDefault index_server_default;
 	bool index_follow_last;
 	bool index_keep_files;
+	int index_facet_id = 1;
 
 	SCDirs* index_scd;
 
@@ -812,12 +880,12 @@ private:
 		const std::vector<std::string>& exclude_dirs,
 		const std::vector<SIndexInclude>& include_dirs, const std::string& orig_path);
 
-	std::auto_ptr<SLastFileList> last_filelist;
+	std::unique_ptr<SLastFileList> last_filelist;
 
 	std::vector<SReadError> read_errors;
 	IMutex* read_error_mutex;
 
-	std::auto_ptr<IFsFile> index_hdat_file;
+	std::unique_ptr<IFsFile> index_hdat_file;
 	std::map<std::string, size_t> index_hdat_sequence_ids;
 	int64 index_hdat_fs_block_size;
 	int64 index_chunkhash_pos;
@@ -838,6 +906,8 @@ private:
 	static std::map<unsigned int, SResult> index_results;
 	static unsigned int next_result_id;
 	static IMutex* result_mutex;
+
+	std::vector<IFsFile::os_file_handle> flock_fds_perm;
 
 #ifdef _WIN32
 	struct SComponent

@@ -34,8 +34,13 @@
 #include "../urbackupcommon/internet_pipe_capabilities.h"
 #include "../urbackupcommon/CompressedPipe2.h"
 #include "../urbackupcommon/CompressedPipeZstd.h"
+#include "../urbackupcommon/WebSocketPipe.h"
 
 #include "../stringtools.h"
+
+#ifndef _WIN32
+#include "../config.h"
+#endif
 
 #include <stdlib.h>
 #include <memory.h>
@@ -46,19 +51,14 @@
 extern ICryptoFactory *crypto_fak;
 const unsigned int pbkdf2_iterations=20000;
 
-IMutex *InternetClient::mutex=NULL;
 bool InternetClient::connected=false;
-size_t InternetClient::n_connections=0;
 int64 InternetClient::last_lan_connection=0;
-bool InternetClient::update_settings=false;
+std::set<int> InternetClient::update_settings;
 SServerSettings InternetClient::server_settings;
-ICondition *InternetClient::wakeup_cond=NULL;
-int InternetClient::auth_err=0;
-std::queue<std::pair<unsigned int, std::string> > InternetClient::onetime_tokens;
 bool InternetClient::do_exit=false;
-IMutex *InternetClient::onetime_token_mutex=NULL;
-std::string InternetClient::status_msg="initializing";
-
+IMutex* InternetClient::g_mutex = nullptr;
+std::map<int, std::string> InternetClient::status_msgs;
+std::map<int, ICondition*> InternetClient::running_client_facets;
 
 const unsigned int ic_lan_timeout=10*60*1000;
 const unsigned int spare_connections=1;
@@ -71,17 +71,29 @@ const int ic_sleep_after_auth_errs=2;
 const char SERVICE_COMMANDS=0;
 const char SERVICE_FILESRV=1;
 
+namespace
+{
+	std::string formatServerForLog(const SServerConnectionSettings& ss)
+	{
+		if (next(ss.hostname, 0, "ws://") ||
+			next(ss.hostname, 0, "wss://"))
+		{
+			return ss.hostname;
+		}
+
+		return "urbackup://"+ss.hostname+":"+convert(ss.port)
+			+ (ss.proxy.empty() ? "" : (" via HTTP proxy " + ss.proxy));
+	}
+}
+
 void InternetClient::init_mutex(void)
 {
-	mutex=Server->createMutex();
-	wakeup_cond=Server->createCondition();
-	onetime_token_mutex=Server->createMutex();
+	g_mutex = Server->createMutex();
 }
 
 void InternetClient::destroy_mutex(void)
 {
-	Server->destroy(mutex);
-	Server->destroy(wakeup_cond);
+	Server->destroy(g_mutex);
 }
 
 std::string InternetClientThread::generateRandomBinaryAuthKey(void)
@@ -94,14 +106,14 @@ std::string InternetClientThread::generateRandomBinaryAuthKey(void)
 
 void InternetClient::hasLANConnection(void)
 {
-	IScopedLock lock(mutex);
+	IScopedLock lock(g_mutex);
 	last_lan_connection=Server->getTimeMS();
 }
 
 int64 InternetClient::timeSinceLastLanConnection()
 {
 	int64 ctime=Server->getTimeMS();
-	IScopedLock lock(mutex);
+	IScopedLock lock(g_mutex);
 
 	if(ctime>last_lan_connection)
 	{
@@ -115,13 +127,13 @@ int64 InternetClient::timeSinceLastLanConnection()
 
 bool InternetClient::isConnected(void)
 {
-	IScopedLock lock(mutex);
+	IScopedLock lock(g_mutex);
 	return connected;
 }
 
 void InternetClient::setHasConnection(bool b)
 {
-	IScopedLock lock(mutex);
+	IScopedLock lock(g_mutex);
 	connected=b;
 }
 
@@ -140,8 +152,12 @@ void InternetClient::rmConnection(void)
 
 void InternetClient::updateSettings(void)
 {
-	IScopedLock lock(mutex);
-	update_settings=true;
+	IScopedLock lock(g_mutex);
+	for (auto& it : running_client_facets)
+	{
+		update_settings.insert(it.first);
+		it.second->notify_one();
+	}
 }
 
 void InternetClient::setHasAuthErr(void)
@@ -158,6 +174,10 @@ void InternetClient::resetAuthErr(void)
 
 void InternetClient::operator()(void)
 {
+	{
+		IScopedLock lock(g_mutex);
+		running_client_facets[facet_id] = wakeup_cond;
+	}
 	Server->waitForStartupComplete();
 
 	setStatusMsg("wait_local");
@@ -178,11 +198,13 @@ void InternetClient::operator()(void)
 		{
 			Server->wait(1000);
 			{
-				IScopedLock lock(mutex);
-				if (update_settings)
+				IScopedLock lock(g_mutex);
+				if (update_settings.find(facet_id)!=update_settings.end())
 				{
+					update_settings.erase(facet_id);
+					lock.relock(mutex);
+
 					doUpdateSettings();
-					update_settings = false;
 
 					if (!has_server
 						&& !server_settings.servers.empty())
@@ -200,12 +222,14 @@ void InternetClient::operator()(void)
 	doUpdateSettings();
 	while(!do_exit)
 	{
-		IScopedLock lock(mutex);
-		if(update_settings)
+		IScopedLock lock(g_mutex);
+		if(update_settings.find(facet_id) != update_settings.end())
 		{
+			update_settings.erase(facet_id);
+			lock.relock(mutex);
 			doUpdateSettings();
-			update_settings=false;
 		}
+
 		if(server_settings.internet_connect_always || last_lan_connection==0 || Server->getTimeMS()-last_lan_connection>ic_lan_timeout)
 		{
 			if(!connected)
@@ -223,7 +247,7 @@ void InternetClient::operator()(void)
 			{
 				if(n_connections<spare_connections)
 				{
-					Server->getThreadPool()->execute(new InternetClientThread(NULL, server_settings, NULL), "internet client");
+					Server->getThreadPool()->execute(new InternetClientThread(this, nullptr, server_settings, nullptr), "internet client");
 					newConnection();
 				}
 				else
@@ -231,7 +255,7 @@ void InternetClient::operator()(void)
 					wakeup_cond->wait(&lock);
 					if(auth_err>=ic_sleep_after_auth_errs)
 					{
-						lock.relock(NULL);
+						lock.relock(nullptr);
 						Server->wait(ic_lan_timeout/2);
 					}
 				}
@@ -251,8 +275,8 @@ void InternetClient::doUpdateSettings(void)
 {
 	server_settings.servers.clear();
 
-	ISettingsReader *settings=Server->createFileSettingsReader("urbackup/data/settings.cfg");
-	if(settings==NULL)
+	ISettingsReader *settings=Server->createFileSettingsReader(settings_fn);
+	if(settings==nullptr)
 	{
 		Server->Log("Cannot open settings in InternetClient", LL_WARNING);
 		return;
@@ -267,7 +291,6 @@ void InternetClient::doUpdateSettings(void)
 			if(Server->getServerParameter("internet_only_mode")=="true")
 			{
 				Server->Log("Internet mode not enabled. Please set \"internet_mode_enabled\" to \"true\".", LL_ERROR);
-				exit(2);
 			}
 			else
 			{
@@ -395,18 +418,17 @@ bool InternetClient::tryToConnect(IScopedLock *lock)
 	{
 		SServerConnectionSettings selected_server_settings = server_settings.servers[i];
 
-		lock->relock(NULL);
-		Server->Log("Trying to connect to internet server \""+ selected_server_settings .hostname+"\" at port "+convert(selected_server_settings.port)
-			+ (selected_server_settings.proxy.empty() ? "" : (" via HTTP proxy "+ selected_server_settings.proxy)), LL_DEBUG);
-		std::auto_ptr<CTCPStack> tcpstack(new CTCPStack(true));
+		lock->relock(nullptr);
+		Server->Log("Trying to connect to internet server "+ formatServerForLog(selected_server_settings), LL_DEBUG);
+		std::unique_ptr<CTCPStack> tcpstack(new CTCPStack(true));
 		IPipe *cs = connect(selected_server_settings, *tcpstack);
 		lock->relock(mutex);
-		if(cs!=NULL)
+		if(cs!=nullptr)
 		{
 			server_settings.selected_server=i;
 			Server->Log("Successfully connected.", LL_DEBUG);
 			setStatusMsg("connected");
-			Server->getThreadPool()->execute(new InternetClientThread(cs, server_settings, tcpstack.release()), "internet client");
+			Server->getThreadPool()->execute(new InternetClientThread(this, cs, server_settings, tcpstack.release()), "internet client");
 			newConnection();
 			return true;
 		}
@@ -417,34 +439,49 @@ bool InternetClient::tryToConnect(IScopedLock *lock)
 	return false;
 }
 
-THREADPOOL_TICKET InternetClient::start(bool use_pool)
+std::vector<THREADPOOL_TICKET> InternetClient::start(bool use_pool)
 {
 	init_mutex();
-	if(!use_pool)
+
+	std::vector<SFile> facet_dirs = getFiles("urbackup");
+
+	std::vector<THREADPOOL_TICKET> ret;
+	for (SFile& fdir : facet_dirs)
 	{
-		Server->createThread(new InternetClient, "internet client main");
-		return ILLEGAL_THREADPOOL_TICKET;
-	}
-	else
-	{
-		return Server->getThreadPool()->execute(new InternetClient, "internet client main");
-	}
+		if (!fdir.isdir || !next(fdir.name, 0, "data_"))
+			continue;
+
+		int facet_id = watoi(getafter("data_", fdir.name));
+		std::string settings_fn = "urbackup/data_" + convert(facet_id) + "/settings.cfg";
+
+		if (!use_pool)
+		{
+			Server->createThread(new InternetClient(facet_id, settings_fn), "internet client main");
+		}
+		else
+		{
+			THREADPOOL_TICKET tt= Server->getThreadPool()->execute(new InternetClient(facet_id, settings_fn), "internet client main");
+			ret.push_back(tt);
+		}
+	}	
+	return ret;
 }
 
-void InternetClient::stop(THREADPOOL_TICKET tt)
+void InternetClient::stop(std::vector<THREADPOOL_TICKET> tt)
 {
 	{
-		IScopedLock lock(mutex);
+		IScopedLock lock(g_mutex);
 		do_exit=true;
-		wakeup_cond->notify_all();
+
+		for(auto it: running_client_facets)
+			it.second->notify_all();
 	}
 
-	if(tt==ILLEGAL_THREADPOOL_TICKET)
-		Server->wait(1000);
-	else
+	if (!tt.empty())
+	{
 		Server->getThreadPool()->waitFor(tt);
-
-	destroy_mutex();
+		destroy_mutex();
+	}
 }
 
 void InternetClient::addOnetimeToken(const std::string &token)
@@ -489,22 +526,22 @@ void InternetClient::clearOnetimeTokens()
 	}
 }
 
-std::string InternetClient::getStatusMsg()
+std::string InternetClient::getStatusMsg(int facet_id)
 {
-	IScopedLock lock(mutex);
-	return status_msg;
+	IScopedLock lock(g_mutex);
+	return status_msgs[facet_id];
 }
 
 void InternetClient::setStatusMsg(const std::string& msg)
 {
-	IScopedLock lock(mutex);
-	status_msg=msg;
+	IScopedLock lock(g_mutex);
+	status_msgs[facet_id]=msg;
 }
 
-InternetClientThread::InternetClientThread(IPipe *cs, const SServerSettings &server_settings, CTCPStack* tcpstack)
-	: cs(cs), server_settings(server_settings), tcpstack(tcpstack)
+InternetClientThread::InternetClientThread(InternetClient* internet_client, IPipe *cs, const SServerSettings &server_settings, CTCPStack* tcpstack)
+	: internet_client(internet_client), cs(cs), server_settings(server_settings), tcpstack(tcpstack)
 {
-	if (this->tcpstack == NULL)
+	if (this->tcpstack == nullptr)
 		this->tcpstack = new CTCPStack(true);
 }
 
@@ -517,7 +554,7 @@ char *InternetClientThread::getReply(CTCPStack *tcpstack, IPipe *pipe, size_t &r
 {
 	int64 starttime=Server->getTimeMS();
 	char *buf = tcpstack->getPacket(&replysize);
-	if (buf != NULL)
+	if (buf != nullptr)
 		return buf;
 
 	while(Server->getTimeMS()-starttime<timeoutms)
@@ -526,14 +563,14 @@ char *InternetClientThread::getReply(CTCPStack *tcpstack, IPipe *pipe, size_t &r
 		size_t rc=pipe->Read(&ret, timeoutms);
 		if(rc==0)
 		{
-			return NULL;
+			return nullptr;
 		}
 		tcpstack->AddData((char*)ret.c_str(), ret.size());
 		buf=tcpstack->getPacket(&replysize);
-		if(buf!=NULL)
+		if(buf!=nullptr)
 			return buf;
 	}
-	return NULL;
+	return nullptr;
 }
 
 void InternetClientThread::operator()(void)
@@ -541,39 +578,37 @@ void InternetClientThread::operator()(void)
 	bool finish_ok=false;
 	bool rm_connection=true;
 
-	if(cs==NULL)
+	if(cs==nullptr)
 	{
 		int tries=10;
-		while(tries>0 && cs==NULL)
+		while(tries>0 && cs==nullptr)
 		{
 			cs = InternetClient::connect(server_settings.servers[server_settings.selected_server], *tcpstack);
 			--tries;
-			InternetClient::setStatusMsg("connecting_failed");
-			if(cs==NULL && tries>0)
+			internet_client->setStatusMsg("connecting_failed");
+			if(cs==nullptr && tries>0)
 			{
-				Server->Log("Connecting to server "+server_settings.servers[server_settings.selected_server].hostname
-					+(server_settings.servers[server_settings.selected_server].proxy.empty() ? "" : (" via HTTP proxy " + server_settings.servers[server_settings.selected_server].proxy)) + " failed. Retrying in 30s...", LL_INFO);
+				Server->Log("Connecting to server "+ formatServerForLog(server_settings.servers[server_settings.selected_server]) + " failed. Retrying in 30s...", LL_INFO);
 				Server->wait(30000);
 			}
 		}
-		if(cs==NULL)
+		if(cs==nullptr)
 		{
-			Server->Log("Connecting to server "+server_settings.servers[server_settings.selected_server].hostname
-				+(server_settings.servers[server_settings.selected_server].proxy.empty() ? "" : (" via HTTP proxy " + server_settings.servers[server_settings.selected_server].proxy))
+			Server->Log("Connecting to server "+ formatServerForLog(server_settings.servers[server_settings.selected_server])
 				+ " failed", LL_INFO);
-			InternetClient::rmConnection();
-			InternetClient::setHasConnection(false);
-			InternetClient::setStatusMsg("connecting_failed");
+			internet_client->rmConnection();
+			internet_client->setHasConnection(false);
+			internet_client->setStatusMsg("connecting_failed");
 			return;
 		}
 		else
 		{
-			InternetClient::setStatusMsg("connected");
+			internet_client->setStatusMsg("connected");
 		}
 	}
 
-	IPipe *comm_pipe=NULL;
-	IPipe *comp_pipe=NULL;
+	IPipe *comm_pipe=nullptr;
+	IPipe *comp_pipe=nullptr;
 
 	std::string challenge;
 	unsigned int server_capa;
@@ -597,7 +632,7 @@ void InternetClientThread::operator()(void)
 		char *buf;
 		size_t bufsize;
 		buf=getReply(tcpstack, cs, bufsize, ic_auth_timeout);	
-		if(buf==NULL)
+		if(buf==nullptr)
 		{
 			Server->Log("Error receiving challenge packet");
 			goto cleanup;
@@ -619,7 +654,7 @@ void InternetClientThread::operator()(void)
 			{
 				std::string error = "Not enough challenge fields -1";
 				Server->Log(error, LL_ERROR);
-				InternetClient::setStatusMsg("error:"+error);
+				internet_client->setStatusMsg("error:"+error);
 				goto cleanup;
 			}
 
@@ -627,7 +662,7 @@ void InternetClientThread::operator()(void)
 			{
 				std::string error = "No server public key. Server version probably not new enough.";
 				Server->Log(error, LL_ERROR);
-				InternetClient::setStatusMsg("error:"+error);
+				internet_client->setStatusMsg("error:"+error);
 				goto cleanup;
 			}
 
@@ -635,7 +670,7 @@ void InternetClientThread::operator()(void)
 			{
 				std::string error = "Challenge not long enough -1";
 				Server->Log(error, LL_ERROR);
-				InternetClient::setStatusMsg("error:"+error);
+				internet_client->setStatusMsg("error:"+error);
 				goto cleanup;
 			}
 		}
@@ -643,13 +678,13 @@ void InternetClientThread::operator()(void)
 		{
 			std::string error = "Unknown response id -2";
 			Server->Log(error, LL_ERROR);
-			InternetClient::setStatusMsg("error:"+error);
+			internet_client->setStatusMsg("error:"+error);
 			goto cleanup;
 		}
 	}
 	
 	{
-		std::pair<unsigned int, std::string> token=InternetClient::getOnetimeToken();
+		std::pair<unsigned int, std::string> token=internet_client->getOnetimeToken();
 
 		CWData data;
 		if(token.second.empty())
@@ -667,10 +702,16 @@ void InternetClientThread::operator()(void)
 
 		if(token.second.empty())
 		{
-			std::auto_ptr<IECDHKeyExchange> ecdh_key_exchange(crypto_fak->createECDHKeyExchange());
+			std::unique_ptr<IECDHKeyExchange> ecdh_key_exchange(crypto_fak->createECDHKeyExchange());
 
-			authkey=server_settings.authkey;			
-			std::string salt = challenge+client_challenge+ecdh_key_exchange->getSharedKey(server_pubkey);
+			std::string shared_key = ecdh_key_exchange->getSharedKey(server_pubkey);
+			if (shared_key.empty())
+			{
+				Server->Log("Error calculating ECDH shared key from server public key", LL_ERROR);
+				goto cleanup;
+			}
+			authkey=server_settings.authkey;
+			std::string salt = challenge+client_challenge+ shared_key;
 			hmac_key=crypto_fak->generateBinaryPasswordHash(authkey, salt, (std::max)(pbkdf2_iterations,server_iterations) );
 			std::string hmac_l=crypto_fak->generateBinaryPasswordHash(hmac_key, challenge, 1);
 			data.addString(hmac_l);
@@ -696,7 +737,7 @@ void InternetClientThread::operator()(void)
 		char *buf;
 		size_t bufsize;
 		buf=getReply(tcpstack, cs, bufsize, ic_auth_timeout);	
-		if(buf==NULL)
+		if(buf==nullptr)
 		{
 			Server->Log("Error receiving authentication response");
 			goto cleanup;
@@ -717,13 +758,13 @@ void InternetClientThread::operator()(void)
 			int loglevel = LL_ERROR;
 			if(errmsg=="Token not found")
 			{
-				InternetClient::clearOnetimeTokens();
+				internet_client->clearOnetimeTokens();
 				loglevel=LL_INFO;
-				InternetClient::setStatusMsg("error:Temporary authentication failure: "+errmsg);
+				internet_client->setStatusMsg("error:Temporary authentication failure: "+errmsg);
 			}
 			else
 			{
-				InternetClient::setStatusMsg("error:Authentication failure: "+errmsg);
+				internet_client->setStatusMsg("error:Authentication failure: "+errmsg);
 			}
 			Server->Log("Internet server auth failed. Error: "+errmsg, loglevel);
 			
@@ -733,7 +774,7 @@ void InternetClientThread::operator()(void)
 		{
 			std::string error = "Unknown response id -1";
 			Server->Log(error, LL_ERROR);
-			InternetClient::setStatusMsg("error:"+error);
+			internet_client->setStatusMsg("error:"+error);
 			goto cleanup;
 		}
 		else
@@ -744,7 +785,7 @@ void InternetClientThread::operator()(void)
 			{
 				std::string error = "Server authentification failed";
 				Server->Log(error, LL_ERROR);
-				InternetClient::setStatusMsg("error:"+error);
+				internet_client->setStatusMsg("error:"+error);
 				goto cleanup;
 			}
 
@@ -753,7 +794,7 @@ void InternetClientThread::operator()(void)
 			std::string new_token;
 			while(rd.getStr(&new_token))
 			{
-				InternetClient::addOnetimeToken(ics_pipe->decrypt(new_token));
+				internet_client->addOnetimeToken(ics_pipe->decrypt(new_token));
 			}
 		}
 	}
@@ -802,7 +843,7 @@ void InternetClientThread::operator()(void)
 	}
 
 	finish_ok=true;
-	InternetClient::resetAuthErr();
+	internet_client->resetAuthErr();
 
 	while(true)
 	{
@@ -824,7 +865,7 @@ void InternetClientThread::operator()(void)
 		}
 
 		buf=getReply(tcpstack, comm_pipe, bufsize, ping_timeout);
-		if(buf==NULL)
+		if(buf==nullptr)
 		{
 			goto cleanup;
 		}
@@ -853,7 +894,7 @@ void InternetClientThread::operator()(void)
 				data.addChar(ID_ISC_CONNECT_OK);
 				tcpstack->Send(comm_pipe, data);
 
-				InternetClient::rmConnection();
+				internet_client->rmConnection();
 				rm_connection=false;
 			}
 			else
@@ -874,7 +915,7 @@ void InternetClientThread::operator()(void)
 			else if(service==SERVICE_FILESRV)
 			{
 				Server->Log("Started connection to SERVICE_FILESRV", LL_DEBUG);
-				IndexThread::getFileSrv()->runClient(comm_pipe, NULL);
+				IndexThread::getFileSrv()->runClient(comm_pipe, nullptr);
 				Server->Log("SERVICE_FILESRV finished", LL_DEBUG);
 				goto cleanup;
 			}
@@ -890,17 +931,17 @@ cleanup:
 	if(destroy_cs)
 	{
 		delete comp_pipe;
-		if(cs!=NULL)
+		if(cs!=nullptr)
 			Server->destroy(cs);
 		delete ics_pipe;
 	}	
 	if(!finish_ok)
 	{
-		InternetClient::setHasAuthErr();
+		internet_client->setHasAuthErr();
 		Server->Log("InternetClient: Had an auth error");
 	}
 	if(rm_connection)
-		InternetClient::rmConnection();
+		internet_client->rmConnection();
 
 	delete this;
 }
@@ -909,13 +950,13 @@ void InternetClientThread::runServiceWrapper(IPipe *pipe, ICustomClient *client)
 {
 	client->Init(Server->getThreadID(), pipe, server_settings.servers[server_settings.selected_server].hostname);
 	ClientConnector * cc=dynamic_cast<ClientConnector*>(client);
-	if(cc!=NULL)
+	if(cc!=nullptr)
 	{
 		cc->setIsInternetConnection();
 	}
 	while(true)
 	{
-		bool b=client->Run(NULL);
+		bool b=client->Run(nullptr);
 		if(!b)
 		{
 			printInfo(pipe);
@@ -926,11 +967,11 @@ void InternetClientThread::runServiceWrapper(IPipe *pipe, ICustomClient *client)
 		{
 			if(pipe->isReadable(10))
 			{
-				client->ReceivePackets(NULL);
+				client->ReceivePackets(nullptr);
 			}
 			else if(pipe->hasError())
 			{
-				client->ReceivePackets(NULL);
+				client->ReceivePackets(nullptr);
 				Server->wait(20);
 			}
 		}
@@ -952,20 +993,20 @@ void InternetClientThread::printInfo( IPipe * pipe )
 		IPipe* back_pipe= pipe;
 		CompressedPipe2* comp_pipe = dynamic_cast<CompressedPipe2*>(pipe);
 
-		if(comp_pipe!=NULL)
+		if(comp_pipe!=nullptr)
 		{
 			back_pipe=comp_pipe->getRealPipe();
 		}
 
 		int64 enc_overhead=0;
 		InternetServicePipe2* isp2 = dynamic_cast<InternetServicePipe2*>(back_pipe);
-		if(isp2!=NULL)
+		if(isp2!=nullptr)
 		{
 			enc_overhead=isp2->getEncryptionOverheadBytes();
 			Server->Log("Encryption overhead: "+PrettyPrintBytes(enc_overhead));
 		}
 
-		if(comp_pipe!=NULL)
+		if(comp_pipe!=nullptr)
 		{
 			int64 uncompr_transferred = comp_pipe->getUncompressedReceivedBytes()+comp_pipe->getUncompressedSentBytes();
 			Server->Log("Transferred uncompressed: "+PrettyPrintBytes(uncompr_transferred)+" (ratio: "+convert((float)uncompr_transferred/(transferred_bytes-enc_overhead))+")");
@@ -976,6 +1017,7 @@ void InternetClientThread::printInfo( IPipe * pipe )
 
 IPipe * InternetClient::connect(const SServerConnectionSettings & selected_server_settings, CTCPStack& tcpstack)
 {
+#if defined(_WIN32) || defined(WITH_OPENSSL)
 	std::string proxy = selected_server_settings.proxy;
 	if (!proxy.empty())
 	{
@@ -1001,7 +1043,7 @@ IPipe * InternetClient::connect(const SServerConnectionSettings & selected_serve
 			std::string password = getafter(":", udata);
 			std::string adata = username + ":" + password;
 
-			authorization = "Proxy-Authorization: Basic " + base64_encode(reinterpret_cast<const unsigned char*>(adata.c_str()), adata.size())+"\r\n";
+			authorization = "Proxy-Authorization: Basic " + base64_encode(reinterpret_cast<const unsigned char*>(adata.c_str()), static_cast<unsigned int>(adata.size()))+"\r\n";
 		}
 
 		unsigned short port = ssl ? 443 : 80;
@@ -1140,6 +1182,215 @@ IPipe * InternetClient::connect(const SServerConnectionSettings & selected_serve
 		Server->destroy(cs);
 		return NULL;
 	}
+	else if(next(selected_server_settings.hostname, 0, "ws://") ||
+		next(selected_server_settings.hostname, 0, "wss://") )
+	{
+		std::string hostname;
+		bool ssl;
+		if (next(selected_server_settings.hostname, 0, "ws://"))
+		{
+			ssl = false;
+			hostname = selected_server_settings.hostname.substr(5);
+		}
+		else
+		{
+			ssl = true;
+			hostname = selected_server_settings.hostname.substr(6);
+		}
+
+		std::string authorization;
+		if (hostname.find("@") != std::string::npos)
+		{
+			std::string udata = getuntil("@", hostname);
+			hostname = getafter("@", hostname);
+
+			std::string username = getuntil(":", udata);
+			std::string password = getafter(":", udata);
+			std::string adata = username + ":" + password;
+
+			authorization = "Authorization: Basic " + base64_encode(reinterpret_cast<const unsigned char*>(adata.c_str()), static_cast<unsigned int>(adata.size())) + "\r\n";
+		}
+
+		unsigned short port = ssl ? 443 : 80;
+		std::string loc;
+		if (hostname.find(":") != std::string::npos)
+		{
+			std::string port_str = getafter(":", hostname);
+			if(port_str.find("/")!=std::string::npos)
+			{
+				port = static_cast<unsigned short>(watoi(getuntil("/", port_str)));
+				loc = getafter("/", port_str);
+			}
+			else
+			{
+				port = static_cast<unsigned short>(watoi(port_str));
+			}
+			
+			hostname = getuntil(":", hostname);
+		}
+		else if (hostname.find("/") != std::string::npos)
+		{
+			loc = getafter("/", hostname);
+			hostname = getuntil("/", hostname);
+		}
+
+		if (loc.empty() || 
+			loc[0] != '/')
+			loc = "/" + loc;
+
+		IPipe* cs;
+		if (ssl)
+			cs = Server->ConnectSslStream(hostname, port, 10000);
+		else
+			cs = Server->ConnectStream(hostname, port, 10000);
+
+		if (cs == NULL)
+			return cs;
+
+		unsigned char websocket_key[16];
+		Server->secureRandomFill(reinterpret_cast<char*>(websocket_key), sizeof(websocket_key));
+
+		std::string websocket_key_str = base64_encode(websocket_key, sizeof(websocket_key));
+
+		cs->Write(std::string("GET ")+loc+" HTTP/1.1\r\n"
+			"Host: "+hostname+"\r\n"
+			"Upgrade: websocket\r\n"
+			"Connection: Upgrade\r\n"
+			"Sec-WebSocket-Key: "+ websocket_key_str+"\r\n"
+			"Sec-WebSocket-Protocol: urbackup\r\n"
+			"Sec-WebSocket-Version: 13\r\n\r\n");
+
+		char buf[512];
+
+		int64 resp_timeout = 30000;
+
+		int64 starttime = Server->getTimeMS();
+		int state = 0;
+		std::string header;
+		std::string pipe_add;
+		bool has_header = false;
+		do
+		{
+			size_t read = cs->Read(buf, sizeof(buf), 10000);
+
+			if (read > 0)
+			{
+				for (size_t i = 0; i < read; ++i)
+				{
+					char ch = buf[i];
+					if (state == 0)
+					{
+						if (ch == '\r')
+							state = 1;
+						else if (ch == '\n')
+							state = 2;
+						else
+							state = 0;
+					}
+					else if (state == 1)
+					{
+						if (ch == '\n')
+							state = 2;
+						else
+							state = 0;
+					}
+					else if (state == 2)
+					{
+						if (ch == '\r')
+							state = 3;
+						else if (ch == '\n')
+							state = 4;
+						else
+							state = 0;
+					}
+					else if (state == 3)
+					{
+						if (ch == '\n')
+							state = 4;
+						else
+							state = 0;
+					}
+					else if (state == 4)
+					{
+						pipe_add.assign(buf + i, read - i);
+						has_header = true;
+						break;
+					}
+
+					header += ch;
+				}
+
+				if (state == 4)
+				{
+					has_header = true;
+				}
+			}
+		} while (!has_header &&
+			Server->getTimeMS() - starttime < resp_timeout);
+
+
+		if (!has_header)
+		{
+			Server->Log("Timeout connecting via web socket");
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		if (!next(header, 0, "HTTP/1.1 101"))
+		{
+			Server->Log("Error connecting via web socket. Response: " + header, LL_ERROR);
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		std::vector<std::string> headers;
+		Tokenize(getafter("\n", header), headers, "\n");
+		str_map header_map;
+		for (size_t i = 0; i < headers.size(); ++i)
+		{
+			std::string key = strlower(getuntil(":", headers[i]));
+			header_map[key] = trim(getafter(":", headers[i]));
+		}
+
+		if (header_map["sec-websocket-protocol"] != "urbackup")
+		{
+			Server->Log("Unknown web socket protocol \"" + header_map["sec-websocket-protocol"] + "\"", LL_ERROR);
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		if (header_map["upgrade"] != "websocket")
+		{
+			Server->Log("Unknown web socket upgrade value \"" + header_map["upgrade"] + "\"", LL_ERROR);
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		if (strlower(header_map["connection"]) != "upgrade")
+		{
+			Server->Log("Unknown web socket connection value \"" + header_map["connection"] + "\"", LL_ERROR);
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		std::string accept_key = header_map["sec-websocket-accept"];
+
+		std::string expected_accept_key = websocket_key_str + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+		std::string sha_bin = crypto_fak->sha1Binary(expected_accept_key);
+
+		expected_accept_key = base64_encode(reinterpret_cast<const unsigned char*>(sha_bin.data()), static_cast<unsigned int>(sha_bin.size()));
+
+		if (accept_key != expected_accept_key)
+		{
+			Server->Log("Web socket accept key wrong. Expected " + expected_accept_key + " got "+accept_key, LL_ERROR);
+			Server->destroy(cs);
+			return NULL;
+		}
+
+		return new WebSocketPipe(cs, true, false, pipe_add, true);
+	}
+#endif
 	
 	return Server->ConnectStream(selected_server_settings.hostname,
 		selected_server_settings.port, 10000);

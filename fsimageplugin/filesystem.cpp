@@ -146,8 +146,8 @@ public:
 			if (current_block != -1)
 			{
 				int64 l_current_block = current_block;
-				lock.relock(NULL);
-				IFilesystem::IFsBuffer* buf = fs.readBlockInt(l_current_block, false, NULL);
+				lock.relock(nullptr);
+				IFilesystem::IFsBuffer* buf = fs.readBlockInt(l_current_block, false, nullptr);
 				lock.relock(mutex.get());
 
 				read_blocks[l_current_block] = buf;
@@ -174,8 +174,8 @@ public:
 
 		clearUnusedReadahead(block);
 
-		IFilesystem::IFsBuffer* ret = NULL;
-		while (ret == NULL)
+		IFilesystem::IFsBuffer* ret = nullptr;
+		while (ret == nullptr)
 		{
 			std::map<int64, IFilesystem::IFsBuffer*>::iterator it = read_blocks.find(block);
 
@@ -229,9 +229,9 @@ private:
 		}
 	}
 
-	std::auto_ptr<IMutex> mutex;
-	std::auto_ptr<ICondition> start_readahead_cond;
-	std::auto_ptr<ICondition> read_block_cond;
+	std::unique_ptr<IMutex> mutex;
+	std::unique_ptr<ICondition> start_readahead_cond;
+	std::unique_ptr<ICondition> read_block_cond;
 	Filesystem& fs;
 
 	std::map<int64, IFilesystem::IFsBuffer*> read_blocks;
@@ -261,7 +261,7 @@ Filesystem::Filesystem(const std::string &pDev, IFSImageFactory::EReadaheadMode 
 	{
 		dev = Server->openFile(pDev, MODE_READ_DEVICE);
 	}
-	if(dev==NULL)
+	if(dev==nullptr)
 	{
 		errcode = getLastSystemError();
 		Server->Log("Error opening device file. Errorcode: "+convert(errcode), LL_ERROR);
@@ -280,9 +280,9 @@ Filesystem::Filesystem(IFile *pDev, IFsNextBlockCallback* next_block_callback)
 
 Filesystem::~Filesystem()
 {
-	assert(readahead_thread.get()==NULL);
+	assert(readahead_thread.get()==nullptr);
 
-	if(dev!=NULL && own_dev)
+	if(dev!=nullptr && own_dev)
 	{
 		Server->destroy(dev);
 	}
@@ -323,7 +323,7 @@ bool Filesystem::hasBlock(int64 pBlock)
 
 IFilesystem::IFsBuffer* Filesystem::readBlock(int64 pBlock, bool* p_has_error)
 {
-	return readBlockInt(pBlock, readahead_thread.get()!=NULL, p_has_error);
+	return readBlockInt(pBlock, readahead_thread.get()!=nullptr, p_has_error);
 }
 
 IFilesystem::IFsBuffer* Filesystem::readBlockInt(int64 pBlock, bool use_readahead, bool* p_has_error)
@@ -339,13 +339,13 @@ IFilesystem::IFsBuffer* Filesystem::readBlockInt(int64 pBlock, bool use_readahea
 	bool has_bit=((b & (1<<bitmap_bit))>0);
 
 	if(!has_bit)
-		return NULL;
+		return nullptr;
 	
 	if (read_ahead_mode == IFSImageFactory::EReadaheadMode_Overlapped)
 	{
 		SBlockBuffer* block_buf = completionGetBlock(pBlock, p_has_error);
-		if (block_buf == NULL)
-			return NULL;
+		if (block_buf == nullptr)
+			return nullptr;
 		return block_buf;
 	}
 	else if (read_ahead_mode == IFSImageFactory::EReadaheadMode_Thread)
@@ -359,14 +359,14 @@ IFilesystem::IFsBuffer* Filesystem::readBlockInt(int64 pBlock, bool use_readahea
 		{
 			Server->Log("Seeking in device failed -1", LL_ERROR);
 			has_error=true;
-			return NULL;
+			return nullptr;
 		}
 		IFsBuffer* buf = getBuffer();
 		if(!readFromDev(buf->getBuf(), (_u32)blocksize) )
 		{
 			Server->Log("Reading from device failed -1", LL_ERROR);
 			has_error=true;
-			return NULL;
+			return nullptr;
 		}
 
 		return buf;
@@ -457,8 +457,8 @@ std::vector<int64> Filesystem::readBlocks(int64 pStartBlock, unsigned int n,
 		{
 			if (hasBlock(i))
 			{
-				SBlockBuffer* block_buf = completionGetBlock(i, NULL);
-				if (block_buf != NULL)
+				SBlockBuffer* block_buf = completionGetBlock(i, nullptr);
+				if (block_buf != nullptr)
 				{
 					memcpy(buffers[currbuf] + buffer_offset, block_buf->buffer, blocksize);
 					++currbuf;
@@ -475,7 +475,7 @@ std::vector<int64> Filesystem::readBlocks(int64 pStartBlock, unsigned int n,
 		else
 		{
 			IFsBuffer* buf = readBlock(i);
-			if (buf != NULL)
+			if (buf != nullptr)
 			{
 				memcpy(buffers[currbuf] + buffer_offset, buf->getBuf(), blocksize);
 				++currbuf;
@@ -571,7 +571,7 @@ void Filesystem::initReadahead(IFSImageFactory::EReadaheadMode read_ahead, bool 
 #else
 			next_blocks[i].buffers[0].buffer = new char[getBlocksize()*fs_readahead_n_max_buffers];
 #endif
-			if (next_blocks[i].buffers[0].buffer == NULL)
+			if (next_blocks[i].buffers[0].buffer == nullptr)
 			{
 				has_error = true;
 			}
@@ -597,7 +597,7 @@ void Filesystem::initReadahead(IFSImageFactory::EReadaheadMode read_ahead, bool 
 	}
 
 	if (read_ahead != IFSImageFactory::EReadaheadMode_None
-		&& next_block_callback==NULL)
+		&& next_block_callback==nullptr)
 	{
 		next_block_callback = this;
 	}
@@ -725,18 +725,18 @@ SBlockBuffer* Filesystem::completionGetBlock(int64 pBlock, bool* p_has_error)
 		}
 		if (nwait >= max_read_wait_seconds)
 		{
-			if (p_has_error != NULL) *p_has_error = true;
+			if (p_has_error != nullptr) *p_has_error = true;
 			errcode = fs_error_read_timeout;
 			has_error = true;
-			return NULL;
+			return nullptr;
 		}
 	}
 
 	if (next_block->state != ENextBlockState_Ready)
 	{
-		if (p_has_error != NULL) *p_has_error = true;
+		if (p_has_error != nullptr) *p_has_error = true;
 		completionFreeBuffer(next_block);
-		return NULL;
+		return nullptr;
 	}
 
 	return next_block;
@@ -831,7 +831,7 @@ void Filesystem::releaseBuffer(IFsBuffer* buf)
 
 void Filesystem::shutdownReadahead()
 {
-	if(readahead_thread.get()!=NULL)
+	if(readahead_thread.get()!=nullptr)
 	{
 		readahead_thread->stop();
 		Server->getThreadPool()->waitFor(readahead_thread_ticket);
@@ -853,3 +853,190 @@ void Filesystem::shutdownReadahead()
 	}
 }
 
+bool Filesystem::excludeFile(const std::string& path)
+{
+	Server->Log("Trying to exclude contents of file " + path + " from backup...", LL_DEBUG);
+
+#ifdef _WIN32
+	HANDLE hFile = CreateFileW(Server->ConvertToWchar(path).c_str(), GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL,
+		OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+	if (hFile != INVALID_HANDLE_VALUE)
+	{
+		STARTING_VCN_INPUT_BUFFER start_vcn = {};
+		std::vector<char> ret_buf;
+		ret_buf.resize(32768);
+
+		while (true)
+		{
+			RETRIEVAL_POINTERS_BUFFER* ret_ptrs = reinterpret_cast<RETRIEVAL_POINTERS_BUFFER*>(ret_buf.data());
+
+			DWORD bytesRet = 0;
+
+			BOOL b = DeviceIoControl(hFile, FSCTL_GET_RETRIEVAL_POINTERS,
+				&start_vcn, sizeof(start_vcn), ret_ptrs, static_cast<DWORD>(ret_buf.size()), &bytesRet, NULL);
+
+			DWORD err = GetLastError();
+
+			if (b || err == ERROR_MORE_DATA)
+			{
+				LARGE_INTEGER last_vcn = ret_ptrs->StartingVcn;
+				for (DWORD i = 0; i < ret_ptrs->ExtentCount; ++i)
+				{
+					//Sparse entries have Lcn -1
+					if (ret_ptrs->Extents[i].Lcn.QuadPart != -1)
+					{
+						int64 count = ret_ptrs->Extents[i].NextVcn.QuadPart - last_vcn.QuadPart;
+
+						if (!excludeSectors(ret_ptrs->Extents[i].Lcn.QuadPart, count))
+						{
+							Server->Log("Error excluding sectors of file " + path, LL_WARNING);
+						}
+					}
+
+					last_vcn = ret_ptrs->Extents[i].NextVcn;
+				}
+			}
+
+			if (!b)
+			{
+				if (err == ERROR_MORE_DATA)
+				{
+					start_vcn.StartingVcn = ret_ptrs->Extents[ret_ptrs->ExtentCount - 1].NextVcn;
+				}
+				else
+				{
+					Server->Log("Error " + convert((int)GetLastError()) + " while accessing retrieval points", LL_WARNING);
+					CloseHandle(hFile);
+					break;
+				}
+			}
+			else
+			{
+				CloseHandle(hFile);
+				break;
+			}
+		}
+		return true;
+	}
+	else
+	{
+		Server->Log("Error opening file handle to " + path, LL_DEBUG);
+		return false;
+	}
+#else
+	std::unique_ptr<IFsFile> f(Server->openFile(path, MODE_READ));
+	if (f.get() == nullptr)
+	{
+		Server->Log("Error opening file " + path + ". " + os_last_error_str(), LL_DEBUG);
+		return false;
+	}
+
+	bool has_more_extents = true;
+	int64 offset = 0;
+	int64 block_size = getBlocksize();
+	while (has_more_extents)
+	{
+		std::vector<IFsFile::SFileExtent> exts = f->getFileExtents(offset, block_size, has_more_extents);
+		for (size_t i = 0; i < exts.size(); ++i)
+		{
+			if (exts[i].volume_offset != -1)
+			{
+				int64 vol_block=exts[i].volume_offset/block_size;
+
+				if(exts[i].volume_offset%block_size!=0)
+					vol_block++;
+
+				if (!excludeSectors(vol_block, exts[i].size / block_size))
+				{
+					Server->Log("Error excluding sectors of file " + path, LL_WARNING);
+				}
+			}
+			offset = (std::max)(exts[i].offset + exts[i].size, offset);
+		}
+	}
+	return true;
+#endif
+}
+
+bool Filesystem::excludeFiles(const std::string& path, const std::string& fn_contains)
+{
+#ifdef _WIN32
+	HANDLE fHandle;
+	WIN32_FIND_DATAW wfd;
+	std::wstring tpath = Server->ConvertToWchar(path);
+	if (!tpath.empty() && tpath[tpath.size() - 1] == '\\') tpath.erase(path.size() - 1, 1);
+	fHandle = FindFirstFileW((tpath + L"\\*" + Server->ConvertToWchar(fn_contains) + L"*").c_str(), &wfd);
+
+	if (fHandle == INVALID_HANDLE_VALUE)
+	{
+		Server->Log("Error opening find handle to " + path + " err: " + convert((int)GetLastError()), LL_DEBUG);
+		return false;
+	}
+
+	bool ret = true;
+	do
+	{
+		std::string name = Server->ConvertFromWchar(wfd.cFileName);
+		if (name == "." || name == "..")
+			continue;
+
+		if (!(wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+		{
+			if (!excludeFile(Server->ConvertFromWchar(tpath + L"\\" + wfd.cFileName)))
+			{
+				ret = false;
+			}
+		}
+	} while (FindNextFileW(fHandle, &wfd));
+	FindClose(fHandle);
+
+	return ret;
+#else
+	std::vector<SFile> files = getFiles(path);
+	bool ret = true;
+	for (size_t i = 0; i < files.size(); ++i)
+	{
+		const SFile& f = files[i];
+		if (f.isdir)
+			continue;
+
+		if (f.name.find(fn_contains) != std::string::npos)
+		{
+			if (!excludeFile(path + os_file_sep() + f.name))
+			{
+				ret = false;
+			}
+		}
+	}
+	return ret;
+#endif
+}
+
+bool Filesystem::excludeSectors(int64 start, int64 count)
+{
+	for (int64 block = start; block < start + count; ++block)
+	{
+		if (!excludeBlock(block))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool Filesystem::excludeBlock(int64 block)
+{
+	size_t bitmap_byte = (size_t)(block / 8);
+	size_t bitmap_bit = block % 8;
+
+	unsigned char* bitmap = const_cast<unsigned char*>(getBitmap());
+	unsigned char b = bitmap[bitmap_byte];
+
+	b = b & (~(1 << bitmap_bit));
+
+	bitmap[bitmap_byte] = b;
+
+	return true;
+}

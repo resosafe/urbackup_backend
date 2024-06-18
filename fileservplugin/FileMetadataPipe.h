@@ -7,6 +7,7 @@
 #include "../Interface/Condition.h"
 #include "IFileServ.h"
 #include "../urbackupcommon/sha2/sha2.h"
+#include "IFileMetadataPipe.h"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -25,18 +26,27 @@ const char METADATA_PIPE_SEND_RAW = 1;
 const char METADATA_PIPE_EXIT = 2;
 const char METADATA_PIPE_SEND_RAW_FILEDATA = 3;
 
-class FileMetadataPipe : public PipeFileBase
+class FileMetadataPipe : public PipeFileBase, public IFileMetadataPipe
 {
 public:
 	FileMetadataPipe(IPipe* pipe, const std::string& cmd);
+	FileMetadataPipe();
+
 	~FileMetadataPipe();
 
 	virtual bool getExitCode( int& exit_code );
 
 	void forceExitWait();
 
+	virtual IPipe* getErrPipe();
+
+	virtual bool openOsMetadataFile(const std::string& fn);
+
+	virtual bool readCurrOsMetadata(char* buf, size_t buf_avail, size_t& read_bytes);
+
 protected:
-	virtual bool readStdoutIntoBuffer( char* buf, size_t buf_avail, size_t& read_bytes );
+
+	virtual bool readStdoutIntoBuffer(char* buf, size_t buf_avail, size_t& read_bytes);
 
 	virtual void finishStdout();
 
@@ -103,15 +113,16 @@ private:
 	int64 folder_items;
 	IFileServ::IMetadataCallback* callback;
 	std::string server_token;
-	std::auto_ptr<IFile> metadata_file;
+	std::unique_ptr<IFile> metadata_file;
 	int64 metadata_file_off;
 	int64 metadata_file_size;
 	int64 metadata_id;
+	int64 active_gen;
 
 	MetadataState metadata_state;
 
 	std::string stderr_buf;
-	std::auto_ptr<IPipe> errpipe;
+	std::unique_ptr<IPipe> errpipe;
 	IPipe* pipe;
 
 	size_t metadata_buffer_size;
@@ -126,12 +137,17 @@ private:
 	IPipe* transmit_wait_pipe;
 	sha512_ctx transmit_file_ctx;
 
-	std::auto_ptr<IFileServ::ITokenCallback> token_callback;
+	std::unique_ptr<IFileServ::ITokenCallback> token_callback;
 };
 
 #ifndef _WIN32
 #include <sys/stat.h>
 #include "../common/data.h"
 
+#if defined(__APPLE__)
+void serialize_stat_buf(const struct stat& buf, const std::string& symlink_target, CWData& data);
+#else
 void serialize_stat_buf(const struct stat64& buf, const std::string& symlink_target, CWData& data);
+#endif
+
 #endif

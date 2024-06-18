@@ -71,6 +71,8 @@ public:
 		int resumed;
 		int complete;
 		int id;
+		int incremental_ref;
+		int deletion_protected;
 	};
 	struct SMountedImage
 	{
@@ -89,6 +91,14 @@ public:
 		int report_loglevel;
 		int report_sendonly;
 	};
+	struct SSetting
+	{
+		bool exists;
+		std::string value;
+		std::string value_client;
+		int use;
+		int64 use_last_modified;
+	};
 
 
 	void addToOldBackupfolders(const std::string& backupfolder);
@@ -96,29 +106,30 @@ public:
 	std::vector<std::string> getDeletePendingClientNames(void);
 	CondString getGroupName(int groupid);
 	CondInt getClientGroup(int clientid);
+	SSetting getServerSetting(const std::string& key, int clientid);
 	SClientName getVirtualMainClientname(int clientid);
-	void insertIntoOrigClientSettings(int clientid, const std::string& data);
-	CondString getOrigClientSettings(int clientid);
 	std::vector<SDuration> getLastIncrementalDurations(int clientid);
 	std::vector<SDuration> getLastFullDurations(int clientid);
 	CondString getClientSetting(const std::string& key, int clientid);
 	std::vector<int> getClientIds(void);
 	std::vector<int> getClientsByUid(const std::string& uid);
+	CondString getClientUid(int id);
 	void updateClientUid(const std::string& uid, int clientid);
 	void deleteClient(int clientid);
 	void changeClientName(const std::string& name, int id);
 	void changeClientNameWithVirtualmain(const std::string& name, const std::string& virtualmain, int id);
 	void addClientMoved(const std::string& from_name, const std::string& to_name);
-	std::vector<std::string> getClientMoved(const std::string& to_name);
+	std::vector<std::string> getClientMovedLimit5(const std::string& to_name);
 	std::vector<std::string> getClientMovedFrom(const std::string& from_name);
 	CondString getSetting(int clientid, const std::string& key);
+	int hasFileBackups(int clientid);
 	void insertSetting(const std::string& key, const std::string& value, int clientid);
 	void updateSetting(const std::string& value, const std::string& key, int clientid);
 	CondString getMiscValue(const std::string& tkey);
 	void addMiscValue(const std::string& tkey, const std::string& tvalue);
 	void delMiscValue(const std::string& tkey);
 	void setClientUsedFilebackupSize(int64 bytes_used_files, int id);
-	bool newFileBackup(int incremental, int clientid, const std::string& path, int resumed, int64 indexing_time_ms, int tgroup);
+	bool newFileBackup(int incremental, int clientid, const std::string& path, int resumed, int64 indexing_time_ms, int tgroup, int incremental_ref, int deletion_protected);
 	void updateFileBackupRunning(int backupid);
 	void setFileBackupDone(int backupid);
 	void setFileBackupSynced(int backupid);
@@ -144,7 +155,7 @@ public:
 	void updateClientLastImageBackup(int backupid, int clientid);
 	void updateClientNumIssues(int last_filebackup_issues, int clientid);
 	void updateClientLastFileBackup(int backupid, int last_filebackup_issues, int clientid);
-	void updateClientOsAndClientVersion(const std::string& os_simple, const std::string& os_version, const std::string& client_version, int clientid);
+	void updateClientOsAndClientVersion(const std::string& os_simple, const std::string& os_version, const std::string& client_version, int capa, int clientid);
 	void deleteAllUsersOnClient(int clientid);
 	void addUserOnClient(int clientid, const std::string& username);
 	void addClientToken(int clientid, const std::string& token);
@@ -173,6 +184,10 @@ public:
 	SMountedImage getMountedImage(int backupid, int partition);
 	SMountedImage getImageInfo(int backupid);
 	std::vector<SMountedImage> getOldMountedImages(int64 times);
+	void setCapa(int capa, int clientid);
+	CondInt getCapa(int clientid);
+	CondInt getClientWithHashes(int clientid);
+	void updateClientWithHashes(int with_hashes, int clientid);
 	//@-SQLGenFunctionsEnd
 
 	void updateOrInsertSetting(int clientid, const std::string& key, const std::string& value);
@@ -190,22 +205,23 @@ private:
 	IQuery* q_getDeletePendingClientNames;
 	IQuery* q_getGroupName;
 	IQuery* q_getClientGroup;
+	IQuery* q_getServerSetting;
 	IQuery* q_getVirtualMainClientname;
-	IQuery* q_insertIntoOrigClientSettings;
-	IQuery* q_getOrigClientSettings;
 	IQuery* q_getLastIncrementalDurations;
 	IQuery* q_getLastFullDurations;
 	IQuery* q_getClientSetting;
 	IQuery* q_getClientIds;
 	IQuery* q_getClientsByUid;
+	IQuery* q_getClientUid;
 	IQuery* q_updateClientUid;
 	IQuery* q_deleteClient;
 	IQuery* q_changeClientName;
 	IQuery* q_changeClientNameWithVirtualmain;
 	IQuery* q_addClientMoved;
-	IQuery* q_getClientMoved;
+	IQuery* q_getClientMovedLimit5;
 	IQuery* q_getClientMovedFrom;
 	IQuery* q_getSetting;
+	IQuery* q_hasFileBackups;
 	IQuery* q_insertSetting;
 	IQuery* q_updateSetting;
 	IQuery* q_getMiscValue;
@@ -267,6 +283,10 @@ private:
 	IQuery* q_getMountedImage;
 	IQuery* q_getImageInfo;
 	IQuery* q_getOldMountedImages;
+	IQuery* q_setCapa;
+	IQuery* q_getCapa;
+	IQuery* q_getClientWithHashes;
+	IQuery* q_updateClientWithHashes;
 	//@-SQLGenVariablesEnd
 
 	IDatabase *db;

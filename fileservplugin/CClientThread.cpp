@@ -89,8 +89,8 @@
 
 
 CClientThread::CClientThread(SOCKET pSocket, CTCPFileServ* pParent)
-	: extra_buffer(NULL), waiting_for_chunk(false),
-	backup_semantics(true)
+	: extra_buffer(nullptr), waiting_for_chunk(false),
+	backup_semantics(true), is_tunneled(false)
 {
 	int_socket=pSocket;
 
@@ -103,7 +103,7 @@ CClientThread::CClientThread(SOCKET pSocket, CTCPFileServ* pParent)
 #ifdef _WIN32
 	bufmgr=new fileserv::CBufMgr(NBUFFERS, READSIZE);
 #else
-	bufmgr=NULL;
+	bufmgr=nullptr;
 #endif
 
 	hFile=INVALID_HANDLE_VALUE;
@@ -131,14 +131,14 @@ CClientThread::CClientThread(SOCKET pSocket, CTCPFileServ* pParent)
 	close_the_socket=true;
 	errcount=0;
 	clientpipe=Server->PipeFromSocket(pSocket);
-	mutex=NULL;
-	cond=NULL;
+	mutex=nullptr;
+	cond=nullptr;
 	state=CS_NONE;
 	chunk_send_thread_ticket=ILLEGAL_THREADPOOL_TICKET;
 }
 
 CClientThread::CClientThread(IPipe *pClientpipe, CTCPFileServ* pParent, std::vector<char>* extra_buffer)
-	: extra_buffer(extra_buffer), waiting_for_chunk(false)
+	: extra_buffer(extra_buffer), waiting_for_chunk(false), is_tunneled(true)
 {
 	stopped=false;
 	killable=false;
@@ -146,7 +146,7 @@ CClientThread::CClientThread(IPipe *pClientpipe, CTCPFileServ* pParent, std::vec
 
 	parent=pParent;
 
-	bufmgr=NULL;
+	bufmgr=nullptr;
 
 	hFile=INVALID_HANDLE_VALUE;
 
@@ -154,8 +154,8 @@ CClientThread::CClientThread(IPipe *pClientpipe, CTCPFileServ* pParent, std::vec
 	errcount=0;
 	clientpipe=pClientpipe;
 	state=CS_NONE;
-	mutex=NULL;
-	cond=NULL;
+	mutex=nullptr;
+	cond=nullptr;
 	chunk_send_thread_ticket=ILLEGAL_THREADPOOL_TICKET;
 
 	stack.setAddChecksum(true);
@@ -164,7 +164,7 @@ CClientThread::CClientThread(IPipe *pClientpipe, CTCPFileServ* pParent, std::vec
 CClientThread::~CClientThread()
 {
 	delete bufmgr;
-	if(mutex!=NULL)
+	if(mutex!=nullptr)
 	{
 		Server->destroy(mutex);
 		Server->destroy(cond);
@@ -208,11 +208,11 @@ void CClientThread::operator()(void)
 			state=CS_NONE;
 			while(!next_chunks.empty())
 			{
-				if(next_chunks.front().update_file!=NULL)
+				if(next_chunks.front().update_file!=nullptr)
 				{
-					if (next_chunks.front().pipe_file_user == NULL)
+					if (next_chunks.front().pipe_file_user == nullptr)
 					{
-						FileServ::decrShareActive(next_chunks.front().s_filename);
+						FileServ::decrShareActive(next_chunks.front().s_filename, next_chunks.front().share_active_gen);
 						Server->destroy(next_chunks.front().update_file);
 					}
 					delete next_chunks.front().pipe_file_user;
@@ -231,7 +231,7 @@ void CClientThread::operator()(void)
 bool CClientThread::RecvMessage()
 {
 	_i32 rc;
-	if(extra_buffer==NULL || extra_buffer->empty())
+	if(extra_buffer==nullptr || extra_buffer->empty())
 	{
 		rc=clientpipe->isReadable(60*1000)?1:0;
 		if(clientpipe->hasError())
@@ -240,7 +240,7 @@ bool CClientThread::RecvMessage()
 		{
 			Log("1 min Timeout deleting Buffers ("+convert((NBUFFERS*READSIZE)/1024 )+" KB) and waiting 1h more...", LL_DEBUG);
 			delete bufmgr;
-			bufmgr=NULL;
+			bufmgr=nullptr;
 			int n=0;
 			while(!stopped && rc==0 && n<60)
 			{
@@ -277,9 +277,14 @@ bool CClientThread::RecvMessage()
 	}
 	else
 	{
-		if(extra_buffer==NULL || extra_buffer->empty())
+		if(extra_buffer==nullptr || extra_buffer->empty())
 		{
 			rc=(_i32)clientpipe->Read(buffer, BUFFERSIZE, 60*1000);
+
+			if (rc > 0)
+			{
+				Server->Log("FileSRV received " + convert(rc));
+			}
 		}
 		else
 		{
@@ -302,7 +307,7 @@ bool CClientThread::RecvMessage()
 
 		size_t packetsize;
 		char* packet;
-		while( (packet=stack.getPacket(&packetsize)) != NULL )
+		while( (packet=stack.getPacket(&packetsize)) != nullptr )
 		{
 			Log("Received a Packet.", LL_DEBUG);
 			CRData data(packet, packetsize);
@@ -356,9 +361,9 @@ bool CClientThread::ProcessPacket(CRData *data)
 #ifdef CHECK_IDENT
 				std::string ident;
 				data->getStr(&ident);
-				if(!FileServ::checkIdentity(ident))
+				if(!FileServ::checkIdentity(ident, is_tunneled))
 				{
-					Log("Identity check failed -2", LL_DEBUG);
+					Log("Identity check failed -2 ("+ ident+")", LL_DEBUG);
 					return false;
 				}
 #endif
@@ -463,7 +468,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 				
 
 				bool allow_exec;
-				std::string filename=map_file(o_filename, ident, allow_exec, NULL);
+				std::string filename=map_file(o_filename, ident, allow_exec, nullptr);
 
 				if (is_script)
 				{
@@ -536,20 +541,20 @@ bool CClientThread::ProcessPacket(CRData *data)
 				if(is_script)
 				{
 					ScopedPipeFileUser pipe_file_user;
-					IFile* file = NULL;
+					IFile* file = nullptr;
 					bool sent_metadata = false;
 					if(next(s_filename, 0, "urbackup/FILE_METADATA|"))
 					{
-						file = PipeSessions::getFile(o_filename, pipe_file_user, std::string(), ident, NULL, NULL, resumed);
+						file = PipeSessions::getFile(o_filename, pipe_file_user, std::string(), ident, nullptr, nullptr, resumed);
 					}
 					else if (next(s_filename, 0, "urbackup/TAR|"))
 					{
 						std::string server_token = getbetween("|", "|", s_filename);
 						std::string tar_fn = getafter("urbackup/TAR|" + server_token + "|", s_filename);
-						std::string map_res = map_file(tar_fn, ident, allow_exec, NULL);
+						std::string map_res = map_file(tar_fn, ident, allow_exec, nullptr);
 						if (!map_res.empty() && allow_exec)
 						{
-							file = PipeSessions::getFile(tar_fn, pipe_file_user, server_token, ident, &sent_metadata, NULL, true);
+							file = PipeSessions::getFile(tar_fn, pipe_file_user, server_token, ident, &sent_metadata, nullptr, true);
 						}
 					}
 					else if(allow_exec)
@@ -562,7 +567,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 						}
 
 						bool tar_file = false;
-						file = PipeSessions::getFile(filename, pipe_file_user, server_token, ident, NULL, &tar_file, resumed);
+						file = PipeSessions::getFile(filename, pipe_file_user, server_token, ident, nullptr, &tar_file, resumed);
 
 						if (metadata_id != 0)
 						{
@@ -996,7 +1001,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 					if(!share_name.empty())
 					{
 						bool allow_exec;
-						std::string basePath=map_file(share_name+"/", ident, allow_exec, NULL);
+						std::string basePath=map_file(share_name+"/", ident, allow_exec, nullptr);
 						if(!isDirectory(basePath))
 						{
 							char ch=ID_BASE_DIR_LOST;
@@ -1105,7 +1110,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 					    next_checkpoint=curr_filesize;
 				}
 
-				if((clientpipe!=NULL || with_hashes) && foffset>0)
+				if((clientpipe!=nullptr || with_hashes) && foffset>0)
 				{
 					if(lseek64(hFile, foffset, SEEK_SET)!=foffset)
 					{
@@ -1146,7 +1151,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 							if (next_checkpoint>curr_filesize)
 								next_checkpoint = curr_filesize;
 
-							if (clientpipe != NULL || with_hashes)
+							if (clientpipe != nullptr || with_hashes)
 							{
 								off64_t rc = lseek64(hFile, foffset, SEEK_SET);
 
@@ -1183,7 +1188,7 @@ bool CClientThread::ProcessPacket(CRData *data)
 						}
 					}
 
-					if( clientpipe==NULL && !with_hashes && count>0 )
+					if( clientpipe==nullptr && !with_hashes && count>0 )
 					{
 						#if defined(__APPLE__) || defined(__FreeBSD__)
 						ssize_t rc=sendfile64(int_socket, hFile, foffset, count, reinterpret_cast<off_t*>(&count));
@@ -1702,7 +1707,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 #ifdef CHECK_IDENT
 	std::string ident;
 	data->getStr(&ident);
-	if(!FileServ::checkIdentity(ident))
+	if(!FileServ::checkIdentity(ident, is_tunneled))
 	{
 		Log("Identity check failed -2", LL_DEBUG);
 		return false;
@@ -1771,7 +1776,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 	Log("Sending file (chunked) "+o_filename, LL_DEBUG);
 
 	bool allow_exec;
-	std::string filename=map_file(o_filename, ident, allow_exec, NULL);
+	std::string filename=map_file(o_filename, ident, allow_exec, nullptr);
 
 	if (is_script)
 	{
@@ -1821,10 +1826,10 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 
 	ScopedShareActive scoped_share_active;
 
-	std::auto_ptr<ScopedPipeFileUser> pipe_file_user;
-	IFile* srv_file = NULL;
+	std::unique_ptr<ScopedPipeFileUser> pipe_file_user;
+	IFile* srv_file = nullptr;
 	IFileServ::CbtHashFileInfo cbt_hash_file_info;
-	IFileServ::IMetadataCallback* metadata_callback = NULL;
+	IFileServ::IMetadataCallback* metadata_callback = nullptr;
 	if(is_script)
 	{
 		pipe_file_user.reset(new ScopedPipeFileUser);
@@ -1833,10 +1838,10 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 		{
 			std::string server_token = getbetween("|", "|", s_filename);
 			std::string tar_fn = getafter("urbackup/TAR|" + server_token + "|", s_filename);
-			std::string map_res = map_file(tar_fn, ident, allow_exec, NULL);
+			std::string map_res = map_file(tar_fn, ident, allow_exec, nullptr);
 			if (!map_res.empty() && allow_exec)
 			{
-				srv_file = PipeSessions::getFile(tar_fn, *pipe_file_user, server_token, ident, NULL, NULL, true);
+				srv_file = PipeSessions::getFile(tar_fn, *pipe_file_user, server_token, ident, nullptr, nullptr, true);
 			}
 		}
 		else if(allow_exec)
@@ -1849,7 +1854,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 			}
 
 			bool tar_file = false;
-			srv_file = PipeSessions::getFile(filename, *pipe_file_user, server_token, ident, NULL, &tar_file, resumed);
+			srv_file = PipeSessions::getFile(filename, *pipe_file_user, server_token, ident, nullptr, &tar_file, resumed);
 
 			if (metadata_id != 0)
 			{
@@ -1858,7 +1863,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 			}
 		}
 
-		if(srv_file==NULL)
+		if(srv_file==nullptr)
 		{
 			queueChunk(SChunk(ID_COULDNT_OPEN));
 			Log("Info: Couldn't open script", LL_DEBUG);
@@ -1909,7 +1914,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 			if(!share_name.empty())
 			{
 				bool allow_exec;
-				std::string basePath=map_file(share_name+"/", ident, allow_exec, NULL);
+				std::string basePath=map_file(share_name+"/", ident, allow_exec, nullptr);
 				if(!isDirectory(basePath))
 				{
 					queueChunk(SChunk(ID_BASE_DIR_LOST));
@@ -1948,12 +1953,12 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 		{
 			map_file(o_filename, ident, allow_exec, &cbt_hash_file_info);
 
-			if (cbt_hash_file_info.cbt_hash_file == NULL
-				&& metadata_callback != NULL)
+			if (cbt_hash_file_info.cbt_hash_file == nullptr
+				&& metadata_callback != nullptr)
 			{
 				int64 offset, length;
-				IFile* metadata_f = metadata_callback->getMetadata("f" + s_filename, NULL, &offset, &length, NULL, true);
-				if (metadata_f != NULL)
+				IFile* metadata_f = metadata_callback->getMetadata("f" + s_filename, nullptr, &offset, &length, nullptr, true);
+				if (metadata_f != nullptr)
 				{
 					cbt_hash_file_info.cbt_hash_file = metadata_f;
 					cbt_hash_file_info.metadata_offset = offset;
@@ -1975,9 +1980,9 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 	{
 		srv_file = Server->openFileFromHandle((void*)hFile, filename);
 
-		if(srv_file==NULL)
+		if(srv_file==nullptr)
 		{
-			if (cbt_hash_file_info.cbt_hash_file != NULL
+			if (cbt_hash_file_info.cbt_hash_file != nullptr
 				&& cbt_hash_file_info.metadata_offset != -1)
 			{
 				Server->destroy(cbt_hash_file_info.cbt_hash_file);
@@ -2003,7 +2008,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 
 	hFile=INVALID_HANDLE_VALUE;
 
-	scoped_share_active.release();
+	chunk.share_active_gen = scoped_share_active.release();
 
 	queueChunk(chunk);
 
@@ -2013,7 +2018,7 @@ bool CClientThread::GetFileBlockdiff(CRData *data, bool with_metadata)
 bool CClientThread::Handle_ID_BLOCK_REQUEST(CRData *data)
 {
 	SChunk chunk;
-	chunk.update_file = NULL;
+	chunk.update_file = nullptr;
 	bool b=data->getInt64(&chunk.startpos);
 	if(!b)
 		return false;
@@ -2070,7 +2075,7 @@ void CClientThread::queueChunk(const SChunk& chunk )
 {
 	if(chunk_send_thread_ticket==ILLEGAL_THREADPOOL_TICKET)
 	{
-		if(mutex==NULL)
+		if(mutex==nullptr)
 		{
 			mutex=Server->createMutex();
 			cond=Server->createCondition();
@@ -2098,7 +2103,7 @@ bool CClientThread::GetFileHashAndMetadata( CRData* data )
 #ifdef CHECK_IDENT
 	std::string ident;
 	data->getStr(&ident);
-	if(!FileServ::checkIdentity(ident))
+	if(!FileServ::checkIdentity(ident, is_tunneled))
 	{
 		Log("Identity check failed -hash", LL_DEBUG);
 		return false;
@@ -2110,7 +2115,7 @@ bool CClientThread::GetFileHashAndMetadata( CRData* data )
 	Log("Calculating hash of file "+o_filename, LL_DEBUG);
 
 	bool allow_exec;
-	std::string filename=map_file(o_filename, ident, allow_exec, NULL);
+	std::string filename=map_file(o_filename, ident, allow_exec, nullptr);
 
 	Log("Mapped name: "+filename, LL_DEBUG);
 
@@ -2167,7 +2172,7 @@ bool CClientThread::GetFileHashAndMetadata( CRData* data )
 #ifdef CHECK_BASE_PATH
 		std::string share_name = getuntil("/",o_filename);
 		bool allow_exec;
-		std::string basePath=map_file(share_name + "/", ident, allow_exec, NULL);
+		std::string basePath=map_file(share_name + "/", ident, allow_exec, nullptr);
 		if(!isDirectory(basePath))
 		{
 			char ch=ID_BASE_DIR_LOST;
@@ -2193,8 +2198,8 @@ bool CClientThread::GetFileHashAndMetadata( CRData* data )
 		return false;
 	}
 
-	std::auto_ptr<IFile> tf(Server->openFileFromHandle((void*)hFile, filename));
-	if(tf.get()==NULL)
+	std::unique_ptr<IFile> tf(Server->openFileFromHandle((void*)hFile, filename));
+	if(tf.get()==nullptr)
 	{
 		Log("Could not open file from handle -hash", LL_ERROR);
 		return false;
@@ -2400,7 +2405,7 @@ bool CClientThread::InformMetadataStreamEnd( CRData * data )
 #ifdef CHECK_IDENT
 	std::string ident;
 	data->getStr(&ident);
-	if(!FileServ::checkIdentity(ident))
+	if(!FileServ::checkIdentity(ident, is_tunneled))
 	{
 		Log("Identity check failed -hash", LL_DEBUG);
 		return false;
@@ -2433,7 +2438,7 @@ bool CClientThread::StopPhash(CRData * data)
 #ifdef CHECK_IDENT
 	std::string ident;
 	data->getStr(&ident);
-	if (!FileServ::checkIdentity(ident))
+	if (!FileServ::checkIdentity(ident, is_tunneled))
 	{
 		Log("Identity check failed -hash", LL_DEBUG);
 		return false;
@@ -2469,7 +2474,7 @@ bool CClientThread::FinishScript( CRData * data )
 #ifdef CHECK_IDENT
 	std::string ident;
 	data->getStr(&ident);
-	if(!FileServ::checkIdentity(ident))
+	if(!FileServ::checkIdentity(ident, is_tunneled))
 	{
 		Log("Identity check failed -FinishScript", LL_DEBUG);
 		return false;
@@ -2491,7 +2496,7 @@ bool CClientThread::FinishScript( CRData * data )
 	Log("Finishing script "+s_filename, LL_DEBUG);
 
 	bool allow_exec;
-	std::string filename=map_file(s_filename, ident, allow_exec, NULL);
+	std::string filename=map_file(s_filename, ident, allow_exec, nullptr);
 	filename = FileServ::getRedirectedFn(filename);
 
 	Log("Mapped name: "+filename, LL_DEBUG);
@@ -2512,28 +2517,28 @@ bool CClientThread::FinishScript( CRData * data )
 	}
 
 	ScopedPipeFileUser pipe_file_user;
-	IFile* file = NULL;
+	IFile* file = nullptr;
 	std::string f_name;
 	bool sent_metadata = false;
 	if(next(s_filename, 0, "urbackup/FILE_METADATA|"))
 	{
 		f_name = s_filename;
-		file = PipeSessions::getFile(s_filename, pipe_file_user, std::string(), ident, NULL, NULL, true);
+		file = PipeSessions::getFile(s_filename, pipe_file_user, std::string(), ident, nullptr, nullptr, true);
 	}
 	else if (next(s_filename, 0, "urbackup/TAR|"))
 	{
 		std::string server_token = getbetween("|", "|", s_filename);
 		f_name = getafter("urbackup/TAR|" + server_token + "|", s_filename);
-		std::string map_res = map_file(f_name, ident, allow_exec, NULL);
+		std::string map_res = map_file(f_name, ident, allow_exec, nullptr);
 		if (!map_res.empty() && allow_exec)
 		{
-			file = PipeSessions::getFile(f_name, pipe_file_user, server_token, ident, &sent_metadata, NULL, true);
+			file = PipeSessions::getFile(f_name, pipe_file_user, server_token, ident, &sent_metadata, nullptr, true);
 		}
 	}
 	else if(allow_exec)
 	{
 		f_name = filename;
-		file = PipeSessions::getFile(filename, pipe_file_user, std::string(), ident, NULL, NULL, true);
+		file = PipeSessions::getFile(filename, pipe_file_user, std::string(), ident, nullptr, nullptr, true);
 	}			
 
 	bool ret=false;
@@ -2551,7 +2556,7 @@ bool CClientThread::FinishScript( CRData * data )
 	}
 	else
 	{
-		pipe_file_user.reset(NULL);
+		pipe_file_user.reset(nullptr);
 
 		PipeSessions::removeFile(f_name);
 
@@ -2589,7 +2594,7 @@ std::string CClientThread::getDummyMetadata(std::string output_fn, int64 folder_
 	}
 
 	data.addString(type + output_fn);
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr() + fn_start, static_cast<_u32>(data.getDataSize()) - fn_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr() + fn_start, static_cast<_u32>(data.getDataSize()) - fn_start));
 	_u32 common_start = data.getDataSize();
 	data.addUInt(0);
 	data.addChar(1);
@@ -2598,9 +2603,9 @@ std::string CClientThread::getDummyMetadata(std::string output_fn, int64 folder_
 	data.addVarInt(0);
 	data.addVarInt(folder_items);
 	data.addVarInt(metadata_id);
-	std::auto_ptr<IFileServ::ITokenCallback> token_callback(FileServ::newTokenCallback());
+	std::unique_ptr<IFileServ::ITokenCallback> token_callback(FileServ::newTokenCallback());
 	std::string ttokens;
-	if (token_callback.get() != NULL)
+	if (token_callback.get() != nullptr)
 	{
 		ttokens = token_callback->translateTokens(0, 0, 0000400);
 	}
@@ -2618,7 +2623,7 @@ std::string CClientThread::getDummyMetadata(std::string output_fn, int64 folder_
 
 	_u32 common_metadata_size = little_endian(static_cast<_u32>(data.getDataSize() - common_start - sizeof(_u32)));
 	memcpy(data.getDataPtr() + common_start, &common_metadata_size, sizeof(common_metadata_size));
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr() + common_start, static_cast<_u32>(data.getDataSize()) - common_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr() + common_start, static_cast<_u32>(data.getDataSize()) - common_start));
 	_u32 os_start = data.getDataSize();
 
 #ifdef _WIN32
@@ -2650,7 +2655,7 @@ std::string CClientThread::getDummyMetadata(std::string output_fn, int64 folder_
 	memcpy(data.getDataPtr() + os_start, &stat_data_size, sizeof(stat_data_size));
 	data.addInt64(0);
 #endif
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr() + os_start, static_cast<_u32>(data.getDataSize()) - os_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr() + os_start, static_cast<_u32>(data.getDataSize()) - os_start));
 
 	return std::string(data.getDataPtr(), data.getDataSize());
 }

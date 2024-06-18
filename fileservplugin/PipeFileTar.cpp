@@ -111,7 +111,7 @@ namespace
 			return res;
 		}
 
-		return strtoll(extract_digits(val).c_str(), NULL, 8);
+		return strtoll(extract_digits(val).c_str(), nullptr, 8);
 	}
 
 	bool check_header_checksum(const std::string& header, std::string& errmsg)
@@ -176,17 +176,13 @@ std::string PipeFileTar::Read(_u32 tr, bool * has_error)
 
 	int64 pos = tar_file.pos;
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	std::string ret = Read(pos, tr, has_error);
 
 	lock.relock(mutex.get());
 
-	if (hash_pos == pos)
-	{
-		sha_def_update(&sha_ctx, reinterpret_cast<const unsigned char*>(ret.data()), ret.size());
-		hash_pos += ret.size();
-	}
+	hashReadData(pos, ret.data(), ret.size());
 	assert(pos + ret.size() <= hash_pos);
 
 	tar_file.pos += ret.size();
@@ -207,16 +203,12 @@ std::string PipeFileTar::Read(int64 spos, _u32 tr, bool * has_error)
 	_u32 max_read = static_cast<_u32>((std::max)(tar_file.size - spos, static_cast<int64>(tr)));
 	int64 pf_offset = file_offset + spos;
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	std::string ret = pipe_file->pipe_file->Read(pf_offset, max_read, has_error);
 
 	lock.relock(mutex.get());
-	if (spos == hash_pos)
-	{
-		sha_def_update(&sha_ctx, reinterpret_cast<const unsigned char*>(ret.data()), ret.size());
-		hash_pos += ret.size();
-	}
+	hashReadData(spos, ret.data(), ret.size());
 	assert(spos + ret.size() <= hash_pos);
 
 	return ret;
@@ -228,17 +220,13 @@ _u32 PipeFileTar::Read(char * buffer, _u32 bsize, bool * has_error)
 
 	int64 pos = tar_file.pos;
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	_u32 ret = Read(tar_file.pos, buffer, bsize, has_error);
 
 	lock.relock(mutex.get());
 
-	if (tar_file.pos == hash_pos)
-	{
-		sha_def_update(&sha_ctx, reinterpret_cast<const unsigned char*>(buffer), ret);
-		hash_pos += ret;
-	}
+	hashReadData(tar_file.pos, buffer, ret);
 	assert(pos + ret <= hash_pos);
 	
 	tar_file.pos += ret;
@@ -258,16 +246,12 @@ _u32 PipeFileTar::Read(int64 spos, char * buffer, _u32 bsize, bool * has_error)
 
 	int64 pf_offset = file_offset + spos;
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	_u32 ret = pipe_file->pipe_file->Read(pf_offset, buffer, bsize, has_error);
 
 	lock.relock(mutex.get());
-	if (spos == hash_pos)
-	{
-		sha_def_update(&sha_ctx, reinterpret_cast<const unsigned char*>(buffer), ret);
-		hash_pos += ret;
-	}
+	hashReadData(spos, buffer, ret);
 	assert(spos + ret <= hash_pos);
 
 	return ret;
@@ -286,7 +270,7 @@ bool PipeFileTar::Seek(_i64 spos)
 
 	int64 pf_offset = file_offset + spos;
 
-	lock.relock(NULL);
+	lock.relock(nullptr);
 
 	return pipe_file->pipe_file->Seek(pf_offset);
 }
@@ -313,6 +297,30 @@ _i64 PipeFileTar::Size()
 	IScopedLock lock(mutex.get());
 
 	return tar_file.size;
+}
+
+void PipeFileTar::hashReadData(int64 spos, const char * buffer, _u32 bsize)
+{
+	_u32 off = 0;
+	if (spos < hash_pos)
+	{
+		off = hash_pos - spos;
+		if (off >= bsize)
+		{
+			return;
+		}
+		Server->Log("Hash tar file off!=0", LL_DEBUG);
+	}
+	if (spos+off == hash_pos)
+	{
+		Server->Log("Hash tar file spos=" + convert(spos) + " len=" + convert(bsize) +" off="+convert(off), LL_DEBUG);
+		sha_def_update(&sha_ctx, reinterpret_cast<const unsigned char*>(buffer+off), bsize-off);
+		hash_pos += bsize-off;
+	}
+	else
+	{
+		Server->Log("Don't hash tar file spos=" + convert(spos) + " len=" + convert(bsize), LL_DEBUG);
+	}
 }
 
 std::string PipeFileTar::buildCurrMetadata()
@@ -348,7 +356,7 @@ std::string PipeFileTar::buildCurrMetadata()
 	}
 
 	data.addString(type + "urbackup_backup_scripts/"+ output_fn + (fn.empty() ? "" : "/"+ fn) );
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr()+ fn_start, static_cast<_u32>(data.getDataSize())- fn_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr()+ fn_start, static_cast<_u32>(data.getDataSize())- fn_start));
 	_u32 common_start = data.getDataSize();
 	data.addUInt(0);
 	data.addChar(1);
@@ -357,9 +365,9 @@ std::string PipeFileTar::buildCurrMetadata()
 	data.addVarInt(0);
 	data.addVarInt(0);
 	data.addVarInt(0);
-	std::auto_ptr<IFileServ::ITokenCallback> token_callback(FileServ::newTokenCallback());
+	std::unique_ptr<IFileServ::ITokenCallback> token_callback(FileServ::newTokenCallback());
 	std::string ttokens;
-	if (token_callback.get() != NULL)
+	if (token_callback.get() != nullptr)
 	{
 		ttokens = token_callback->translateTokens(tar_file.buf.st_uid, tar_file.buf.st_gid, tar_file.buf.st_mode);
 	}
@@ -377,7 +385,7 @@ std::string PipeFileTar::buildCurrMetadata()
 	
 	_u32 common_metadata_size = little_endian(static_cast<_u32>(data.getDataSize() - common_start - sizeof(_u32)));
 	memcpy(data.getDataPtr() + common_start, &common_metadata_size, sizeof(common_metadata_size));
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr()+ common_start, static_cast<_u32>(data.getDataSize())- common_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr()+ common_start, static_cast<_u32>(data.getDataSize())- common_start));
 	_u32 os_start = data.getDataSize();
 
 #ifdef _WIN32
@@ -399,7 +407,7 @@ std::string PipeFileTar::buildCurrMetadata()
 	memcpy(data.getDataPtr() + os_start, &stat_data_size, sizeof(stat_data_size));
 	data.addInt64(0);
 #endif
-	data.addUInt(urb_adler32(urb_adler32(0, NULL, 0), data.getDataPtr() + os_start, static_cast<_u32>(data.getDataSize())- os_start));
+	data.addUInt(urb_adler32(urb_adler32(0, nullptr, 0), data.getDataPtr() + os_start, static_cast<_u32>(data.getDataSize())- os_start));
 
 	return std::string(data.getDataPtr(), data.getDataSize());
 }
@@ -417,7 +425,7 @@ bool PipeFileTar::readHeader(bool* has_error, std::string & stderr_ret)
 	if (header.size() != 512)
 	{
 		addErrMsg("Error reading tar header (1). Unexpected length " + convert(header.size()), stderr_ret);
-		if(has_error!=NULL) *has_error = true;
+		if(has_error!=nullptr) *has_error = true;
 		return false;
 	}
 
@@ -428,7 +436,7 @@ bool PipeFileTar::readHeader(bool* has_error, std::string & stderr_ret)
 		if (header.size() != 512)
 		{
 			addErrMsg("Error reading tar header (2). Unexpected length " + convert(header.size()), stderr_ret);
-			if (has_error != NULL) *has_error = true;
+			if (has_error != nullptr) *has_error = true;
 			return false;
 		}
 
@@ -444,7 +452,7 @@ bool PipeFileTar::readHeader(bool* has_error, std::string & stderr_ret)
 	{
 		addErrMsg(errmsg, stderr_ret);
 		addErrMsg("Current tar fn: "+extract_string(header, 0, 100), stderr_ret);
-		if (has_error != NULL) *has_error = true;
+		if (has_error != nullptr) *has_error = true;
 		return false;
 	}
 
@@ -613,6 +621,8 @@ std::string PipeFileTar::getStdErr()
 	unsigned char dig[SHA_DEF_DIGEST_SIZE];
 	sha_def_final(&sha_ctx, dig);
 
+	Server->Log("Hash tar file final (" + tar_file.fn + ") pos="+convert(tar_file.pos)+" hash_pos="+convert(hash_pos)+" size="+convert(tar_file.size)+" h="+base64_encode(dig, SHA_DEF_DIGEST_SIZE), LL_DEBUG);
+
 	stderr_ret.append(1, 1);
 
 	stderr_ret.append(reinterpret_cast<const char*>(dig),
@@ -735,7 +745,7 @@ std::string PipeFileTar::getStdErr()
 			{
 				++small_files;
 				std::string curr_metadata = buildCurrMetadata();
-				lock.relock(NULL);
+				lock.relock(nullptr);
 				PipeSessions::transmitFileMetadataAndFiledataWait(public_fn, curr_metadata, server_token, identity, this);
 				lock.relock(mutex.get());
 			}
@@ -763,6 +773,7 @@ std::string PipeFileTar::getStdErr()
 
 bool PipeFileTar::getExitCode(int & exit_code)
 {
+	IScopedLock lock(mutex.get());
 	if (has_next)
 	{
 		exit_code = 0;
@@ -770,14 +781,17 @@ bool PipeFileTar::getExitCode(int & exit_code)
 	}
 	else
 	{
+		lock.relock(nullptr);
 		return pipe_file->pipe_file->getExitCode(exit_code);
 	}
 }
 
 void PipeFileTar::forceExitWait()
 {
+	IScopedLock lock(mutex.get());
 	if (!has_next)
 	{
+		lock.relock(nullptr);
 		pipe_file->pipe_file->forceExitWait();
 	}
 }
@@ -801,4 +815,17 @@ int64 PipeFileTar::getPos()
 {
 	IScopedLock lock(mutex.get());
 	return tar_file.pos;
+}
+
+bool PipeFileTar::waitForStderr(int64 timeoutms)
+{
+	IScopedLock lock(mutex.get());
+	if (has_next)
+	{
+		return true;
+	}
+	else
+	{
+		return pipe_file->pipe_file->waitForStderr(timeoutms);
+	}
 }

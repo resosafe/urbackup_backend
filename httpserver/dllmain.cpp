@@ -51,7 +51,7 @@ extern IServer* Server;
 #define UnloadActions UnloadActions_httpserver
 #endif
 
-CHTTPService* http_service=NULL;
+CHTTPService* http_service=nullptr;
 std::vector<std::string> allowed_urls;
 
 DLLEXPORT void LoadActions(IServer* pServer)
@@ -105,7 +105,14 @@ DLLEXPORT void LoadActions(IServer* pServer)
 
 	Server->Log("Starting HTTP-Server on port "+convert(port), LL_INFO);
 
-	Server->StartCustomStreamService( http_service, "HTTP", (unsigned short)port, 1);
+	IServer::BindTarget bind_target = IServer::BindTarget_All;
+
+	if (Server->getServerParameter("http_localhost_only") == "1")
+	{
+		bind_target = IServer::BindTarget_Localhost;
+	}
+
+	Server->StartCustomStreamService( http_service, "HTTP", (unsigned short)port, 1, bind_target);
 }
 
 DLLEXPORT void UnloadActions(void)

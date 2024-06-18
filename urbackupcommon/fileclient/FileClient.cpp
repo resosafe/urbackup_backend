@@ -89,12 +89,12 @@ bool setSockP(SOCKET sock)
         return true;
 }    
 
-FileClient::FileClient(bool enable_find_servers, std::string identity, int protocol_version, bool internet_connection,
+FileClient::FileClient(bool enable_find_servers, std::string identity, int protocol_version, bool add_request_checksums,
 	FileClient::ReconnectionCallback *reconnection_callback, FileClient::NoFreeSpaceCallback *nofreespace_callback)
 	: tcpsock(NULL), starttime(0), connect_starttime(0), socket_open(false), connected(false),
 	local_ip(),
 	max_version(), server_addr(), connection_id(), 
-	protocol_version(protocol_version), internet_connection(internet_connection),
+	protocol_version(protocol_version), 
 	transferred_bytes(0), reconnection_callback(reconnection_callback),
 	nofreespace_callback(nofreespace_callback), reconnection_timeout(300000), retryBindToNewInterfaces(true),
 	identity(identity), received_data_bytes(0), queue_callback(NULL), dl_off(0),
@@ -110,7 +110,7 @@ FileClient::FileClient(bool enable_find_servers, std::string identity, int proto
 	}
 
 	socket_open=false;
-	stack.setAddChecksum(internet_connection);
+	stack.setAddChecksum(add_request_checksums);
 
 	mutex = Server->createMutex();
 }
@@ -152,7 +152,8 @@ void FileClient::bindToNewInterfaces()
 				!(ifap->ifa_flags & IFF_LOOPBACK)
 				&& !(ifap->ifa_flags & IFF_POINTOPOINT))
 			{
-				if (ifap->ifa_addr->sa_family == AF_INET
+				if (ifap->ifa_addr!=NULL
+					&& ifap->ifa_addr->sa_family == AF_INET
 					&& (ifap->ifa_flags & IFF_BROADCAST))
 				{
 					sockaddr_in source_addr;
@@ -222,7 +223,8 @@ void FileClient::bindToNewInterfaces()
 
 					Server->Log("Broadcasting on ipv4 interface "+std::string(ifap->ifa_name) + " addr " + ipToString(new_udpsock));
 				}
-				else if (ifap->ifa_addr->sa_family == AF_INET6
+				else if (ifap->ifa_addr != NULL 
+					&& ifap->ifa_addr->sa_family == AF_INET6
 					&& Server->getServerParameter("disable_ipv6").empty())
 				{
 					sockaddr_in6 source_addr;
@@ -1075,7 +1077,7 @@ bool FileClient::Reconnect(void)
 	_u32 hash_r;
 	MD5 hash_func;
 	IFile* file = backing_file;
-	std::auto_ptr<SparseFile> sparse_file;
+	std::unique_ptr<SparseFile> sparse_file;
 
 	char* buf = dl_buf;
 
@@ -1421,6 +1423,9 @@ bool FileClient::Reconnect(void)
 						Reconnect();
 						return ERR_ERROR;
 					}
+
+					if(received>0)
+						file->Seek(received);
 
 					{
 						IScopedLock lock(mutex);
@@ -1998,6 +2003,11 @@ void FileClient::setReconnectTries(int tries)
 {
 	IScopedLock lock(mutex);
 	reconnect_tries = tries;
+}
+
+void FileClient::setAddChecksum(bool add_request_checksums)
+{
+	stack.setAddChecksum(add_request_checksums);
 }
 
 void FileClient::setProgressLogCallback( ProgressLogCallback* cb )

@@ -23,6 +23,7 @@
 #include "file_permissions.h"
 #include "DirectoryWatcherThread.h"
 #include "../urbackupcommon/json.h"
+#include "ClientService.h"
 #include <assert.h>
 
 #define CHECK_COM_RESULT_RELEASE(x) { HRESULT r; if( (r=(x))!=S_OK ){ VSSLog(#x+(std::string)" failed. VSS error code "+GetErrorHResErrStr(r), LL_ERROR); printProviderInfo(r); if(backupcom!=NULL){backupcom->AbortBackup();backupcom->Release();} return false; }}
@@ -272,7 +273,7 @@ bool IndexThread::checkErrorAndLog(BSTR pbstrWriter, VSS_WRITER_STATE pState, HR
 bool IndexThread::check_writer_status(IVssBackupComponents *backupcom, std::string& errmsg, int loglevel, bool continue_on_failure, 
 	const std::vector<VSS_ID>& critical_writers, bool* critical_failure, bool* retryable_error)
 {
-	if (critical_failure != NULL)
+	if (critical_failure != nullptr)
 		*critical_failure = false;
 
 	IVssAsync *pb_result;
@@ -375,6 +376,7 @@ std::string IndexThread::GetErrorHResErrStr(HRESULT res)
 	CASE_VSS_ERROR(VSS_E_TRANSACTION_THAW_TIMEOUT);
 	CASE_VSS_ERROR(VSS_E_UNEXPECTED);
 	CASE_VSS_ERROR(VSS_E_INVALID_XML_DOCUMENT);
+	CASE_VSS_ERROR(VSS_E_OBJECT_ALREADY_EXISTS);
 	};
 #undef CASE_VSS_ERROR
 	return "UNDEF("+convert((int64)res)+")";
@@ -470,7 +472,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 	const int max_tries = 3;
 	int tries = max_tries;
 	bool retryable_error = true;
-	IVssBackupComponents *backupcom = NULL;
+	IVssBackupComponents *backupcom = nullptr;
 	while (tries>0 && retryable_error)
 	{
 		CHECK_COM_RESULT_RELEASE(CreateVssBackupComponents(&backupcom));
@@ -511,7 +513,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			{
 				VSSLog("Selecting components to backup failed", LL_ERROR);
 				backupcom->Release();
-				backupcom = NULL;
+				backupcom = nullptr;
 				return false;
 			}
 
@@ -519,7 +521,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 			{
 				VSSLog("Selected no components to backup", LL_INFO);
 				backupcom->Release();
-				backupcom = NULL;
+				backupcom = nullptr;
 				return true;
 			}
 
@@ -729,7 +731,7 @@ bool IndexThread::start_shadowcopy_win(SCDirs * dir, std::string &wpath, bool fo
 #endif
 #endif
 			backupcom->Release();
-			backupcom = NULL;
+			backupcom = nullptr;
 
 			Server->wait(30000);
 		}
@@ -1038,7 +1040,7 @@ void IndexThread::initVss()
 
 bool IndexThread::deleteSavedShadowCopyWin(SShadowCopy& scs, SShadowCopyContext& context)
 {
-	IVssBackupComponents *backupcom = NULL;
+	IVssBackupComponents *backupcom = nullptr;
 	if (context.backupcom == NULL)
 	{
 		CHECK_COM_RESULT_RELEASE(CreateVssBackupComponents(&backupcom));
@@ -1098,18 +1100,36 @@ bool IndexThread::deleteSavedShadowCopyWin(SShadowCopy& scs, SShadowCopyContext&
 bool IndexThread::getVssSettings()
 {
 	std::string settings_fn = "urbackup/data/settings.cfg";
-	std::auto_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
+	std::unique_ptr<ISettingsReader> curr_settings(Server->createFileSettingsReader(settings_fn));
 	vss_select_components.clear();
 	vss_select_all_components = false;
 	bool select_default_components = false;
 	bool ret = false;
 	if (curr_settings.get() != NULL)
 	{
+		std::string use_val;
+		int use = curr_settings->getValue("vss_select_components.use", c_use_value_client);
+
 		std::string val;
-		if (!curr_settings->getValue("vss_select_components", &val)
-			 && !curr_settings->getValue("vss_select_components_def", &val))
+		if (use & c_use_value_client)
 		{
-			val = "default=1";
+			val = curr_settings->getValue("vss_select_components.client");
+		}
+		if (use & c_use_group)
+		{
+			std::string add = curr_settings->getValue("vss_select_components.group");
+			if (!add.empty()
+				&& add[0] != '&')
+				val += "&";
+			val += add;
+		}
+		if (use & c_use_value)
+		{
+			std::string add = curr_settings->getValue("vss_select_components.home");
+			if (!add.empty()
+				&& add[0] != '&')
+				val += "&";
+			val += add;
 		}
 
 		if (!val.empty())
@@ -1569,7 +1589,7 @@ std::string IndexThread::getVolPath(const std::string& bpath)
 
 bool IndexThread::indexVssComponents(VSS_ID ssetid, bool use_db, const std::vector<SCRef*>& past_refs, std::fstream &outfile)
 {
-	IVssBackupComponents* backupcom = NULL;
+	IVssBackupComponents* backupcom = nullptr;
 	for (size_t i = 0; i < sc_refs.size(); ++i)
 	{
 		if (sc_refs[i]->ssetid == ssetid)
@@ -1579,7 +1599,7 @@ bool IndexThread::indexVssComponents(VSS_ID ssetid, bool use_db, const std::vect
 		}
 	}
 
-	if (backupcom == NULL)
+	if (backupcom == nullptr)
 	{
 		VSSLog("Could not find backupcom for snapshot set " + convert(ssetid), LL_ERROR);
 		return false;
@@ -2211,11 +2231,11 @@ bool IndexThread::addFiles(IVssWMFiledesc* wmFile, VSS_ID ssetid, const std::vec
 	{
 		SBackupDir backup_dir;
 
-		cd->addBackupDir(named_prefix, path, 0, index_flags, c_group_vss_components, 0);
+		cd->addBackupDir(named_prefix, path, 0, index_flags, c_group_vss_components, 0, index_facet_id);
 
 		backup_dir.id = static_cast<int>(db->getLastInsertID());
 
-		if (dwt != NULL)
+		if (dwt != nullptr)
 		{
 			std::string msg = "A" + path;
 			dwt->getPipe()->Write(msg);
@@ -2398,7 +2418,7 @@ void IndexThread::removeUnconfirmedVssDirs()
 			{
 				VSSLog("Removing unconfirmed VSS path \"" + backup_dirs[i].tname + "\" to \"" + backup_dirs[i].path, LL_INFO);
 
-				if (dwt != NULL)
+				if (dwt != nullptr)
 				{
 					std::string msg = "D" + backup_dirs[i].path;
 					dwt->getPipe()->Write(msg);
@@ -2408,7 +2428,7 @@ void IndexThread::removeUnconfirmedVssDirs()
 
 				removeDir(starttoken, backup_dirs[i].tname);
 
-				if (filesrv != NULL)
+				if (filesrv != nullptr)
 				{
 					filesrv->removeDir(backup_dirs[i].tname, starttoken);
 				}

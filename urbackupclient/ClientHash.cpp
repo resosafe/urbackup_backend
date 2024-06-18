@@ -31,7 +31,7 @@ namespace
 	std::string build_sparse_extent_content()
 	{
 		char buf[c_small_hash_dist] = {};
-		_u32 small_hash = urb_adler32(urb_adler32(0, NULL, 0), buf, c_small_hash_dist);
+		_u32 small_hash = urb_adler32(urb_adler32(0, nullptr, 0), buf, c_small_hash_dist);
 		small_hash = little_endian(small_hash);
 
 		MD5 big_hash;
@@ -64,7 +64,8 @@ ClientHash::ClientHash(IFile * index_hdat_file,
 	index_hdat_fs_block_size(index_hdat_fs_block_size),
 	index_chunkhash_pos(-1),
 	snapshot_sequence_id(snapshot_sequence_id),
-	snapshot_sequence_id_reference(snapshot_sequence_id_reference)
+	snapshot_sequence_id_reference(snapshot_sequence_id_reference),
+	vdl_vol_cache(nullptr)
 {
 }
 
@@ -74,13 +75,14 @@ ClientHash::~ClientHash()
 	{
 		Server->destroy(index_hdat_file);
 	}
+	Server->destroy(vdl_vol_cache);
 }
 
 bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_cbt)
 {
-	std::auto_ptr<IFsFile>  f(Server->openFile(os_file_prefix(fn), MODE_READ_SEQUENTIAL_BACKUP));
+	std::unique_ptr<IFsFile>  f(Server->openFile(os_file_prefix(fn), MODE_READ_SEQUENTIAL_BACKUP));
 
-	if (f.get() == NULL)
+	if (f.get() == nullptr)
 	{
 		return false;
 	}
@@ -98,6 +100,7 @@ bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_
 	IFsFile::SSparseExtent curr_sparse_extent = extent_iterator.nextExtent();
 
 	int64 fsize = f->Size();
+	int64 max_vdl = fsize;
 
 	bool has_more_extents = false;
 	std::vector<IFsFile::SFileExtent> extents;
@@ -106,6 +109,16 @@ bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_
 		&& fsize>c_checkpoint_dist)
 	{
 		extents = f->getFileExtents(0, index_hdat_fs_block_size, has_more_extents);
+
+		if (vdl_vol_cache == nullptr)
+		{
+			vdl_vol_cache = f->createVdlVolCache();
+		}
+
+		max_vdl = f->getValidDataLength(vdl_vol_cache);
+
+		if (max_vdl < 0)
+			max_vdl = fsize;
 	}
 	else
 	{
@@ -143,7 +156,7 @@ bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_
 		index_chunkhash_pos = -1;
 
 		if (!extents.empty()
-			&& index_hdat_file != NULL
+			&& index_hdat_file != nullptr
 			&& fpos%c_checkpoint_dist == 0
 			&& curr_bsize == bsize)
 		{
@@ -162,15 +175,18 @@ bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_
 			}
 
 			if (curr_extent_idx<extents.size()
+				&& extents[curr_extent_idx].volume_offset >= 0
+				&& !(extents[curr_extent_idx].flags & IFsFile::SFileExtent::FeFlag_Unwritten)
 				&& extents[curr_extent_idx].offset <= fpos
-				&& extents[curr_extent_idx].offset + extents[curr_extent_idx].size >= fpos + static_cast<int64>(bsize))
+				&& extents[curr_extent_idx].offset + extents[curr_extent_idx].size >= fpos + static_cast<int64>(bsize)
+				&& extents[curr_extent_idx].offset + extents[curr_extent_idx].size <= max_vdl )
 			{
 				int64 volume_pos = extents[curr_extent_idx].volume_offset + (fpos - extents[curr_extent_idx].offset);
 				index_chunkhash_pos = (volume_pos / c_checkpoint_dist)*(sizeof(_u16) + chunkhash_single_size);
 				index_chunkhash_pos_offset = static_cast<_u16>((volume_pos%c_checkpoint_dist) / 512);
 
 				char chunkhash[sizeof(_u16) + chunkhash_single_size];
-				if (snapshot_sequence_id!=NULL
+				if (snapshot_sequence_id!=nullptr
 					&& *snapshot_sequence_id == snapshot_sequence_id_reference
 					&& index_hdat_file->Read(index_chunkhash_pos, chunkhash, sizeof(chunkhash)) == sizeof(chunkhash))
 				{
@@ -274,7 +290,7 @@ bool ClientHash::getShaBinary(const std::string & fn, IHashFunc & hf, bool with_
 				char chunkhash[sizeof(_u16) + chunkhash_single_size];
 				memcpy(chunkhash, &index_chunkhash_pos_offset, sizeof(index_chunkhash_pos_offset));
 				memcpy(chunkhash + sizeof(_u16), sparse_extent_content.data(), chunkhash_single_size);
-				if (snapshot_sequence_id!=NULL
+				if (snapshot_sequence_id!=nullptr
 					&& *snapshot_sequence_id == snapshot_sequence_id_reference)
 				{
 					index_hdat_file->Write(index_chunkhash_pos, chunkhash, sizeof(chunkhash));
@@ -308,14 +324,14 @@ void ClientHash::hash_output_all_adlers(int64 pos, const char * hash, size_t hsi
 	EX_DEBUG(Server->Log("Hash output at pos " + convert(pos) + ": " + base64_encode((const unsigned char*)hash, hsize),
 		LL_DEBUG);)
 	if (index_chunkhash_pos != -1
-		&& index_hdat_file != NULL)
+		&& index_hdat_file != nullptr)
 	{
 		assert(hsize == chunkhash_single_size);
 		char chunkhash[sizeof(_u16) + chunkhash_single_size];
 		memcpy(chunkhash, &index_chunkhash_pos_offset, sizeof(index_chunkhash_pos_offset));
 		memcpy(chunkhash + sizeof(_u16), hash, chunkhash_single_size);
 
-		if (snapshot_sequence_id!=NULL
+		if (snapshot_sequence_id!=nullptr
 			&& *snapshot_sequence_id == snapshot_sequence_id_reference)
 		{
 			index_hdat_file->Write(index_chunkhash_pos, chunkhash, sizeof(chunkhash));

@@ -35,14 +35,18 @@ public:
 	{
 		ImageFormat_VHD=0,
 		ImageFormat_CompressedVHD=1,
-		ImageFormat_RawCowFile=2
+		ImageFormat_RawCowFile=2,
+		ImageFormat_VHDX = 3,
+		ImageFormat_CompressedVHDX = 4
 	};
 
 	virtual IVHDFile *createVHDFile(const std::string &fn, bool pRead_only, uint64 pDstsize,
-		unsigned int pBlocksize=2*1024*1024, bool fast_mode=false, ImageFormat compress=ImageFormat_VHD)=0;
+		unsigned int pBlocksize=2*1024*1024, bool fast_mode=false, ImageFormat compress=ImageFormat_VHD,
+		size_t n_compress_threads = 0)=0;
 
 	virtual IVHDFile *createVHDFile(const std::string &fn, const std::string &parent_fn,
-		bool pRead_only, bool fast_mode=false, ImageFormat compress=ImageFormat_VHD, uint64 pDstsize=0)=0;
+		bool pRead_only, bool fast_mode=false, ImageFormat compress=ImageFormat_VHD, uint64 pDstsize=0,
+		size_t n_compress_threads = 0)=0;
 
 	virtual void destroyVHDFile(IVHDFile *vhd)=0;
 
@@ -53,6 +57,8 @@ public:
 	virtual bool initializeImageMounting() = 0;
 
 	virtual std::vector<SPartition> readPartitions(IVHDFile *vhd, int64 offset, bool& gpt_style) = 0;
+
+	virtual std::vector<SPartition> readPartitions(IFile* dev, bool& gpt_style) = 0;
 
 	virtual std::vector<SPartition> readPartitions(const std::string& mbr, 
 		const std::string& gpt_header, const std::string& gpt_table, bool& gpt_style) = 0;

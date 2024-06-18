@@ -39,8 +39,8 @@ int repair_cmd(void)
 			return 1;
 		}
 
-		Server->Log("Exporting database with id " + convert(dbs[i])+"...", LL_INFO);
-		if (!db->Dump("urbackup/server_database_export_"+ convert(dbs[i])+".sql"))
+		Server->Log("Recovering contents of database with id " + convert(dbs[i])+"...", LL_INFO);
+		if (!db->Recover("urbackup/server_database_export_"+ convert(dbs[i])+".sql"))
 		{
 			Server->Log("Exporting database failed", LL_ERROR);
 			return 1;
@@ -78,6 +78,13 @@ int repair_cmd(void)
 		{
 			Server->Log("Importing database failed", LL_ERROR);
 			return 1;
+		}
+
+		if (db_names[i] == "_files")
+		{
+			Server->Log("Moving rows from lost+found...", LL_INFO);
+			db->Write("INSERT OR IGNORE INTO files SELECT id, c1 AS backupid, c2 AS fullpath, c3 AS shahash, c4 AS filesize, c5 AS created, c6 AS rsize, "
+				"c7 AS clientid, c8 AS incremental, c9 AS hashpath, c10 AS next_entry, c11 AS prev_entry, c12 AS pointed_to FROM lost_and_found WHERE nfield=13;");
 		}
 
 		Server->deleteFile("urbackup/server_database_export_" + convert(dbs[i]) + ".sql");

@@ -43,6 +43,7 @@ std::vector<std::string> getSettingsList(void)
 	ret.push_back("computername");
 	ret.push_back("virtual_clients");
 	ret.push_back("default_dirs");
+	ret.push_back("allow_overwrite");
 	ret.push_back("backup_dirs_optional");
 	ret.push_back("allow_config_paths");
 	ret.push_back("allow_starting_full_file_backups");
@@ -102,6 +103,70 @@ std::vector<std::string> getSettingsList(void)
 	ret.push_back("internet_image_dataplan_limit");
 	ret.push_back("alert_script");
 	ret.push_back("alert_params");
+	ret.push_back("archive");
+	ret.push_back("client_settings_tray_access_pw");
+	ret.push_back("local_encrypt");
+	ret.push_back("local_compress");
+	ret.push_back("download_threads");
+	ret.push_back("hash_threads");
+	ret.push_back("client_hash_threads");
+	ret.push_back("image_compress_threads");
+	ret.push_back("ransomware_canary_paths");
+	ret.push_back("backup_dest_url");
+	ret.push_back("backup_dest_params");
+	ret.push_back("pause_if_windows_unlocked");
+	ret.push_back("backup_unlocked_window");
+	return ret;
+}
+
+std::vector<std::string> getClientConfigurableSettingsList()
+{
+	std::vector<std::string> ret;
+	ret.push_back("update_freq_incr");
+	ret.push_back("update_freq_full");
+	ret.push_back("update_freq_image_incr");
+	ret.push_back("update_freq_image_full");
+	ret.push_back("max_file_incr");
+	ret.push_back("min_file_incr");
+	ret.push_back("max_file_full");
+	ret.push_back("min_file_full");
+	ret.push_back("min_image_incr");
+	ret.push_back("max_image_incr");
+	ret.push_back("min_image_full");
+	ret.push_back("max_image_full");
+	ret.push_back("startup_backup_delay");
+	ret.push_back("computername");
+	ret.push_back("virtual_clients");
+	ret.push_back("exclude_files");
+	ret.push_back("include_files");
+	ret.push_back("default_dirs");
+	ret.push_back("image_letters");
+	ret.push_back("internet_speed");
+	ret.push_back("local_speed");
+	ret.push_back("internet_mode_enabled");
+	ret.push_back("internet_full_file_backups");
+	ret.push_back("internet_image_backups");
+	ret.push_back("internet_compress");
+	ret.push_back("internet_encrypt");
+	ret.push_back("internet_connect_always");
+	ret.push_back("vss_select_components");
+	ret.push_back("local_encrypt");
+	ret.push_back("local_compress");
+	return ret;
+}
+
+std::vector<std::string> getClientMergableSettingsList()
+{
+	std::vector<std::string> ret;
+	ret.push_back("virtual_clients");
+	ret.push_back("exclude_files");
+	ret.push_back("include_files");
+	ret.push_back("default_dirs");
+	ret.push_back("image_letters");
+	ret.push_back("vss_select_components");
+	ret.push_back("archive");
+	ret.push_back("ransomware_canary_paths");
+	ret.push_back("backup_dest_params");
 	return ret;
 }
 
@@ -139,6 +204,13 @@ std::vector<std::string> getOnlyServerClientSettingsList(void)
 	ret.push_back("internet_image_dataplan_limit");
 	ret.push_back("alert_script");
 	ret.push_back("alert_params");
+	ret.push_back("archive");
+	ret.push_back("client_settings_tray_access_pw");
+	ret.push_back("ransomware_canary_paths");
+	ret.push_back("backup_dest_url");
+	ret.push_back("backup_dest_params");
+	ret.push_back("backup_unlocked_window");
+	ret.push_back("pause_if_windows_unlocked");
 	return ret;
 }
 
@@ -187,6 +259,7 @@ std::vector<std::string> getGlobalSettingsList(void)
 	ret.push_back("use_incremental_symlinks");
 	ret.push_back("update_dataplan_db");
 	ret.push_back("internet_expect_endpoint");
+	ret.push_back("internet_server_bind_port");
 	return ret;
 }
 

@@ -40,6 +40,7 @@
 #include "../urbackupcommon/TreeHash.h"
 #include "../common/data.h"
 #include "PhashLoad.h"
+#include "../urbackupcommon/glob.h"
 
 #ifndef NAME_MAX
 #define NAME_MAX _POSIX_NAME_MAX
@@ -54,7 +55,7 @@ FileBackup::FileBackup( ClientMain* client_main, int clientid, std::string clien
 	:  Backup(client_main, clientid, clientname, clientsubname, log_action, true, is_incremental, server_token, details, scheduled),
 	group(group), use_tmpfiles(use_tmpfiles), tmpfile_path(tmpfile_path), use_reflink(use_reflink), use_snapshots(use_snapshots),
 	disk_error(false), with_hashes(false),
-	backupid(-1), hashpipe(NULL), hashpipe_prepare(NULL), bsh(NULL), bsh_prepare(NULL),
+	backupid(-1), hashpipe(NULL), hashpipe_prepare(NULL),
 	bsh_ticket(ILLEGAL_THREADPOOL_TICKET), bsh_prepare_ticket(ILLEGAL_THREADPOOL_TICKET), pingthread(NULL),
 	pingthread_ticket(ILLEGAL_THREADPOOL_TICKET), cdp_path(false), metadata_download_thread_ticket(ILLEGAL_THREADPOOL_TICKET),
 	last_speed_received_bytes(0), speed_set_time(0)
@@ -119,7 +120,7 @@ bool FileBackup::request_filelist_construct(bool full, bool resume, int group,
 	CTCPStack tcpstack(client_main->isOnInternetConnection());
 
 	ServerLogger::Log(logid, clientname+": Connecting for filelist...", LL_DEBUG);
-	IPipe *cc=client_main->getClientCommandConnection(server_settings.get(), 10000);
+	IPipe *cc=client_main->getClientCommandConnection(server_settings.get(), 60000);
 	if(cc==NULL)
 	{
 		ServerLogger::Log(logid, "Connecting to ClientService of \""+clientname+"\" failed - CONNECT error during filelist construction", LL_ERROR);
@@ -396,7 +397,7 @@ bool FileBackup::request_filelist_construct(bool full, bool resume, int group,
 bool FileBackup::wait_for_async(const std::string& async_id, int64 timeout_time)
 {
 	int64 starttime = Server->getTimeMS();
-	std::auto_ptr<IPipe> cc;
+	std::unique_ptr<IPipe> cc;
 	CTCPStack tcpstack(client_main->isOnInternetConnection());
 
 	while (Server->getTimeMS() - starttime <= timeout_time)
@@ -407,7 +408,7 @@ bool FileBackup::wait_for_async(const std::string& async_id, int64 timeout_time)
 				&& Server->getTimeMS() - starttime <= timeout_time)
 			{
 				ServerLogger::Log(logid, clientname + ": Connecting for async...", LL_DEBUG);
-				cc.reset(client_main->getClientCommandConnection(server_settings.get(), 10000));
+				cc.reset(client_main->getClientCommandConnection(server_settings.get(), 60000));
 
 				if (ServerStatus::getProcess(clientname, status_id).stop)
 				{
@@ -552,7 +553,7 @@ bool FileBackup::getTokenFile(FileClient &fc, bool hashed_transfer, bool request
 	Server->destroy(tokens_file);
 
 
-	std::auto_ptr<ISettingsReader> urbackup_tokens(
+	std::unique_ptr<ISettingsReader> urbackup_tokens(
 		Server->createFileSettingsReader(os_file_prefix(backuppath_hashes+os_file_sep()+".urbackup_tokens.properties")));
 
 	std::string access_key;
@@ -581,36 +582,43 @@ std::string FileBackup::clientlistName(int ref_backupid)
 
 void FileBackup::createHashThreads(bool use_reflink, bool ignore_hash_mismatches)
 {
-	assert(bsh==NULL);
-	assert(bsh_prepare==NULL);
+	assert(bsh.empty());
+	assert(bsh_prepare.empty());
 
 	hashpipe=Server->createMemoryPipe();
 	hashpipe_prepare=Server->createMemoryPipe();
 
-	bsh=new BackupServerHash(hashpipe, clientid, use_snapshots, use_reflink, use_tmpfiles, logid, use_snapshots, max_file_id);
-	bsh_prepare=new BackupServerPrepareHash(hashpipe_prepare, hashpipe, clientid, logid, ignore_hash_mismatches);
-	bsh_ticket = Server->getThreadPool()->execute(bsh, "fbackup write");
-	bsh_prepare_ticket = Server->getThreadPool()->execute(bsh_prepare, "fbackup hash");
+	size_t h_cnt = server_settings->getSettings()->hash_threads;
+
+	for (size_t i = 0; i < h_cnt; ++i)
+	{
+		BackupServerHash* curr_bsh = new BackupServerHash(hashpipe, clientid, use_snapshots, use_reflink, use_tmpfiles, logid, use_snapshots, max_file_id);
+		BackupServerPrepareHash* curr_bsh_prepare = new BackupServerPrepareHash(hashpipe_prepare, hashpipe, clientid, logid, ignore_hash_mismatches);
+		bsh.push_back(curr_bsh);
+		bsh_prepare.push_back(curr_bsh_prepare);
+		bsh_ticket.push_back(Server->getThreadPool()->execute(curr_bsh, "fbackup write" + convert(i)));
+		bsh_prepare_ticket.push_back(Server->getThreadPool()->execute(curr_bsh_prepare, "fbackup hash" + convert(i)));
+	}
 }
 
 
 void FileBackup::destroyHashThreads()
 {
-	if (hashpipe_prepare != NULL)
+	if (!bsh_prepare.empty())
 	{
-		assert(bsh_ticket != ILLEGAL_THREADPOOL_TICKET);
-		assert(bsh_prepare_ticket != ILLEGAL_THREADPOOL_TICKET);
 		hashpipe_prepare->Write("exit");
 		Server->getThreadPool()->waitFor(bsh_ticket);
 		Server->getThreadPool()->waitFor(bsh_prepare_ticket);
+		Server->destroy(hashpipe_prepare);
+		Server->destroy(hashpipe);
 	}
 
-	bsh_ticket=ILLEGAL_THREADPOOL_TICKET;
-	bsh_prepare_ticket=ILLEGAL_THREADPOOL_TICKET;
+	bsh_ticket.clear();
+	bsh_prepare_ticket.clear();
 	hashpipe=NULL;
 	hashpipe_prepare=NULL;
-	bsh=NULL;
-	bsh_prepare=NULL;
+	bsh.clear();
+	bsh_prepare.clear();
 }
 
 _i64 FileBackup::getIncrementalSize(IFile *f, const std::vector<size_t> &diffs, bool& backup_with_components, bool all)
@@ -781,7 +789,7 @@ bool FileBackup::doBackup()
 		return false;
 	}
 
-	if( server_settings->getSettings()->internet_mode_enabled )
+	if( client_main->isOnInternetConnection() )
 	{
 		if( server_settings->getSettings()->internet_incr_file_transfer_mode=="blockhash")
 		{
@@ -792,6 +800,17 @@ bool FileBackup::doBackup()
 	if( server_settings->getSettings()->local_incr_file_transfer_mode=="blockhash")
 	{
 		with_hashes=true;
+	}
+
+	ServerBackupDao::CondInt c_with_hashes = backup_dao->getClientWithHashes(clientid);
+	if (c_with_hashes.exists
+		&& c_with_hashes.value != 0)
+	{
+		with_hashes = true;
+	}
+	else if (with_hashes)
+	{
+		backup_dao->updateClientWithHashes(1, clientid);
 	}
 
 	if(!fileindex.get())
@@ -845,6 +864,12 @@ bool FileBackup::doBackup()
 	{
 		ServerLogger::Log(logid, "FATAL: Backup failed because of disk problems (see previous messages)", LL_ERROR);
 		client_main->sendMailToAdmins("Fatal error occurred during backup", ServerLogger::getWarningLevelTextLogdata(logid));
+	}
+
+	if (!checkRansomwareCanaries())
+	{
+		ServerLogger::Log(logid, "Ransomware canary check failed", LL_ERROR);
+		backup_result = false;
 	}
 
 	if((!has_early_error && !backup_result) || disk_error)
@@ -1000,6 +1025,39 @@ std::string FileBackup::fixFilenameForOS(std::string fn, std::set<std::string>& 
 		}
 		fn.resize(name_max);
 		append_hash = true;
+
+		size_t rm_bytes = 0;
+		//Repair UTF-8
+		for (size_t i = fn.size() - 1; i-- > 0;)
+		{
+			const unsigned char first_mask = 0x80;
+			const unsigned char utf8_start = 0xC0;
+
+			const unsigned char ch = static_cast<unsigned char>(fn[i]);
+
+			if (ch & first_mask)
+			{
+				if (ch & utf8_start == utf8_start)
+				{
+					++rm_bytes;
+					break;
+				}
+				else
+				{
+					++rm_bytes;
+				}
+			}
+			else
+			{
+				//ASCII char
+				break;
+			}
+		}
+
+		if (rm_bytes > 0)
+		{
+			fn.resize(name_max - rm_bytes);
+		}
 	}
 #endif
 
@@ -1208,18 +1266,30 @@ void FileBackup::waitForFileThreads(void)
 	SStatus status=ServerStatus::getStatus(clientname);
 	hashpipe->Write("flush");
 	hashpipe_prepare->Write("flush");
-	_u32 hashqueuesize=(_u32)hashpipe->getNumElements()+(bsh->isWorking()?1:0);
-	_u32 prepare_hashqueuesize=(_u32)hashpipe_prepare->getNumElements()+(bsh_prepare->isWorking()?1:0);
-	while(hashqueuesize>0 || prepare_hashqueuesize>0)
+	
+	size_t hashqueuesize=std::string::npos;
+	size_t prepare_hashqueuesize=0;
+	while(hashqueuesize==std::string::npos || hashqueuesize>0 || prepare_hashqueuesize>0)
 	{
-		ServerStatus::setProcessQueuesize(clientname, status_id, prepare_hashqueuesize, hashqueuesize);
-		Server->wait(1000);
-		hashqueuesize=(_u32)hashpipe->getNumElements()+(bsh->isWorking()?1:0);
-		prepare_hashqueuesize=(_u32)hashpipe_prepare->getNumElements()+(bsh_prepare->isWorking()?1:0);
+		if (hashqueuesize != std::string::npos)
+		{
+			ServerStatus::setProcessQueuesize(clientname, status_id, prepare_hashqueuesize, hashqueuesize);
+			Server->wait(1000);
+		}
+
+		size_t bsh_working = bsh.size() - hashpipe->getNumWaiters();
+		size_t bsh_prepare_working = bsh_prepare.size() - hashpipe_prepare->getNumWaiters();
+		
+		hashqueuesize = hashpipe->getNumElements() + bsh_working;
+		prepare_hashqueuesize = hashpipe_prepare->getNumElements() + bsh_prepare_working;
 	}
 	{
 		Server->wait(10);
-		while(bsh->isWorking()) Server->wait(1000);
+
+		while (hashpipe->getNumWaiters() < bsh.size())
+		{
+			Server->wait(1000);
+		}
 	}	
 
 	ServerStatus::setProcessQueuesize(clientname, status_id, 0, 0);
@@ -1444,7 +1514,7 @@ std::string FileBackup::getSHA512(const std::string& fn)
 
 std::string FileBackup::getSHADef(const std::string& fn)
 {
-	std::auto_ptr<IFsFile> f(Server->openFile(os_file_prefix(fn), MODE_READ));
+	std::unique_ptr<IFsFile> f(Server->openFile(os_file_prefix(fn), MODE_READ));
 
 	if (f.get() == NULL)
 	{
@@ -1516,7 +1586,7 @@ bool FileBackup::constructBackupPath(bool on_snapshot, bool create_fs, std::stri
 					return false;
 				}
 
-				std::auto_ptr<IFile> touch_f(Server->openFile(backuppath, MODE_WRITE));
+				std::unique_ptr<IFile> touch_f(Server->openFile(backuppath, MODE_WRITE));
 				if (touch_f.get() == NULL)
 				{
 					ServerLogger::Log(logid, "Could not touch file " + backuppath + ". " + os_last_error_str(), LL_ERROR);
@@ -1624,7 +1694,7 @@ bool FileBackup::constructBackupPathCdp()
 
 void FileBackup::createUserViews(IFile* file_list_f)
 {
-	std::auto_ptr<ISettingsReader> urbackup_tokens(
+	std::unique_ptr<ISettingsReader> urbackup_tokens(
 		Server->createFileSettingsReader(os_file_prefix(backuppath_hashes+os_file_sep()+".urbackup_tokens.properties")));
 
 	if(urbackup_tokens.get()==NULL)
@@ -2036,7 +2106,7 @@ bool FileBackup::createUserView(IFile* file_list_f, const std::vector<int64>& id
 
 void FileBackup::saveUsersOnClient()
 {
-	std::auto_ptr<ISettingsReader> urbackup_tokens(
+	std::unique_ptr<ISettingsReader> urbackup_tokens(
 		Server->createFileSettingsReader(os_file_prefix(backuppath_hashes+os_file_sep()+".urbackup_tokens.properties")));
 
 	if(urbackup_tokens.get()==NULL)
@@ -2186,10 +2256,10 @@ bool FileBackup::startFileMetadataDownloadThread()
 	if(client_main->getProtocolVersions().file_meta>0)
 	{
 		std::string identity = client_main->getIdentity();
-		std::auto_ptr<FileClient> fc_metadata_stream(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
+		std::unique_ptr<FileClient> fc_metadata_stream(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
 			client_main->isOnInternetConnection(), client_main, use_tmpfiles?NULL:this));
 
-		_u32 rc=client_main->getClientFilesrvConnection(fc_metadata_stream.get(), server_settings.get(), 10000);
+		_u32 rc=client_main->getClientFilesrvConnection(fc_metadata_stream.get(), server_settings.get(), 60000);
 		if(rc!=ERR_CONNECTED)
 		{
 			ServerLogger::Log(logid, "Backup of "+clientname+" failed - CONNECT error (for metadata stream)", LL_ERROR);
@@ -2253,7 +2323,7 @@ bool FileBackup::stopFileMetadataDownloadThread(bool stopped, size_t expected_em
 			do
 			{
 				std::string identity = client_main->getIdentity();
-				std::auto_ptr<FileClient> fc_metadata_stream_end(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
+				std::unique_ptr<FileClient> fc_metadata_stream_end(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
 					client_main->isOnInternetConnection(), client_main, use_tmpfiles ? NULL : this));
 
 				_u32 rc = client_main->getClientFilesrvConnection(fc_metadata_stream_end.get(), server_settings.get(), 10000);
@@ -2369,7 +2439,7 @@ bool FileBackup::loadWindowsBackupComponentConfigXml(FileClient &fc)
 	if (os_directory_exists(os_file_prefix(component_config_dir)))
 	{
 		ServerLogger::Log(logid, "Loading Windows backup component config XML...", LL_DEBUG);
-		std::auto_ptr<IFsFile> component_config_xml(Server->openFile(os_file_prefix(component_config_dir+os_file_sep()+"backupcom.xml"), MODE_WRITE));
+		std::unique_ptr<IFsFile> component_config_xml(Server->openFile(os_file_prefix(component_config_dir+os_file_sep()+"backupcom.xml"), MODE_WRITE));
 		_u32 rc = fc.GetFile(server_token + "|windows_components_config/backupcom.xml", component_config_xml.get(), true, false, 0, false, 0);
 		if (rc != ERR_SUCCESS)
 		{
@@ -2389,10 +2459,10 @@ bool FileBackup::loadWindowsBackupComponentConfigXml(FileClient &fc)
 bool FileBackup::startPhashDownloadThread(const std::string& async_id)
 {
 	std::string identity = client_main->getIdentity();
-	std::auto_ptr<FileClient> fc_phash_stream(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
+	std::unique_ptr<FileClient> fc_phash_stream(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
 		client_main->isOnInternetConnection(), client_main, use_tmpfiles ? NULL : this));
 
-	_u32 rc = client_main->getClientFilesrvConnection(fc_phash_stream.get(), server_settings.get(), 10000);
+	_u32 rc = client_main->getClientFilesrvConnection(fc_phash_stream.get(), server_settings.get(), 60000);
 	if (rc != ERR_CONNECTED)
 	{
 		ServerLogger::Log(logid, "Full Backup of " + clientname + " failed - CONNECT error (for metadata stream)", LL_ERROR);
@@ -2440,7 +2510,7 @@ bool FileBackup::stopPhashDownloadThread(const std::string& async_id)
 		do
 		{
 			std::string identity = client_main->getIdentity();
-			std::auto_ptr<FileClient> fc_phash_stream_end(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
+			std::unique_ptr<FileClient> fc_phash_stream_end(new FileClient(false, identity, client_main->getProtocolVersions().filesrv_protocol_version,
 				client_main->isOnInternetConnection(), client_main, use_tmpfiles ? NULL : this));
 
 			_u32 rc = client_main->getClientFilesrvConnection(fc_phash_stream_end.get(), server_settings.get(), 10000);
@@ -2474,6 +2544,151 @@ bool FileBackup::stopPhashDownloadThread(const std::string& async_id)
 	return true;
 }
 
+bool FileBackup::checkRansomwareCanaryFile(const std::string& last_backuppath, const std::string& curr_path, const std::string& fn_prefix)
+{
+	std::string canary_path = curr_path + fn_prefix + "-" + server_token + ".docx";
+
+	std::string curr_canary_path = backuppath + os_file_sep() + canary_path;
+	std::string last_canary_path = last_backuppath + os_file_sep() + canary_path;
+
+	std::unique_ptr<IFile> lastf(Server->openFile(last_canary_path, MODE_READ));
+
+	if (lastf.get() == nullptr)
+		return true;
+
+	std::unique_ptr<IFile> currf(Server->openFile(curr_canary_path, MODE_READ));
+
+	if (currf.get() == nullptr)
+	{
+		ServerLogger::Log(logid, "Ransomware canary at \"" + canary_path + "\" is now missing", LL_ERROR);
+		return false;
+	}
+
+	std::vector<char> buf1(32768*2);
+	std::vector<char> buf2(32768 * 2);
+
+	while (true)
+	{
+		_u32 read1 = lastf->Read(buf1.data(), buf1.size());
+		_u32 read2 = currf->Read(buf2.data(), buf2.size());
+
+		if (read1 != read2)
+		{
+			ServerLogger::Log(logid, "Ransomware canary at \"" + canary_path + "\" has changed size", LL_ERROR);
+			return false;
+		}
+
+		if (read1 == 0)
+			return true;
+
+		if (memcmp(buf1.data(), buf2.data(), read1) != 0)
+		{
+			ServerLogger::Log(logid, "Ransomware canary at \"" + canary_path + "\" has changed", LL_ERROR);
+			return false;
+		}
+	}
+}
+
+bool FileBackup::checkRansomwareCanariesPath(const std::string& last_backuppath, const std::string& curr_path, const std::vector<std::string> path_components, size_t idx)
+{
+	if (idx >= path_components.size())
+		return true;
+
+	bool last_comp = idx + 1 >= path_components.size();
+	std::string comp = path_components[idx];
+
+	bool create = false;
+
+	if (comp[0] == '^'
+		&& comp.find("*") == std::string::npos)
+	{
+		create = true;
+		comp = comp.substr(1);
+	}
+
+	if (comp=="." || comp == "..")
+		return false;
+
+	std::string curr_backuppath = backuppath + os_file_sep() + curr_path;
+	std::string last_path = last_backuppath + os_file_sep() + curr_path;
+
+	if (!last_comp
+		&& comp.find("*") != std::string::npos)
+	{
+		std::vector<SFile> files = getFiles(last_path);
+		for (size_t i = 0; i < files.size(); ++i)
+		{
+			if (idx == 0
+				&& files[i].isdir
+				&& files[i].name == ".hashes")
+				continue;
+
+			if (files[i].isdir
+				&& amatch(files[i].name.c_str(), comp.c_str()))
+			{
+				bool b = checkRansomwareCanariesPath(last_backuppath, curr_path + files[i].name + os_file_sep(),
+					path_components, idx + 1);
+				if (!b)
+					return false;
+			}
+		}
+	}
+	else
+	{
+		if (last_comp)
+		{
+			if (!checkRansomwareCanaryFile(last_backuppath, curr_path,
+				comp))
+				return false;
+		}
+
+		if (!last_comp)
+		{
+			bool b = checkRansomwareCanariesPath(last_backuppath, curr_path + comp + os_file_sep(), path_components, idx + 1);
+			if (!b)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+bool FileBackup::checkRansomwareCanariesInt(const std::string& last_backuppath, const std::string& ransomware_canary_paths)
+{
+	std::vector<std::string> paths;
+	Tokenize(ransomware_canary_paths, paths, ";");
+
+	for (std::string path : paths)
+	{
+		std::vector<std::string> path_components;
+		Tokenize(path, path_components, "/");
+
+		if (!path_components.empty())
+		{
+			bool b = checkRansomwareCanariesPath(last_backuppath, std::string(), path_components, 0);
+			if (!b)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+bool FileBackup::checkRansomwareCanaries()
+{
+	if (server_settings->getSettings()->ransomware_canary_paths.empty())
+		return true;
+
+	ServerBackupDao::SLastIncremental last = backup_dao->getLastIncrementalCompleteFileBackup(clientid, group);
+
+	if (!last.exists)
+		return true;
+
+	std::string last_backuppath = server_settings->getSettings()->backupfolder + os_file_sep() + clientname + os_file_sep() + last.path;
+
+	return checkRansomwareCanariesInt(last_backuppath, server_settings->getSettings()->ransomware_canary_paths);
+}
+
 void FileBackup::save_debug_data(const std::string& rfn, const std::string& local_hash, const std::string& remote_hash)
 {
 	ServerLogger::Log(logid, "Local hash: "+local_hash+" remote hash: "+remote_hash, LL_INFO);
@@ -2492,13 +2707,13 @@ void FileBackup::save_debug_data(const std::string& rfn, const std::string& loca
 
 	fc.setProgressLogCallback(this);
 
-	std::auto_ptr<IFile> tmpfile(Server->openTemporaryFile());
+	std::unique_ptr<IFile> tmpfile(Server->openTemporaryFile());
 	std::string tmpdirname = tmpfile->getFilename();
 	tmpfile.reset();
 	Server->deleteFile(tmpdirname);
 	os_create_dir(tmpdirname);
 
-	std::auto_ptr<IFsFile> output_file(Server->openFile(tmpdirname+os_file_sep()+"verify_failed.file", MODE_WRITE));
+	std::unique_ptr<IFsFile> output_file(Server->openFile(tmpdirname+os_file_sep()+"verify_failed.file", MODE_WRITE));
 	rc = fc.GetFile((rfn), output_file.get(), true, false, 0, false, 0);
 
 	if(rc!=ERR_SUCCESS)

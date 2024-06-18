@@ -155,6 +155,35 @@ ServerBackupDao::CondInt ServerBackupDao::getClientGroup(int clientid)
 	return ret;
 }
 
+/**
+* @-SQLGenAccess
+* @func SSetting ServerBackupDao::getServerSetting
+* @return string value, string value_client, int use, int64 use_last_modified
+* @sql
+*		SELECT value, value_client, use, use_last_modified FROM settings_db.settings WHERE key=:key(string) AND clientid=:clientid(int)
+*/
+ServerBackupDao::SSetting ServerBackupDao::getServerSetting(const std::string& key, int clientid)
+{
+	if(q_getServerSetting==NULL)
+	{
+		q_getServerSetting=db->Prepare("SELECT value, value_client, use, use_last_modified FROM settings_db.settings WHERE key=? AND clientid=?", false);
+	}
+	q_getServerSetting->Bind(key);
+	q_getServerSetting->Bind(clientid);
+	db_results res=q_getServerSetting->Read();
+	q_getServerSetting->Reset();
+	SSetting ret = { false, "", "", 0, 0 };
+	if(!res.empty())
+	{
+		ret.exists=true;
+		ret.value=res[0]["value"];
+		ret.value_client=res[0]["value_client"];
+		ret.use=watoi(res[0]["use"]);
+		ret.use_last_modified=watoi64(res[0]["use_last_modified"]);
+	}
+	return ret;
+}
+
 
 /**
 * @-SQLGenAccess
@@ -182,49 +211,6 @@ ServerBackupDao::SClientName ServerBackupDao::getVirtualMainClientname(int clien
 	return ret;
 }
 
-/**
-* @-SQLGenAccess
-* @func void ServerBackupDao::insertIntoOrigClientSettings
-* @sql
-*      INSERT OR REPLACE INTO orig_client_settings (clientid, data)
-*          VALUES (:clientid(int), :data(std::string))
-*/
-void ServerBackupDao::insertIntoOrigClientSettings(int clientid, const std::string& data)
-{
-	if(q_insertIntoOrigClientSettings==NULL)
-	{
-		q_insertIntoOrigClientSettings=db->Prepare("INSERT OR REPLACE INTO orig_client_settings (clientid, data) VALUES (?, ?)", false);
-	}
-	q_insertIntoOrigClientSettings->Bind(clientid);
-	q_insertIntoOrigClientSettings->Bind(data);
-	q_insertIntoOrigClientSettings->Write();
-	q_insertIntoOrigClientSettings->Reset();
-}
-
-/**
-* @-SQLGenAccess
-* @func string ServerBackupDao::getOrigClientSettings
-* @return string data
-* @sql
-*      SELECT data FROM orig_client_settings WHERE clientid = :clientid(int)
-*/
-ServerBackupDao::CondString ServerBackupDao::getOrigClientSettings(int clientid)
-{
-	if(q_getOrigClientSettings==NULL)
-	{
-		q_getOrigClientSettings=db->Prepare("SELECT data FROM orig_client_settings WHERE clientid = ?", false);
-	}
-	q_getOrigClientSettings->Bind(clientid);
-	db_results res=q_getOrigClientSettings->Read();
-	q_getOrigClientSettings->Reset();
-	CondString ret = { false, "" };
-	if(!res.empty())
-	{
-		ret.exists=true;
-		ret.value=res[0]["data"];
-	}
-	return ret;
-}
 
 /**
 * @-SQLGenAccess
@@ -362,6 +348,31 @@ std::vector<int> ServerBackupDao::getClientsByUid(const std::string& uid)
 
 /**
 * @-SQLGenAccess
+* @func string ServerBackupDao::getClientUid
+* @return string uid
+* @sql
+*      SELECT uid FROM clients WHERE id=:id(int)
+*/
+ServerBackupDao::CondString ServerBackupDao::getClientUid(int id)
+{
+	if(q_getClientUid==NULL)
+	{
+		q_getClientUid=db->Prepare("SELECT uid FROM clients WHERE id=?", false);
+	}
+	q_getClientUid->Bind(id);
+	db_results res=q_getClientUid->Read();
+	q_getClientUid->Reset();
+	CondString ret = { false, "" };
+	if(!res.empty())
+	{
+		ret.exists=true;
+		ret.value=res[0]["uid"];
+	}
+	return ret;
+}
+
+/**
+* @-SQLGenAccess
 * @func void ServerBackupDao::updateClientUid
 * @sql
 *      UPDATE clients SET uid=:uid(string) WHERE id=:clientid(int)
@@ -452,20 +463,20 @@ void ServerBackupDao::addClientMoved(const std::string& from_name, const std::st
 
 /**
 * @-SQLGenAccess
-* @func vector<string> ServerBackupDao::getClientMoved
+* @func vector<string> ServerBackupDao::getClientMovedLimit5
 * @return string from_name
 * @sql
-*	   SELECT from_name FROM moved_clients WHERE to_name=:to_name(string)
+*	   SELECT from_name FROM moved_clients WHERE to_name=:to_name(string) LIMIT 5
 */
-std::vector<std::string> ServerBackupDao::getClientMoved(const std::string& to_name)
+std::vector<std::string> ServerBackupDao::getClientMovedLimit5(const std::string& to_name)
 {
-	if(q_getClientMoved==NULL)
+	if(q_getClientMovedLimit5==NULL)
 	{
-		q_getClientMoved=db->Prepare("SELECT from_name FROM moved_clients WHERE to_name=?", false);
+		q_getClientMovedLimit5=db->Prepare("SELECT from_name FROM moved_clients WHERE to_name=? LIMIT 5", false);
 	}
-	q_getClientMoved->Bind(to_name);
-	db_results res=q_getClientMoved->Read();
-	q_getClientMoved->Reset();
+	q_getClientMovedLimit5->Bind(to_name);
+	db_results res=q_getClientMovedLimit5->Read();
+	q_getClientMovedLimit5->Reset();
 	std::vector<std::string> ret;
 	ret.resize(res.size());
 	for(size_t i=0;i<res.size();++i)
@@ -525,6 +536,26 @@ ServerBackupDao::CondString ServerBackupDao::getSetting(int clientid, const std:
 		ret.value=res[0]["value"];
 	}
 	return ret;
+}
+
+/**
+* @-SQLGenAccess
+* @func int ServerBackupDao::hasFileBackups
+* @return int_raw c
+* @sql
+*      SELECT COUNT(*) AS c FROM backups WHERE clientid=:clientid(int) AND done=1 LIMIT 1
+*/
+int ServerBackupDao::hasFileBackups(int clientid)
+{
+	if(q_hasFileBackups==NULL)
+	{
+		q_hasFileBackups=db->Prepare("SELECT COUNT(*) AS c FROM backups WHERE clientid=? AND done=1 LIMIT 1", false);
+	}
+	q_hasFileBackups->Bind(clientid);
+	db_results res=q_hasFileBackups->Read();
+	q_hasFileBackups->Reset();
+	assert(!res.empty());
+	return watoi(res[0]["c"]);
 }
 
 /**
@@ -647,14 +678,17 @@ void ServerBackupDao::setClientUsedFilebackupSize(int64 bytes_used_files, int id
 * @-SQLGenAccess
 * @func bool ServerBackupDao::newFileBackup
 * @sql
-*       INSERT INTO backups (incremental, clientid, path, complete, running, size_bytes, done, archived, size_calculated, resumed, indexing_time_ms, tgroup)
-*		VALUES (:incremental(int), :clientid(int), :path(string), 0, CURRENT_TIMESTAMP, -1, 0, 0, 0, :resumed(int), :indexing_time_ms(int64), :tgroup(int) )
+*       INSERT INTO backups (incremental, clientid, path, complete, running, size_bytes, 
+							done, archived, size_calculated, resumed, indexing_time_ms, tgroup, incremental_ref, deletion_protected,
+							delete_client_pending)
+*		VALUES (:incremental(int), :clientid(int), :path(string), 0, CURRENT_TIMESTAMP, -1, 0, 0, 0, :resumed(int), :indexing_time_ms(int64), :tgroup(int),
+*				:incremental_ref(int), :deletion_protected(int), 0)
 */
-bool ServerBackupDao::newFileBackup(int incremental, int clientid, const std::string& path, int resumed, int64 indexing_time_ms, int tgroup)
+bool ServerBackupDao::newFileBackup(int incremental, int clientid, const std::string& path, int resumed, int64 indexing_time_ms, int tgroup, int incremental_ref, int deletion_protected)
 {
 	if(q_newFileBackup==NULL)
 	{
-		q_newFileBackup=db->Prepare("INSERT INTO backups (incremental, clientid, path, complete, running, size_bytes, done, archived, size_calculated, resumed, indexing_time_ms, tgroup) VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP, -1, 0, 0, 0, ?, ?, ? )", false);
+		q_newFileBackup=db->Prepare("INSERT INTO backups (incremental, clientid, path, complete, running, size_bytes,  done, archived, size_calculated, resumed, indexing_time_ms, tgroup, incremental_ref, deletion_protected) VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP, -1, 0, 0, 0, ?, ?, ?, ?, ?)", false);
 	}
 	q_newFileBackup->Bind(incremental);
 	q_newFileBackup->Bind(clientid);
@@ -662,6 +696,8 @@ bool ServerBackupDao::newFileBackup(int incremental, int clientid, const std::st
 	q_newFileBackup->Bind(resumed);
 	q_newFileBackup->Bind(indexing_time_ms);
 	q_newFileBackup->Bind(tgroup);
+	q_newFileBackup->Bind(incremental_ref);
+	q_newFileBackup->Bind(deletion_protected);
 	bool ret = q_newFileBackup->Write();
 	q_newFileBackup->Reset();
 	return ret;
@@ -721,21 +757,22 @@ void ServerBackupDao::setFileBackupSynced(int backupid)
 /**
 * @-SQLGenAccess
 * @func SLastIncremental ServerBackupDao::getLastIncrementalFileBackup
-* @return int incremental, string path, int resumed, int complete, int id
+* @return int incremental, string path, int resumed, int complete, int id, int incremental_ref, int deletion_protected
 * @sql
-*       SELECT incremental, path, resumed, complete, id FROM backups WHERE clientid=:clientid(int) AND tgroup=:tgroup(int) AND done=1 ORDER BY backuptime DESC LIMIT 1
+*       SELECT incremental, path, resumed, complete, id, incremental_ref, deletion_protected
+*		FROM backups WHERE clientid=:clientid(int) AND tgroup=:tgroup(int) AND done=1 ORDER BY backuptime DESC LIMIT 1
 */
 ServerBackupDao::SLastIncremental ServerBackupDao::getLastIncrementalFileBackup(int clientid, int tgroup)
 {
 	if(q_getLastIncrementalFileBackup==NULL)
 	{
-		q_getLastIncrementalFileBackup=db->Prepare("SELECT incremental, path, resumed, complete, id FROM backups WHERE clientid=? AND tgroup=? AND done=1 ORDER BY backuptime DESC LIMIT 1", false);
+		q_getLastIncrementalFileBackup=db->Prepare("SELECT incremental, path, resumed, complete, id, incremental_ref, deletion_protected FROM backups WHERE clientid=? AND tgroup=? AND done=1 ORDER BY backuptime DESC LIMIT 1", false);
 	}
 	q_getLastIncrementalFileBackup->Bind(clientid);
 	q_getLastIncrementalFileBackup->Bind(tgroup);
 	db_results res=q_getLastIncrementalFileBackup->Read();
 	q_getLastIncrementalFileBackup->Reset();
-	SLastIncremental ret = { false, 0, "", 0, 0, 0 };
+	SLastIncremental ret = { false, 0, "", 0, 0, 0, 0, 0 };
 	if(!res.empty())
 	{
 		ret.exists=true;
@@ -744,6 +781,8 @@ ServerBackupDao::SLastIncremental ServerBackupDao::getLastIncrementalFileBackup(
 		ret.resumed=watoi(res[0]["resumed"]);
 		ret.complete=watoi(res[0]["complete"]);
 		ret.id=watoi(res[0]["id"]);
+		ret.incremental_ref=watoi(res[0]["incremental_ref"]);
+		ret.deletion_protected=watoi(res[0]["deletion_protected"]);
 	}
 	return ret;
 }
@@ -1211,18 +1250,19 @@ void ServerBackupDao::updateClientLastFileBackup(int backupid, int last_fileback
 * @-SQLGenAccess
 * @func void ServerBackupDao::updateClientOsAndClientVersion
 * @sql
-*       UPDATE clients SET os_simple=:os_simple(string), os_version_str=:os_version(string), client_version_str=:client_version(string)
+*       UPDATE clients SET os_simple=:os_simple(string), os_version_str=:os_version(string), client_version_str=:client_version(string), capa=:capa(int)
 *		WHERE id=:clientid(int)
 */
-void ServerBackupDao::updateClientOsAndClientVersion(const std::string& os_simple, const std::string& os_version, const std::string& client_version, int clientid)
+void ServerBackupDao::updateClientOsAndClientVersion(const std::string& os_simple, const std::string& os_version, const std::string& client_version, int capa, int clientid)
 {
 	if(q_updateClientOsAndClientVersion==NULL)
 	{
-		q_updateClientOsAndClientVersion=db->Prepare("UPDATE clients SET os_simple=?, os_version_str=?, client_version_str=? WHERE id=?", false);
+		q_updateClientOsAndClientVersion=db->Prepare("UPDATE clients SET os_simple=?, os_version_str=?, client_version_str=?, capa=? WHERE id=?", false);
 	}
 	q_updateClientOsAndClientVersion->Bind(os_simple);
 	q_updateClientOsAndClientVersion->Bind(os_version);
 	q_updateClientOsAndClientVersion->Bind(client_version);
+	q_updateClientOsAndClientVersion->Bind(capa);
 	q_updateClientOsAndClientVersion->Bind(clientid);
 	q_updateClientOsAndClientVersion->Write();
 	q_updateClientOsAndClientVersion->Reset();
@@ -1902,6 +1942,93 @@ std::vector<ServerBackupDao::SMountedImage> ServerBackupDao::getOldMountedImages
 	return ret;
 }
 
+/**
+* @-SQLGenAccess
+* @func void ServerBackupDao::setCapa
+* @sql
+*       UPDATE clients SET capa=:capa(int) WHERE id=:clientid(int)
+*/
+void ServerBackupDao::setCapa(int capa, int clientid)
+{
+	if(q_setCapa==NULL)
+	{
+		q_setCapa=db->Prepare("UPDATE clients SET capa=? WHERE id=?", false);
+	}
+	q_setCapa->Bind(capa);
+	q_setCapa->Bind(clientid);
+	q_setCapa->Write();
+	q_setCapa->Reset();
+}
+
+/**
+* @-SQLGenAccess
+* @func int ServerBackupDao::getCapa
+* @return int capa
+* @sql
+*       SELECT capa FROM clients WHERE id=:clientid(int)
+*/
+ServerBackupDao::CondInt ServerBackupDao::getCapa(int clientid)
+{
+	if(q_getCapa==NULL)
+	{
+		q_getCapa=db->Prepare("SELECT capa FROM clients WHERE id=?", false);
+	}
+	q_getCapa->Bind(clientid);
+	db_results res=q_getCapa->Read();
+	q_getCapa->Reset();
+	CondInt ret = { false, 0 };
+	if(!res.empty())
+	{
+		ret.exists=true;
+		ret.value=watoi(res[0]["capa"]);
+	}
+	return ret;
+}
+
+/**
+* @-SQLGenAccess
+* @func int ServerBackupDao::getClientWithHashes
+* @return int with_hashes
+* @sql
+*       SELECT with_hashes FROM clients WHERE id=:clientid(int)
+*/
+ServerBackupDao::CondInt ServerBackupDao::getClientWithHashes(int clientid)
+{
+	if(q_getClientWithHashes==NULL)
+	{
+		q_getClientWithHashes=db->Prepare("SELECT with_hashes FROM clients WHERE id=?", false);
+	}
+	q_getClientWithHashes->Bind(clientid);
+	db_results res=q_getClientWithHashes->Read();
+	q_getClientWithHashes->Reset();
+	CondInt ret = { false, 0 };
+	if(!res.empty())
+	{
+		ret.exists=true;
+		ret.value=watoi(res[0]["with_hashes"]);
+	}
+	return ret;
+}
+
+/**
+* @-SQLGenAccess
+* @func void ServerBackupDao::updateClientWithHashes
+* @sql
+*		UPDATE clients SET with_hashes=:with_hashes(int) WHERE id=:clientid(int)
+*/
+void ServerBackupDao::updateClientWithHashes(int with_hashes, int clientid)
+{
+	if(q_updateClientWithHashes==NULL)
+	{
+		q_updateClientWithHashes=db->Prepare("UPDATE clients SET with_hashes=? WHERE id=?", false);
+	}
+	q_updateClientWithHashes->Bind(with_hashes);
+	q_updateClientWithHashes->Bind(clientid);
+	q_updateClientWithHashes->Write();
+	q_updateClientWithHashes->Reset();
+}
+
+
 //@-SQLGenSetup
 void ServerBackupDao::prepareQueries( void )
 {
@@ -1910,22 +2037,23 @@ void ServerBackupDao::prepareQueries( void )
 	q_getDeletePendingClientNames=NULL;
 	q_getGroupName=NULL;
 	q_getClientGroup=NULL;
+	q_getServerSetting=NULL;
 	q_getVirtualMainClientname=NULL;
-	q_insertIntoOrigClientSettings=NULL;
-	q_getOrigClientSettings=NULL;
 	q_getLastIncrementalDurations=NULL;
 	q_getLastFullDurations=NULL;
 	q_getClientSetting=NULL;
 	q_getClientIds=NULL;
 	q_getClientsByUid=NULL;
+	q_getClientUid=NULL;
 	q_updateClientUid=NULL;
 	q_deleteClient=NULL;
 	q_changeClientName=NULL;
 	q_changeClientNameWithVirtualmain=NULL;
 	q_addClientMoved=NULL;
-	q_getClientMoved=NULL;
+	q_getClientMovedLimit5=NULL;
 	q_getClientMovedFrom=NULL;
 	q_getSetting=NULL;
+	q_hasFileBackups=NULL;
 	q_insertSetting=NULL;
 	q_updateSetting=NULL;
 	q_getMiscValue=NULL;
@@ -1987,6 +2115,10 @@ void ServerBackupDao::prepareQueries( void )
 	q_getMountedImage=NULL;
 	q_getImageInfo=NULL;
 	q_getOldMountedImages=NULL;
+	q_setCapa=NULL;
+	q_getCapa=NULL;
+	q_getClientWithHashes=NULL;
+	q_updateClientWithHashes=NULL;
 }
 
 //@-SQLGenDestruction
@@ -1997,22 +2129,23 @@ void ServerBackupDao::destroyQueries( void )
 	db->destroyQuery(q_getDeletePendingClientNames);
 	db->destroyQuery(q_getGroupName);
 	db->destroyQuery(q_getClientGroup);
+	db->destroyQuery(q_getServerSetting);
 	db->destroyQuery(q_getVirtualMainClientname);
-	db->destroyQuery(q_insertIntoOrigClientSettings);
-	db->destroyQuery(q_getOrigClientSettings);
 	db->destroyQuery(q_getLastIncrementalDurations);
 	db->destroyQuery(q_getLastFullDurations);
 	db->destroyQuery(q_getClientSetting);
 	db->destroyQuery(q_getClientIds);
 	db->destroyQuery(q_getClientsByUid);
+	db->destroyQuery(q_getClientUid);
 	db->destroyQuery(q_updateClientUid);
 	db->destroyQuery(q_deleteClient);
 	db->destroyQuery(q_changeClientName);
 	db->destroyQuery(q_changeClientNameWithVirtualmain);
 	db->destroyQuery(q_addClientMoved);
-	db->destroyQuery(q_getClientMoved);
+	db->destroyQuery(q_getClientMovedLimit5);
 	db->destroyQuery(q_getClientMovedFrom);
 	db->destroyQuery(q_getSetting);
+	db->destroyQuery(q_hasFileBackups);
 	db->destroyQuery(q_insertSetting);
 	db->destroyQuery(q_updateSetting);
 	db->destroyQuery(q_getMiscValue);
@@ -2074,6 +2207,10 @@ void ServerBackupDao::destroyQueries( void )
 	db->destroyQuery(q_getMountedImage);
 	db->destroyQuery(q_getImageInfo);
 	db->destroyQuery(q_getOldMountedImages);
+	db->destroyQuery(q_setCapa);
+	db->destroyQuery(q_getCapa);
+	db->destroyQuery(q_getClientWithHashes);
+	db->destroyQuery(q_updateClientWithHashes);
 }
 
 

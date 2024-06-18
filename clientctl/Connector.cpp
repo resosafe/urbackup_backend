@@ -46,9 +46,17 @@ namespace
 {
 	void read_tokens(std::string token_path, std::string& tokens)
 	{
-            if(os_directory_exists(os_file_prefix(token_path)))
+#ifdef _WIN32
+		std::string prefixed_token_path = os_file_prefix(token_path);
+		if (!os_directory_exists(prefixed_token_path))
+			prefixed_token_path = token_path;
+#else
+		std::string prefixed_token_path = token_path;
+#endif
+
+            if(os_directory_exists(prefixed_token_path))
             {
-		std::vector<SFile> token_files = getFiles(token_path);
+		std::vector<SFile> token_files = getFiles(prefixed_token_path);
 
 		for(size_t i=0;i<token_files.size();++i)
 		{
@@ -57,7 +65,7 @@ namespace
 				continue;
 			}
 
-			std::string nt = getFile(token_path + os_file_sep() + token_files[i].name);
+			std::string nt = getFile(prefixed_token_path + os_file_sep() + token_files[i].name);
 			if(!nt.empty())
 			{
 				if(!tokens.empty())
@@ -110,6 +118,22 @@ std::string Connector::getResponse(const std::string &cmd, const std::string &ar
 #endif
 	SOCKET p=socket(lookup_result.is_ipv6 ? AF_INET6 : AF_INET, type, 0);
 
+	if (p == SOCKET_ERROR)
+	{
+#if !defined(_WIN32) && defined(SOCK_CLOEXEC)
+		if (errno == EINVAL)
+		{
+			type &= ~SOCK_CLOEXEC;
+			p = socket(lookup_result.is_ipv6 ? AF_INET6 : AF_INET, type, 0);
+		}
+#endif
+		if (p == SOCKET_ERROR)
+		{
+			std::cout << "Error creating socket for connection to backend" << std::endl;
+			return "";
+		}
+	}
+
 #if !defined(_WIN32) && !defined(SOCK_CLOEXEC)
 	fcntl(p, F_SETFD, fcntl(p, F_GETFD, 0) | FD_CLOEXEC);
 #endif
@@ -155,10 +179,10 @@ std::string Connector::getResponse(const std::string &cmd, const std::string &ar
 	CTCPStack tcpstack;
 	tcpstack.Send(p, cmd+"#pw="+pw+t_args);
 
-	char *resp=NULL;
+	char *resp=nullptr;
 	char buffer[1024];
 	size_t packetsize;
-	while(resp==NULL)
+	while(resp==nullptr)
 	{
         int rc=recv(p, buffer, 1024, MSG_NOSIGNAL);
 		
@@ -231,7 +255,8 @@ std::vector<SBackupDir> Connector::getSharedPaths(bool use_change_pw)
 				dir["id"].asInt(),
 				dir["group"].asInt(),
 				virtual_client,
-				dir["flags"].asString()
+				dir["flags"].asString(),
+				dir["server_default"].asInt()
 			};
 
 			ret.push_back(rdir);
@@ -246,9 +271,12 @@ std::vector<SBackupDir> Connector::getSharedPaths(bool use_change_pw)
 
 bool Connector::saveSharedPaths(const std::vector<SBackupDir> &res)
 {
-	std::string args="all_virtual_clients=1";
+	std::string args="all_virtual_clients=1&enable_client_paths_use=1";
 	for (size_t i = 0; i<res.size(); ++i)
 	{
+		if (res[i].server_default)
+			continue;
+
 		args += "&";
 		std::string path = EscapeParamString(res[i].path);
 		std::string name = EscapeParamString(res[i].name);
@@ -524,7 +552,7 @@ std::string Connector::getFileList( const std::string& path, int* backupid, cons
 		params+="&path="+EscapeParamString(path);
 	}
 
-	if(backupid!=NULL)
+	if(backupid!=nullptr)
 	{
 		params+="&backupid="+convert(*backupid);
 	}

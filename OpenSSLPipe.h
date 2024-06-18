@@ -45,6 +45,8 @@ public:
 
 	virtual void shutdown(void);
 
+	virtual size_t getNumWaiters();
+
 	virtual size_t getNumElements(void);
 
 	virtual void addThrottler(IPipeThrottler * throttler);
@@ -59,7 +61,7 @@ public:
 
 private:
 
-	std::auto_ptr<CStreamPipe> bpipe;
+	std::unique_ptr<CStreamPipe> bpipe;
 
 	BIO* bbio;
 	SSL_CTX* ctx;

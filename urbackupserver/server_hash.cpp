@@ -18,6 +18,7 @@
 #include "server_hash.h"
 #include "server_prepare_hash.h"
 #include "server_settings.h"
+#include "server.h"
 #include "../urbackupcommon/fileclient/FileClientChunked.h"
 #include "../Interface/Server.h"
 #include "../Interface/File.h"
@@ -73,11 +74,6 @@ BackupServerHash::BackupServerHash(IPipe *pPipe, int pClientid, bool use_snapsho
 
 BackupServerHash::~BackupServerHash(void)
 {
-	if(pipe!=NULL)
-	{
-		Server->destroy(pipe);
-	}
-
 	delete fileindex;
 }
 
@@ -120,6 +116,7 @@ void BackupServerHash::operator()(void)
 		working=true;
 		if(data=="exit")
 		{
+			pipe->Write("exit");
 			deinitDatabase();
 			Server->Log("server_hash Thread finished - normal");
 			Server->destroyDatabases(Server->getThreadID());
@@ -194,7 +191,7 @@ void BackupServerHash::operator()(void)
 				}
 				else
 				{
-					std::auto_ptr<ExtentIterator> extent_iterator;
+					std::unique_ptr<ExtentIterator> extent_iterator;
 					if (!sparse_extents_fn.empty())
 					{
 						IFile* sparse_extents_f = Server->openFile(sparse_extents_fn, MODE_READ);
@@ -248,7 +245,7 @@ void BackupServerHash::operator()(void)
 					metadata.set_shahash(src_metadata.shahash);
 				}
 
-				std::auto_ptr<IFile> tf(Server->openFile(os_file_prefix(source), MODE_READ_SEQUENTIAL));
+				std::unique_ptr<IFile> tf(Server->openFile(os_file_prefix(source), MODE_READ_SEQUENTIAL));
 
 				if(!tf.get())
 				{
@@ -265,7 +262,7 @@ void BackupServerHash::operator()(void)
 
 					if(!hash_src.empty())
 					{
-						std::auto_ptr<IFile> hashf(Server->openFile(os_file_prefix(hash_src), MODE_READ_SEQUENTIAL));
+						std::unique_ptr<IFile> hashf(Server->openFile(os_file_prefix(hash_src), MODE_READ_SEQUENTIAL));
 						if(hashf.get())
 						{
 							copyFile(hashf.get(), hash_dest, NULL);
@@ -641,7 +638,7 @@ bool BackupServerHash::findFileAndLink(const std::string &tfn, IFile *tf, std::s
 		}
 		if (!b)
 		{
-			b = FileBackup::create_hardlink(os_file_prefix(tfn), os_file_prefix(existing_file.fullpath), use_snapshots, &too_many_hardlinks, &copy);
+			b = FileBackup::create_hardlink(os_file_prefix(tfn), os_file_prefix(existing_file.fullpath), use_snapshots || (use_reflink && !BackupServer::canHardlink()), &too_many_hardlinks, &copy);
 		}
 		if(!b)
 		{
@@ -703,7 +700,7 @@ bool BackupServerHash::findFileAndLink(const std::string &tfn, IFile *tf, std::s
 
 						if(!existing_file.hashpath.empty())
 						{
-							std::auto_ptr<IFile> ctf_hash(Server->openFile(os_file_prefix(existing_file.hashpath), MODE_READ));
+							std::unique_ptr<IFile> ctf_hash(Server->openFile(os_file_prefix(existing_file.hashpath), MODE_READ));
 
 							bool write_metadata = true;
 
@@ -772,7 +769,7 @@ bool BackupServerHash::findFileAndLink(const std::string &tfn, IFile *tf, std::s
 
 			if(!hashoutput_fn.empty())
 			{
-				std::auto_ptr<IFile> src(Server->openFile(os_file_prefix(hashoutput_fn), MODE_READ));
+				std::unique_ptr<IFile> src(Server->openFile(os_file_prefix(hashoutput_fn), MODE_READ));
 				if(src.get()!=NULL)
 				{
 					if(!copyFile(src.get(), hash_fn, NULL))
@@ -800,7 +797,7 @@ bool BackupServerHash::findFileAndLink(const std::string &tfn, IFile *tf, std::s
 			}
 			else if(!existing_file.hashpath.empty())
 			{
-				std::auto_ptr<IFile> ctf(Server->openFile(os_file_prefix(existing_file.hashpath), MODE_READ));
+				std::unique_ptr<IFile> ctf(Server->openFile(os_file_prefix(existing_file.hashpath), MODE_READ));
 				if(ctf.get()!=NULL)
 				{
 					int64 hashfilesize = read_hashdata_size(ctf.get());
@@ -929,15 +926,32 @@ void BackupServerHash::addFile(int backupid, int incremental, IFile *tf, const s
 
 			if( fs>0 && available_space<=fs )
 			{
-				if(space_logcnt==0)
+				if (extent_iterator != NULL)
 				{
-					ServerLogger::Log(logid, "HT: No free space available deleting backups...", LL_WARNING);
+					extent_iterator->reset();
+
+					IFsFile::SSparseExtent ext;
+					while ((ext = extent_iterator->nextExtent()).offset!=-1)
+					{
+						if(ext.size>0)
+							fs -= ext.size;
+					}
+
+					extent_iterator->reset();
 				}
-				else
+
+				if (fs > 0 && available_space <= fs)
 				{
-					ServerLogger::Log(logid, "HT: No free space available deleting backups...", LL_WARNING);
+					if (space_logcnt == 0)
+					{
+						ServerLogger::Log(logid, "HT: No free space available deleting backups...", LL_WARNING);
+					}
+					else
+					{
+						ServerLogger::Log(logid, "HT: No free space available deleting backups...", LL_WARNING);
+					}
+					free_ok = freeSpace(fs, os_file_prefix(tfn));
 				}
-				free_ok=freeSpace(fs, os_file_prefix(tfn));
 			}
 
 			if(!free_ok)
@@ -1242,7 +1256,7 @@ bool BackupServerHash::copyFile(IFile *tf, const std::string &dest, ExtentIterat
 	ServerLogger::Log(logid, "HT: Copying file to \""+dest+"\"", LL_DEBUG);
 
 	std::string errstr;
-	std::auto_ptr<IFsFile> dst(openFileRetry(dest, MODE_WRITE, errstr));
+	std::unique_ptr<IFsFile> dst(openFileRetry(dest, MODE_WRITE, errstr));
 	if (dst.get() == NULL)
 	{
 		ServerLogger::Log(logid, "Error opening dest file \"" + dest + "\". " + errstr, LL_ERROR);
@@ -1609,7 +1623,7 @@ bool BackupServerHash::replaceFile(IFile *tf, const std::string &dest, const std
 	ServerLogger::Log(logid, "HT: Copying with reflink data from \""+orig_fn+"\"", LL_DEBUG);
 
 	std::string errstr;
-	std::auto_ptr<IFile> dst(openFileRetry(dest, MODE_RW, errstr));
+	std::unique_ptr<IFile> dst(openFileRetry(dest, MODE_RW, errstr));
 	if (dst.get() == NULL)
 	{
 		ServerLogger::Log(logid, "Error opening destination file at \"" + dest + "\". " + errstr, LL_ERROR);

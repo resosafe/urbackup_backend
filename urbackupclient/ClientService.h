@@ -3,6 +3,7 @@
 #include "../Interface/Thread.h"
 #include "../Interface/File.h"
 #include "../urbackupcommon/fileclient/tcpstack.h"
+#include "../cryptoplugin/CryptoFactory.h"
 
 #include <map>
 #include <deque>
@@ -50,6 +51,10 @@ enum RunningAction
 	RUNNING_RESTORE_IMAGE=9
 };
 
+const int c_use_group = 1;
+const int c_use_value = 2;
+const int c_use_value_client = 4;
+
 struct SRunningProcess
 {
 	SRunningProcess()
@@ -60,7 +65,8 @@ struct SRunningProcess
 		detail_pc(-1),
 		total_bytes(-1),
 		done_bytes(0),
-		speed_bpms(0)
+		speed_bpms(0),
+		refs(0)
 	{}
 
 	int64 id;
@@ -75,6 +81,7 @@ struct SRunningProcess
 	int64 total_bytes;
 	int64 done_bytes;
 	double speed_bpms;
+	size_t refs;
 };
 
 struct SFinishedProcess
@@ -171,6 +178,7 @@ struct SAsyncFileList
 	int64 last_update;
 	unsigned int result_id;
 	size_t refcount;
+	THREADPOOL_TICKET backup_ticket;
 };
 
 struct SVolumesCache;
@@ -206,14 +214,22 @@ public:
 
 	static bool isBackupRunning();
 
+	static bool tochannelSendLocked(bool locked);
+
 	static bool tochannelSendChanges(const char* changes, size_t changes_size);
 
-	static bool tochannelLog(int64 log_id, const std::string& msg, int loglevel, const std::string& identity);
+	static bool tochannelLog(int64 log_id, const std::string& msg, int loglevel, const std::string& identity,
+		int timeoutms=10000);
 
 	static void updateRestorePc(int64 local_process_id, int64 restore_id, int64 status_id, int nv, const std::string& identity,
 		const std::string& fn, int fn_pc, int64 total_bytes, int64 done_bytes, double speed_bpms);
 
 	static bool restoreDone(int64 log_id, int64 status_id, int64 restore_id, bool success, const std::string& identity);
+
+	static void updateLocalBackupPc(int64 local_process_id, int64 backup_id, int64 status_id, int nv, const std::string& identity,
+		const std::string& details, int64 total_bytes, int64 done_bytes, double speed_bpms, int64 eta, int64 eta_set_time);
+
+	static bool localBackupDone(int64 log_id, int64 status_id, int64 backup_id, bool success, const std::string& identity);
 
 	static IPipe* getFileServConnection(const std::string& server_token, unsigned int timeoutms);
 
@@ -223,7 +239,7 @@ public:
 
 	static int64 addNewProcess(SRunningProcess proc);
 	static bool updateRunningPc(int64 id, int pcdone);
-	static bool removeRunningProcess(int64 id, bool success);
+	static bool removeRunningProcess(int64 id, bool success, bool consider_refs=false);
 
 	static void timeoutFilesrvConnections();
 
@@ -231,11 +247,17 @@ public:
 
 	static std::string removeIllegalCharsFromBackupName(std::string in);
 
+	static bool updateDefaultDirsSetting(IDatabase *db, bool all_virtual_clients, int group_offset, bool update_use, int facet_id);
+
+	static bool getBackupDest(const std::string& clientsubname, int facet_id, std::string& dest,
+		std::string& dest_params, str_map& dest_secret_params, std::string& computername,
+		size_t& max_backups, std::string& perm_uid);
+
 private:
 	bool checkPassword(const std::string &cmd, bool& change_pw);
-	bool saveBackupDirs(str_map &args, bool server_default=false, int group_offset=0);
+	bool saveBackupDirs(str_map &args, bool server_default, int group_offset, int facet_id);
 	std::string replaceChars(std::string in);
-	void updateSettings(const std::string &pData);
+	void updateSettings(const std::string &pData, const std::string& server_identity);
 	void replaceSettings(const std::string &pData);
 	void saveLogdata(const std::string &created, const std::string &pData);
 	std::string getLogpoints(void);
@@ -256,7 +278,7 @@ private:
 	void tochannelSendStartbackup(RunningAction backup_type, const std::string& virtual_client);
 	void ImageErr(const std::string &msg);
 	void update_silent(void);
-	bool calculateFilehashesOnClient(const std::string& clientsubname);
+	bool calculateFilehashesOnClient(const std::string& clientsubname, int facet_id);
 	void sendStatus();
     bool sendChannelPacket(const SChannel& channel, const std::string& msg);
 	bool versionNeedsUpdate(const std::string& local_version, const std::string& server_version);
@@ -265,6 +287,7 @@ private:
 	std::string getAccessTokensParams(const std::string& tokens, bool with_clientname, const std::string& virtual_client);
 
 	static bool sendMessageToChannel(const std::string& msg, int timeoutms, const std::string& identity);
+	static bool sendMessageToAllChannels(const std::string& msg, int timeoutms);
 
 	static int64 getLastBackupTime();
 
@@ -278,8 +301,8 @@ private:
 	void CMD_ADD_IDENTITY(const std::string &params);
 	void CMD_GET_CHALLENGE(const std::string &identity, const std::string& cmd);
 	void CMD_SIGNATURE(const std::string &identity, const std::string &cmd);
-	void CMD_START_INCR_FILEBACKUP(const std::string &cmd);
-	void CMD_START_FULL_FILEBACKUP(const std::string &cmd);
+	void CMD_START_INCR_FILEBACKUP(const std::string &cmd, const std::string& server_identity);
+	void CMD_START_FULL_FILEBACKUP(const std::string &cmd, const std::string& server_identity);
 	void CMD_WAIT_FOR_INDEX(const std::string &cmd);
 	void CMD_START_SHADOWCOPY(const std::string &cmd);
 	void CMD_STOP_SHADOWCOPY(const std::string &cmd);
@@ -291,7 +314,7 @@ private:
 	void CMD_BACKUP_FAILED(const std::string& cmd);
 	void CMD_STATUS(const std::string &cmd);
 	void CMD_STATUS_DETAIL(const std::string &cmd);
-	void CMD_UPDATE_SETTINGS(const std::string &cmd);
+	void CMD_UPDATE_SETTINGS(const std::string &cmd, const std::string& server_identity);
 	void CMD_PING_RUNNING(const std::string &cmd);
 	void CMD_PING_RUNNING2(const std::string &cmd);
 	void CMD_CHANNEL(const std::string &cmd, IScopedLock *g_lock, const std::string& identity);
@@ -330,16 +353,30 @@ private:
 	void CMD_GET_ACCESS_PARAMS(str_map &params);
 	void CMD_CONTINUOUS_WATCH_START();
 	void CMD_SCRIPT_STDERR(const std::string& cmd);
-	void CMD_FILE_RESTORE(const std::string& cmd);
+	void CMD_FILE_RESTORE(const std::string& cmd, const std::string& identity);
 	void CMD_RESTORE_OK(str_map &params);
 	void CMD_CLIENT_ACCESS_KEY(const std::string& cmd);
 	void CMD_WRITE_TOKENS(const std::string& cmd);
+	void CMD_GET_CLIENTNAME(const std::string& cmd);
+	void CMD_FINISH_LBACKUP(const std::string& cmd);
 
 	int getCapabilities(IDatabase* db);
 	bool multipleChannelServers();
 	void exit_backup_immediate(int rc);
 
+	void createFacet(const std::string& server_identity, const std::string& facet_name);
+	int getFacetId(const std::string& server_identity);
+	int getFacetIdByName(const std::string& facet_name);
+
 	void refreshSessionFromChannel(const std::string& endpoint_name);
+
+	bool localBackup(std::string dest_url, 
+		const std::string& dest_params,
+		const str_map& dest_secret_params,
+		const std::string& computername,
+		bool full, size_t max_backups,
+		const std::string& server_identity, str_map& params,
+		const std::string& perm_uid);
 
 	static void timeoutAsyncFileIndex();
 
@@ -352,6 +389,7 @@ private:
 	static void removeTimedOutProcesses(std::string server_token, bool file);
 
 	unsigned int curr_result_id;
+	THREADPOOL_TICKET curr_backup_tt;
 	IPipe *pipe;
 	THREAD_ID tid;
 	ClientConnectorState state;
@@ -382,9 +420,32 @@ private:
 	static IMutex *ident_mutex;
 	static std::vector<std::string> new_server_idents;
 	static bool end_to_end_file_backup_verification_enabled;
-	static std::map<std::pair<std::string, std::string>, std::string> challenges;
+
+	struct SChallenge
+	{
+		SChallenge()
+			: shared_key_exchange(NULL),
+			local_compressed(false)
+		{
+		}
+
+		SChallenge(std::string challenge_str,
+			IECDHKeyExchange* shared_key_exchange,
+			bool local_compressed)
+			: challenge_str(challenge_str),
+			shared_key_exchange(shared_key_exchange),
+			local_compressed(local_compressed)
+		{}
+
+		std::string challenge_str;
+		IECDHKeyExchange* shared_key_exchange;
+		bool local_compressed;
+	};
+
+	static std::map < std::pair<std::string, std::string>, SChallenge > challenges;
 	static bool has_file_changes;
 	static bool last_metered;
+	static bool last_locked;
 
 	struct SFilesrvConnection
 	{
@@ -436,7 +497,11 @@ private:
 
 	int64 idle_timeout;
 
+	static int64 startup_timestamp;
+
 	std::string async_file_list_id;
+
+	bool is_encrypted;
 };
 
 class ScopedRemoveRunningBackup

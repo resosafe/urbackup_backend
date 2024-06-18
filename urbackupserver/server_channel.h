@@ -10,6 +10,7 @@ class IDatabase;
 class ServerSettings;
 namespace {
 class SessionKeepaliveThread;
+class RestoreTokenKeepaliveThread;
 }
 
 class ServerChannelThread : public IThread
@@ -29,7 +30,20 @@ public:
 
     static void initOffset();
 
+	static void init_mutex();
+
 	bool isOnline();
+
+	static void add_restore_token(const std::string& token, int backupid);
+	static void remove_restore_token(const std::string& token);
+
+	struct SRestoreToken
+	{
+		int backupid;
+		int64 lasttime;
+	};
+
+	static bool get_restore_token(const std::string& token, SRestoreToken& ret);
 
 private:
 	int64 lasttime;
@@ -39,7 +53,7 @@ private:
 
 	int constructCapabilities(void);
 
-	bool hasDownloadImageRights(void);
+	bool hasDownloadImageRights(const str_map& params=str_map());
 
 	int getLastBackupid(IDatabase* db);
 
@@ -56,6 +70,9 @@ private:
 	void DOWNLOAD_FILES_TOKENS(str_map& params);
 	void RESTORE_PERCENT( str_map params );
 	void RESTORE_DONE( str_map params );
+	void BACKUP_PERCENT(str_map params);
+	void BACKUP_DONE(str_map params);
+	void STARTUP(str_map& params);
 
 	void reset();
 
@@ -66,6 +83,8 @@ private:
 	void add_extra_channel();
 
 	void remove_extra_channel();
+
+	static void timeout_restore_tokens_used();
 
 	ClientMain *client_main;
 	IPipe *exitpipe;
@@ -91,6 +110,7 @@ private:
 	std::string client_addr;
 
 	SessionKeepaliveThread* keepalive_thread;
+	RestoreTokenKeepaliveThread* restore_token_keepalive_thread;
 
 	std::string clientname;
 
@@ -104,4 +124,10 @@ private:
 
 	ServerChannelThread* parent;
 	std::vector<ServerChannelThread*> extra_channel_threads;
+
+	static IMutex* restore_token_mutex;
+	static std::map<std::string, SRestoreToken> restore_tokens;
+	static std::map<std::string, SRestoreToken> restore_tokens_used;
+
+	int64 startup_timestamp;
 };

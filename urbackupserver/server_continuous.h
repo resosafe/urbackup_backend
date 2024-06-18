@@ -14,7 +14,7 @@
 #include "../stringtools.h"
 #include "server_settings.h"
 #include "database.h"
-#include "ServerDownloadThread.h"
+#include "ServerDownloadThreadGroup.h"
 #include "server_log.h"
 #include "dao/ServerBackupDao.h"
 #include "dao/ServerFilesDao.h"
@@ -169,7 +169,7 @@ public:
 		if(server_download.get())
 		{
 			server_download->queueStop();
-			Server->getThreadPool()->waitFor(server_download_ticket);
+			server_download->join(-1);
 		}
 
 		if(has_fullpath_entryid_mapping_table)
@@ -649,7 +649,7 @@ private:
 
 	bool execAddFile(SChange& change)
 	{
-		std::auto_ptr<IFile> f(Server->openFile(getFullpath(change.fn1), MODE_WRITE));
+		std::unique_ptr<IFile> f(Server->openFile(getFullpath(change.fn1), MODE_WRITE));
 
 		if(!f.get())
 		{
@@ -699,7 +699,7 @@ private:
 		}
 	}
 
-	bool constructFileClient(std::auto_ptr<FileClient>& new_fc)
+	bool constructFileClient(std::unique_ptr<FileClient>& new_fc)
 	{		
 		new_fc.reset(new FileClient(false, server_identity, client_main->getProtocolVersions().file_protocol_version, client_main->isOnInternetConnection(), client_main, client_main));
 		_u32 rc = client_main->getClientFilesrvConnection(new_fc.get(), server_settings.get());
@@ -714,19 +714,17 @@ private:
 	void constructServerDownloadThread()
 	{
 		std::vector<std::string> shares_without_snapshot;
-		server_download.reset(new ServerDownloadThread(*fileclient.get(),
+		server_download.reset(new ServerDownloadThreadGroup(*fileclient.get(),
 			fileclient_chunked.get(), continuous_path,
 			continuous_hash_path, continuous_path, std::string(), hashed_transfer_full,
 			false, clientid, clientname, std::string(), use_tmpfiles, tmpfile_path, server_token,
 			use_reflink, backupid, true, hashpipe_prepare, client_main, client_main->getProtocolVersions().file_protocol_version,
-			0, logid, true, shares_without_snapshot, true, NULL, false, filepath_corrections, max_file_id));
-
-		server_download_ticket = Server->getThreadPool()->execute(server_download.get(), "backup download");
+			0, logid, true, shares_without_snapshot, true, NULL, false, 1, server_settings.get(), true, filepath_corrections, max_file_id));
 	}
 
 	bool execMod(SChange& change)
 	{
-		std::auto_ptr<IFile> f(Server->openFile(getFullpath(change.fn1)));
+		std::unique_ptr<IFile> f(Server->openFile(getFullpath(change.fn1)));
 
 		if(!fileclient.get())
 		{
@@ -932,16 +930,15 @@ private:
 	int backupid;
 	IPipe* hashpipe_prepare;
 
-	std::auto_ptr<BackupServerHash> local_hash;
+	std::unique_ptr<BackupServerHash> local_hash;
 
-	std::auto_ptr<FileClientChunked> fileclient_chunked;
-	std::auto_ptr<FileClient> fileclient;
-	std::auto_ptr<FileClient> fileclient_metadata;
+	std::unique_ptr<FileClientChunked> fileclient_chunked;
+	std::unique_ptr<FileClient> fileclient;
+	std::unique_ptr<FileClient> fileclient_metadata;
 
-	std::auto_ptr<ServerSettings> server_settings;
+	std::unique_ptr<ServerSettings> server_settings;
 
-	std::auto_ptr<ServerDownloadThread> server_download;
-	THREADPOOL_TICKET server_download_ticket;
+	std::unique_ptr<ServerDownloadThreadGroup> server_download;
 
 	std::deque<SQueueItem> dl_queue;
 
@@ -950,9 +947,9 @@ private:
 	bool transfer_incr_blockdiff;
 
 	bool has_fullpath_entryid_mapping_table;
-	std::auto_ptr<ServerBackupDao> backupdao;
-	std::auto_ptr<ServerFilesDao> filesdao;
-	std::auto_ptr<FileIndex> fileindex;
+	std::unique_ptr<ServerBackupDao> backupdao;
+	std::unique_ptr<ServerFilesDao> filesdao;
+	std::unique_ptr<FileIndex> fileindex;
 
 	FilePathCorrections filepath_corrections;
 

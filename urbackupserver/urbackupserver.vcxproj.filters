@@ -37,11 +37,11 @@
     <Filter Include="filesindex">
       <UniqueIdentifier>{3ec8a037-dfb3-443f-aa14-dd5a1f016e35}</UniqueIdentifier>
     </Filter>
-    <Filter Include="miniz">
-      <UniqueIdentifier>{c5f185c0-de01-43f8-9a80-28684380f19c}</UniqueIdentifier>
-    </Filter>
     <Filter Include="sha2">
       <UniqueIdentifier>{60144485-8ba8-41fa-9f3a-81c7c9453f3b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="miniz">
+      <UniqueIdentifier>{c5f185c0-de01-43f8-9a80-28684380f19c}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -387,6 +387,27 @@
     <ClCompile Include="..\blockalign_src\crc32c-adler.cpp">
       <Filter>apps</Filter>
     </ClCompile>
+    <ClCompile Include="serverinterface\restore_image.cpp">
+      <Filter>serverinterface</Filter>
+    </ClCompile>
+    <ClCompile Include="WebSocketConnector.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+    <ClCompile Include="..\urbackupcommon\WebSocketPipe.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+    <ClCompile Include="ServerDownloadThreadGroup.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+    <ClCompile Include="LocalBackup.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+    <ClCompile Include="..\clouddrive\ObjectCollector.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
+    <ClCompile Include="..\urbackupcommon\backup_url_parser.cpp">
+      <Filter>Quelldateien</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="action_header.h">
@@ -688,6 +709,18 @@
     </ClInclude>
     <ClInclude Include="..\urbackupcommon\sha2\sha2.h">
       <Filter>sha2</Filter>
+    </ClInclude>
+    <ClInclude Include="WebSocketConnector.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="..\urbackupcommon\WebSocketPipe.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="ServerDownloadThreadGroup.h">
+      <Filter>Headerdateien</Filter>
+    </ClInclude>
+    <ClInclude Include="LocalBackup.h">
+      <Filter>Headerdateien</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

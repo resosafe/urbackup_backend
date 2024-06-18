@@ -7,6 +7,7 @@
 #include "../luaplugin/ILuaInterpreter.h"
 #include "../urlplugin/IUrlFactory.h"
 #include "Mailer.h"
+#include "ClientMain.h"
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include "../common/miniz.h"
 
@@ -159,7 +160,7 @@ void Alerts::operator()()
 
 	db->Write("UPDATE clients SET alerts_next_check=NULL");
 
-	IQuery* q_get_alert_clients = db->Prepare("SELECT c.id AS clientid, c.name AS clientname, file_ok, image_ok, alerts_state, strftime('%s', lastbackup) AS lastbackup, "
+	IQuery* q_get_alert_clients = db->Prepare("SELECT c.id AS clientid, c.name AS clientname, c.capa AS capa, file_ok, image_ok, alerts_state, strftime('%s', lastbackup) AS lastbackup, "
 		"strftime('%s', lastseen) AS lastseen, strftime('%s', lastbackup_image) AS lastbackup_image, created, os_simple, groupid, cg.name AS groupname "
 		"FROM "
 		" (clients c LEFT OUTER JOIN settings_db.si_client_groups cg ON c.groupid = cg.id) "
@@ -232,6 +233,7 @@ void Alerts::operator()()
 				params["passed_time_lastbackup_image"] = (std::min)(times - lastbackup_image, times - created);
 				params["lastbackup_file"] = lastbackup_file;
 				params["lastbackup_image"] = lastbackup_image;
+				params["image_support"] = (watoi(res[i]["capa"]) & CAPA_NO_IMAGE_BACKUPS) == 0;
 
 				SSettings* settings = server_settings.getSettings();
 
@@ -389,7 +391,7 @@ void Alerts::operator()()
 					q_update_client->Bind(i_file_ok);
 					q_update_client->Bind(i_image_ok);
 					q_update_client->Bind(next_check);
-					q_update_client->Bind(state);
+					q_update_client->Bind(state.c_str(), state.size());
 					q_update_client->Bind(clientid);
 					q_update_client->Write();
 					q_update_client->Reset();
@@ -399,7 +401,7 @@ void Alerts::operator()()
 				{
 					it->second.global = global_state;
 
-					q_update_global_state->Bind(global_state);
+					q_update_global_state->Bind(global_state.c_str(), global_state.size());
 					q_update_global_state->Bind(script_id);
 					q_update_global_state->Write();
 					q_update_global_state->Reset();

@@ -29,6 +29,7 @@
 #include "HTTPFile.h"
 #include "HTTPAction.h"
 #include "HTTPProxy.h"
+#include "HTTPSocket.h"
 
 extern CHTTPService* http_service;
 
@@ -39,10 +40,11 @@ const int HTTP_STATE_CONTENT=3;
 const int HTTP_STATE_WAIT_FOR_THREAD=4;
 const int HTTP_STATE_KEEPALIVE=5;
 const int HTTP_STATE_DONE=6;
+const int HTTP_STATE_WEBSOCKET = 7;
 
 const int HTTP_MAX_KEEPALIVE=15000;
 
-IMutex *CHTTPClient::share_mutex=NULL;
+IMutex *CHTTPClient::share_mutex=nullptr;
 std::map<std::string, SShareProxy> CHTTPClient::shared_connections;
 extern std::vector<std::string> allowed_urls;
 
@@ -66,6 +68,16 @@ void CHTTPClient::init_mutex(void)
 void CHTTPClient::destroy_mutex(void)
 {
 	Server->destroy(share_mutex);
+}
+
+bool CHTTPClient::wantReceive(void)
+{
+	return http_g_state != HTTP_STATE_WEBSOCKET;
+}
+
+bool CHTTPClient::closeSocket(void)
+{
+	return http_g_state != HTTP_STATE_WEBSOCKET;
 }
 
 void CHTTPClient::ReceivePackets(IRunOtherCallback* run_other)
@@ -98,7 +110,9 @@ void CHTTPClient::ReceivePackets(IRunOtherCallback* run_other)
 			{
 				if(	processRequest() )
 				{
-					http_g_state=HTTP_STATE_WAIT_FOR_THREAD;
+					if (http_g_state != HTTP_STATE_WEBSOCKET)
+						http_g_state = HTTP_STATE_WAIT_FOR_THREAD;
+					
 				}
 				else
 					do_quit=true;
@@ -116,9 +130,14 @@ void CHTTPClient::ReceivePackets(IRunOtherCallback* run_other)
 
 bool CHTTPClient::Run(IRunOtherCallback* run_other)
 {
+	if (http_g_state == HTTP_STATE_WEBSOCKET)
+	{
+		return false;
+	}
+
 	if( http_g_state==HTTP_STATE_WAIT_FOR_THREAD )
 	{
-		if( Server->getThreadPool()->isRunning(request_ticket)==false )
+		if( !Server->getThreadPool()->isRunning(request_ticket) )
 		{
 			//Server->Log("Connection: "+http_params["CONNECTION"], LL_DEBUG);
 			/*if( strlower(http_params["CONNECTION"])=="close" )
@@ -146,7 +165,7 @@ bool CHTTPClient::Run(IRunOtherCallback* run_other)
 				Server->clearPostFiles(tid);
 			}
 			delete request_handler;
-			request_handler=NULL;
+			request_handler=nullptr;
 
 			if(!http_service->getProxyServer().empty() && http_service->getShareProxyConnections()==1)
 			{
@@ -455,7 +474,7 @@ bool CHTTPClient::processRequest(void)
 		{
 			Server->Log("URL not allowed");
 			pipe->Write("HTTP/1.1 403 Not Allowed\r\nContent-Type: text/html\r\nContent-Length: 46\r\n\r\nSorry. You're not allowed to access this file.");
-			request_handler=NULL;
+			request_handler=nullptr;
 			request_ticket=ILLEGAL_THREADPOOL_TICKET;
 			return false;			
 		}
@@ -473,7 +492,7 @@ bool CHTTPClient::processRequest(void)
 			{
 				it->second.notify_pipe->Write((char*)&pipe, sizeof(IPipe*) );
 				request_ticket=it->second.proxy_ticket;
-				request_handler=NULL;
+				request_handler=nullptr;
 				return true;
 			}
 
@@ -483,13 +502,13 @@ bool CHTTPClient::processRequest(void)
 			sp.proxy=new CHTTPProxy(http_method, http_query, http_version, http_content, http_params, pipe, sp.notify_pipe, sp.timeout_pipe);
 			sp.proxy_ticket=Server->getThreadPool()->execute(sp.proxy);
 			request_ticket=sp.proxy_ticket;
-			request_handler=NULL;
+			request_handler=nullptr;
 
 			shared_connections[http_query]=sp;
 		}
 		else
 		{
-			CHTTPProxy *proxy_handler=new CHTTPProxy(http_method, http_query, http_version, http_content, http_params, pipe, NULL, NULL);
+			CHTTPProxy *proxy_handler=new CHTTPProxy(http_method, http_query, http_version, http_content, http_params, pipe, nullptr, nullptr);
 			request_ticket=Server->getThreadPool()->execute(proxy_handler);
 			request_handler=proxy_handler;
 		}
@@ -507,7 +526,19 @@ bool CHTTPClient::processRequest(void)
 		std::string name;
 		std::string context;
 		size_t pstart;
-		if( pl->size()>1 && (*pl)[0]=='x' && (*pl)[1]=='?' )
+		str_map::iterator upgrade_param = http_params.find("UPGRADE");
+		if (upgrade_param != http_params.end()
+			&& upgrade_param->second == "websocket")
+		{
+			std::string name = getuntil("?", *pl);
+			std::string gparams = getafter("?", *pl);
+			CHTTPSocket* socket_handler = new CHTTPSocket(name, gparams, http_params, pipe, endpoint);
+			request_ticket = Server->getThreadPool()->execute(socket_handler, "http websocket");
+			request_handler = socket_handler;
+			http_g_state = HTTP_STATE_WEBSOCKET;
+			return true;
+		}
+		else if( pl->size()>1 && (*pl)[0]=='x' && (*pl)[1]=='?' )
 		{
 			parseAction(*pl, name, context);
 		}
@@ -538,14 +569,14 @@ bool CHTTPClient::processRequest(void)
 			rp = greplace("\\", "_", rp);
 #endif
 			CHTTPFile *file_handler=new CHTTPFile(http_service->getRoot()+rp, pipe);
-			request_ticket=Server->getThreadPool()->execute(file_handler);
+			request_ticket=Server->getThreadPool()->execute(file_handler, "http file request");
 			request_handler=file_handler;
 			return true;
 		}
 
 		std::string gparams=getafter("?", *pl);
 
-		pl=NULL;
+		pl=nullptr;
 		http_params["REMOTE_ADDR"]=endpoint;
 		CHTTPAction *action_handler=new CHTTPAction(name,context,gparams, http_content, http_params, pipe);
 		request_ticket=Server->getThreadPool()->execute(action_handler, "http dynamic request");
@@ -573,9 +604,7 @@ void CHTTPClient::WaitForRemove(void)
 {
 	if(request_ticket!=ILLEGAL_THREADPOOL_TICKET)
 	{
-		std::vector<THREADPOOL_TICKET> tmp;
-		tmp.push_back(request_ticket);
-		Server->getThreadPool()->waitFor(tmp);
+		Server->getThreadPool()->waitFor(request_ticket);
 	}
 }
 
@@ -644,7 +673,7 @@ void CHTTPClient::ParseMultipartData(const std::string &data, const std::string 
 		case 4:
 			if(next(data,i,rboundary)==true)
 			{
-                IFile *memfile=Server->openMemoryFile();
+                IFile *memfile=Server->openTemporaryFile();
 				memfile->Write(data.substr(start,i-start-2) );
 				memfile->Seek(0);
 				Server->addPostFile(pfilekey, name, SPostfile(memfile, filename, contenttype) );

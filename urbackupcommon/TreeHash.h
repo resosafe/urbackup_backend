@@ -3,8 +3,9 @@
 #include "sha2/sha2.h"
 #include "../md5.h"
 #include "../Interface/Types.h"
+#include "../Interface/Object.h"
 
-class IHashFunc
+class IHashFunc : public IObject
 {
 public:
 	virtual void hash(const char* buf, _u32 bsize) = 0;

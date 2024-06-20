@@ -157,7 +157,7 @@ void ServerAutomaticArchive::archiveBackups(void)
 					else
 					{
 						Tokenize(letter_str, letters, ",;");
-						for (size_t k = 0; k < res.size();)
+						for (size_t k = 0; k < letters.size();)
 						{
 							if (letters[k].empty())
 							{

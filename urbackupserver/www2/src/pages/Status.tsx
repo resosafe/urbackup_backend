@@ -32,8 +32,15 @@ import {
   ChevronLeft20Filled,
   ChevronRight20Filled,
 } from "@fluentui/react-icons";
-import { DownloadClient, StatusMenuAction } from "../features/status";
+import {
+  BackupResultProvider,
+  DownloadClient,
+  LastFileBackup,
+  LastImageBackup,
+  StatusMenuAction,
+} from "../features/status";
 import { useStatusClientActions } from "../features/status/useStatusClientActions";
+import { formatDatetime } from "../features/status/formatDatetime";
 
 // Register icons used in Pagination @fluentui/react-experiments. See https://github.com/microsoft/fluentui/wiki/Using-icons#registering-custom-icons.
 registerIcons({
@@ -75,22 +82,6 @@ const columns: TableColumnDefinition<StatusClientItem>[] = [
     },
   }),
   createTableColumn<StatusClientItem>({
-    columnId: "lastImagebackup",
-    renderHeaderCell: () => {
-      return "Last image backup";
-    },
-    compare: (a, b) => {
-      return compareNum(a.lastbackup_image, b.lastbackup_image);
-    },
-    renderCell: (item) => {
-      return (
-        <TableCellLayout>
-          {formatDatetime(item.lastbackup_image)}
-        </TableCellLayout>
-      );
-    },
-  }),
-  createTableColumn<StatusClientItem>({
     columnId: "lastFilebackup",
     renderHeaderCell: () => {
       return "Last file backup";
@@ -98,13 +89,17 @@ const columns: TableColumnDefinition<StatusClientItem>[] = [
     compare: (a, b) => {
       return compareNum(a.lastbackup, b.lastbackup);
     },
-    renderCell: (item) => {
-      return (
-        <TableCellLayout>
-          {formatDatetime(item.lastbackup)}
-        </TableCellLayout>
-      );
+    renderCell: LastFileBackup,
+  }),
+  createTableColumn<StatusClientItem>({
+    columnId: "lastImagebackup",
+    renderHeaderCell: () => {
+      return "Last image backup";
     },
+    compare: (a, b) => {
+      return compareNum(a.lastbackup_image, b.lastbackup_image);
+    },
+    renderCell: LastImageBackup,
   }),
   createTableColumn<StatusClientItem>({
     columnId: "action",
@@ -149,7 +144,7 @@ const useStyles = makeStyles({
     gap: tokens.spacingHorizontalS,
   },
   searchBox: {
-    width: '28ch'
+    width: "28ch",
   },
   pageSize: {
     display: "flex",
@@ -162,7 +157,7 @@ const useStyles = makeStyles({
   gridActions: {
     display: "flex",
     gap: tokens.spacingHorizontalS,
-    flexWrap: 'wrap'
+    flexWrap: "wrap",
   },
 });
 
@@ -179,10 +174,12 @@ const paginationStyles = {
 
 const PAGE_SIZES = [10, 25, 50, 100];
 const DEFAULT_PAGE_SIZE = PAGE_SIZES[0];
+const REFETCH_INTERVAL = 5000;
 
 const Status = () => {
   const statusResult = useQuery("status", urbackupServer.status, {
     suspense: true,
+    refetchInterval: REFETCH_INTERVAL,
   });
   const { removeClients } = useStatusClientActions();
 
@@ -194,11 +191,11 @@ const Status = () => {
 
   const classes = useStyles();
 
-  const [search, setSearch] = useState("")
+  const [search, setSearch] = useState("");
 
   const dataItems = statusResult.data!.status;
 
-  const filteredItems = filterClientData(dataItems, search)
+  const filteredItems = filterClientData(dataItems, search);
 
   const pageData = chunk(filteredItems, pageSize);
 
@@ -210,12 +207,15 @@ const Status = () => {
             <h3 className={classes.heading}>Status page</h3>
             <div className={classes.topFilters}>
               <Field label="Search" className={classes.search}>
-                <SearchBox autoComplete="off" className={classes.searchBox} onChange={(_, data) => {
-                  const search = data.value.toLowerCase()
+                <SearchBox
+                  autoComplete="off"
+                  className={classes.searchBox}
+                  onChange={(_, data) => {
+                    const search = data.value.toLowerCase();
 
-                  setSearch(search)
-
-                }} />
+                    setSearch(search);
+                  }}
+                />
               </Field>
               <label className={classes.pageSize}>
                 Show
@@ -334,43 +334,46 @@ const Status = () => {
   );
 };
 
-export default Status;
+const StatusPage = () => (
+  <BackupResultProvider>
+    <Status />
+  </BackupResultProvider>
+);
+
+export default StatusPage;
 
 function transformSelectedRows(selectedRows: Set<TableRowId>) {
   const clientIds = Array.from(selectedRows, Number);
   return clientIds;
 }
 
-function formatDatetime(datetime: number) {
-  return new Date(datetime * 1000).toLocaleString()
-}
-
 function filterClientData(dataItems: StatusClientItem[], search: string) {
   return dataItems.filter((d) => {
     // Hide items scheduled for delete
     if (d.delete_pending === "1") {
-      return false
+      return false;
     }
 
     // If there's a search term, filter by search term within object values
     if (search.length) {
-      const { id, name, lastbackup, lastbackup_image } = d
+      const { id, name, lastbackup, lastbackup_image } = d;
 
       // Search in fields as displayed in the table
-      const searchableFields = ({
+      const searchableFields = {
         id,
         name,
         lastbackup: formatDatetime(lastbackup),
-        lastbackup_image: formatDatetime(lastbackup_image)
-      })
+        lastbackup_image: formatDatetime(lastbackup_image),
+      };
 
       // Find matching search term in data values
-      const match = Object.values(searchableFields).some(v => String(v).toLowerCase().includes(search))
+      const match = Object.values(searchableFields).some((v) =>
+        String(v).toLowerCase().includes(search),
+      );
 
-      return match
+      return match;
     }
 
-    return true
+    return true;
   });
-
 }

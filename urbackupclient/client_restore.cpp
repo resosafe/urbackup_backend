@@ -1266,6 +1266,17 @@ namespace restore
 			}
 		}
 
+		if (curr_fix_gpt && fix_gpt)
+		{
+			std::string out;
+			int rc = os_popen("sgdisk --version", out);
+			if (rc != 0 || out.find("sgdisk") == std::string::npos)
+			{
+				Server->Log("sgdisk not available. Not able to fixup GPT table", LL_WARNING);
+				fix_gpt = false;
+			}
+		}
+
 		if(curr_fix_gpt && fix_gpt)
 		{
 			std::string fix_output;

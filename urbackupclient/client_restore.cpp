@@ -1367,7 +1367,7 @@ void do_restore(void)
 		}
 		
 		std::string errmsg;
-		if(!do_restore_write_mbr(mbr_filename, out_device, false, errmsg))
+		if(!do_restore_write_mbr(mbr_filename, out_device, true, errmsg))
 		{
 			Server->Log(errmsg, LL_ERROR);
 			exit(2);

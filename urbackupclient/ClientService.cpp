@@ -3114,7 +3114,7 @@ void ClientConnector::downloadImage(str_map params, IScopedLock& backup_mutex_lo
 			return;
 		}
 
-		const size_t c_buffer_size=32768;
+		const size_t c_buffer_size=512*1024;
 		const unsigned int c_blocksize=4096;
 		char buf[c_buffer_size];
 		_i64 read=0;

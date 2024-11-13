@@ -590,7 +590,7 @@ EDownloadResult downloadImage(int img_id, std::string img_time, std::string outf
 	std::string dl_args;
 	if (img_id != 0 || !img_time.empty())
 	{
-		dl_args = "&img_id = "+convert(img_id)+" & time = "+img_time;
+		dl_args = "&img_id="+convert(img_id)+"&time="+img_time;
 	}
 	else if (login_data.has_login_data
 		&& !login_data.token.empty())

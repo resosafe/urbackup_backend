@@ -885,17 +885,17 @@ uint64 VHDXFile::getSize(void)
 
 uint64 VHDXFile::usedSize()
 {
+	const int64 spos_backup = spos;
+
 	uint64 ret = 0;
 	for (int64 i = 0; i < dst_size; i += block_size)
 	{
-		_u32 block = getBatEntry(spos, block_size, sector_size);
-
-		VhdxBatEntry* bat_entry = reinterpret_cast<VhdxBatEntry*>(bat_buf.data()) + block;
-
-		if (bat_entry->State == PAYLOAD_BLOCK_PARTIALLY_PRESENT ||
-			bat_entry->State == PAYLOAD_BLOCK_FULLY_PRESENT)
+		spos = i;
+		if(has_sector())
 			ret += block_size;
 	}
+
+	spos = spos_backup;
 
 	return ret;
 }

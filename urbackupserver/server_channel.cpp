@@ -1227,10 +1227,13 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 				return;
 			}
 			unsigned int blocksize=vhdfile->getBlocksize();
-			char buffer[4096];
+			char buffer_with_offset[4096+sizeof(uint64)];
+			char* buffer = buffer_with_offset + sizeof(uint64);
 			size_t read;
 			uint64 currpos=offset;
 			_i64 currblock=(currpos+skip)%blocksize;
+			const _u32 update_every = 1024 * 1024;
+			uint64 update_pos = currpos;
 
 			/*vhdfile->Read(buffer, 512, read);
 			if(read!=512)
@@ -1293,12 +1296,9 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 						Server->Log("Error reading from VHD file during restore. "+os_last_error_str(), LL_ERROR);
 					}
 						
-					uint64 currpos_endian = little_endian(currpos);
-					bool b = input->Write((char*)&currpos_endian, sizeof(uint64), img_send_timeout, false);
-					if (b)
-					{
-						b = input->Write(buffer, (_u32)read, img_send_timeout, false);
-					}
+					const uint64 currpos_endian = little_endian(currpos);
+					memcpy(buffer_with_offset, &currpos_endian, sizeof(currpos_endian));
+					bool b = input->Write(buffer_with_offset, static_cast<_u32>(sizeof(currpos_endian) + read), img_send_timeout, false);
 					if(!b)
 					{
 						Server->Log("Writing to output pipe failed processMsg-1", LL_ERROR);
@@ -1312,13 +1312,10 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 				{
 					if(Server->getTimeMS()-lasttime>30000)
 					{
-						uint64 currpos_endian = little_endian(currpos);
-						bool b = input->Write((char*)&currpos_endian, sizeof(uint64), img_send_timeout, false);
+						const uint64 currpos_endian = little_endian(currpos);
+						memcpy(buffer_with_offset, &currpos_endian, sizeof(currpos_endian));
 						memset(buffer, 0, 4096);
-						if (b)
-						{
-							 b = input->Write(buffer, (_u32)4096, img_send_timeout, true);
-						}
+						bool b = input->Write(buffer_with_offset, static_cast<_u32>(sizeof(currpos_endian)+4096), img_send_timeout, false);
 						if (!b)
 						{
 							Server->Log("Sending keep-alive block failed", LL_DEBUG);
@@ -1332,20 +1329,24 @@ void ServerChannelThread::DOWNLOAD_IMAGE(str_map& params)
 				}					
 				currpos+=read;
 
-				if(Server->getTimeMS()-last_update_time>60000)
+				if(currpos - update_pos > update_every)
 				{
-					last_update_time=Server->getTimeMS();
-					ServerStatus::updateActive();
-
-					if (used_bytes > 0)
+					update_pos = currpos;
+					if (Server->getTimeMS() - last_update_time > 60000)
 					{
-						int pcdone_new = static_cast<int>((used_transferred_bytes * 100) / used_bytes);
-						if (pcdone_new != pcdone)
+						last_update_time = Server->getTimeMS();
+						ServerStatus::updateActive();
+
+						if (used_bytes > 0)
 						{
-							pcdone = pcdone_new;
-							ServerStatus::setProcessPcDone(clientname, restore_process.getStatusId(), pcdone);
+							int pcdone_new = static_cast<int>((used_transferred_bytes * 100) / used_bytes);
+							if (pcdone_new != pcdone)
+							{
+								pcdone = pcdone_new;
+								ServerStatus::setProcessPcDone(clientname, restore_process.getStatusId(), pcdone);
+							}
 						}
-					}					
+					}
 				}
 			}
 			while( is_ok && (_i64)currpos<imgsize);

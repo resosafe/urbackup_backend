@@ -14,11 +14,18 @@ import {
   Spinner,
   Toaster,
 } from "@fluentui/react-components";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { useStackStyles } from "./components/StackStyles";
 import UrBackupServer, { SessionNotFoundError } from "./api/urbackupserver";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { i18n } from "@lingui/core";
 import { I18nProvider } from "@lingui/react";
+import { BackupsPage } from "./pages/Backups";
+import { ClientBackupsTable } from "./features/backups/ClientBackupsTable";
+import { BackupsTable } from "./features/backups/BackupsTable";
+import { BackupContentTable } from "./features/backups/BackupContentTable";
+import BackupErrorPage from "./features/backups/BackupsError";
+import "./css/global.css";
 
 const initialDark =
   window.matchMedia &&
@@ -28,6 +35,7 @@ const initialTheme = initialDark ? teamsDarkTheme : teamsLightTheme;
 export enum Pages {
   Status = "status",
   Activities = "activities",
+  Backups = "backups",
   Login = "login",
   About = "about",
 }
@@ -110,6 +118,30 @@ export const router = createHashRouter([
       return null;
     },
   },
+  {
+    path: `/${Pages.Backups}`,
+    element: <BackupsPage />,
+    loader: async () => {
+      state.pageAfterLogin = Pages.Backups;
+      await jumpToLoginPageIfNeccessary();
+      return null;
+    },
+    errorElement: <BackupErrorPage />,
+    children: [
+      {
+        index: true,
+        element: <BackupsTable />,
+      },
+      {
+        path: ":clientId",
+        element: <ClientBackupsTable />,
+      },
+      {
+        path: ":clientId/:backupId",
+        element: <BackupContentTable />,
+      },
+    ],
+  },
 ]);
 
 function getSessionFromLocalStorage(): string {
@@ -191,6 +223,8 @@ const App: React.FunctionComponent = () => {
               </div>
             </div>
             <Toaster toasterId="toaster" />
+            {/* Following only bundled in development mode */}
+            <ReactQueryDevtools initialIsOpen={false} />
           </QueryClientProvider>
         </I18nProvider>
       </React.StrictMode>

@@ -1,0 +1,28 @@
+@import url("reset.css") layer(reset);
+
+@layer composition {
+  /* 
+  FLOW COMPOSITION 
+  Like the Every Layout stack: https://every-layout.dev/layouts/stack/
+  Info about this implementation: https://piccalil.li/quick-tip/flow-utility/ 
+  */
+  .flow > * + * {
+    margin-top: var(--flow-space, 1em);
+  }
+}
+
+.table-wrapper {
+  --flow-space: 1.5em;
+}
+
+[role="gridcell"]:has(a) {
+  align-items: normal;
+}
+
+[role="gridcell"] a {
+  color: inherit;
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}

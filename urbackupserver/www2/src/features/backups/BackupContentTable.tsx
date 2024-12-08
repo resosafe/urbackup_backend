@@ -24,6 +24,16 @@ import { urbackupServer } from "../../App";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
 import { makeBackupsBreadcrumbs } from "./makeBackupsBreadcrumbs";
 import { TableWrapper } from "../../components/TableWrapper";
+import {
+  Pagination,
+  PaginationItemsPerPageSelector,
+  usePagination,
+} from "../../components/Pagination";
+import {
+  filterBySearch,
+  SearchBox,
+  useFilteredBySearch,
+} from "../../components/SearchBox";
 
 const useStyles = makeStyles({
   heading: {
@@ -49,6 +59,17 @@ const tableStyles = {
     color: tokens.colorBrandBackground,
   },
 };
+
+function createFormatter<T extends File>() {
+  return {
+    size: (d: T) => (d.size ? format_size(d.size) : ""),
+    creat: (d: T) => (d.creat ? formatDatetime(d.creat) : "-"),
+    mod: (d: T) => (d.mod ? formatDatetime(d.mod) : "-"),
+    access: (d: T) => (d.access ? formatDatetime(d.access) : "-"),
+  } as Record<keyof T, (d: T) => string>;
+}
+
+const formatter = createFormatter();
 
 export const columns: TableColumnDefinition<File>[] = [
   createTableColumn<File>({
@@ -77,11 +98,7 @@ export const columns: TableColumnDefinition<File>[] = [
       return "Size";
     },
     renderCell: (item) => {
-      return (
-        <TableCellLayout>
-          {item.size ? format_size(item.size) : ""}
-        </TableCellLayout>
-      );
+      return <TableCellLayout>{formatter.size(item)}</TableCellLayout>;
     },
   }),
   createTableColumn<File>({
@@ -90,11 +107,7 @@ export const columns: TableColumnDefinition<File>[] = [
       return "Created";
     },
     renderCell: (item) => {
-      if (!item.creat) {
-        return "-";
-      }
-
-      return <TableCellLayout>{formatDatetime(item.creat)}</TableCellLayout>;
+      return <TableCellLayout>{formatter.creat(item)}</TableCellLayout>;
     },
   }),
   createTableColumn<File>({
@@ -103,11 +116,7 @@ export const columns: TableColumnDefinition<File>[] = [
       return "Last modified";
     },
     renderCell: (item) => {
-      if (!item.mod) {
-        return "-";
-      }
-
-      return <TableCellLayout>{formatDatetime(item.mod)}</TableCellLayout>;
+      return <TableCellLayout>{formatter.mod(item)}</TableCellLayout>;
     },
   }),
   createTableColumn<File>({
@@ -116,11 +125,7 @@ export const columns: TableColumnDefinition<File>[] = [
       return "Last accessed";
     },
     renderCell: (item) => {
-      if (!item.access) {
-        return "-";
-      }
-
-      return <TableCellLayout>{formatDatetime(item.access)}</TableCellLayout>;
+      return <TableCellLayout>{formatter.access(item)}</TableCellLayout>;
     },
   }),
   createTableColumn<File>({
@@ -180,6 +185,14 @@ export function BackupContentTable() {
     );
   }
 
+  const { setSearch, filteredItems } = useFilteredBySearch<File>(
+    files,
+    filterData,
+  );
+
+  const { itemsPerPage, setItemsPerPage, pageData, page, setPage } =
+    usePagination(filteredItems);
+
   return (
     <TableWrapper>
       <div className={classes.heading}>
@@ -201,69 +214,93 @@ export function BackupContentTable() {
           Download Folder as ZIP
         </Button>
       </div>
-      <DataGrid items={files} getRowId={(item) => item.id} columns={columns}>
-        <DataGridHeader>
-          <DataGridRow>
-            {({ renderHeaderCell, columnId }) => (
-              <DataGridHeaderCell style={getNarrowColumnStyles(columnId)}>
-                {renderHeaderCell()}
-              </DataGridHeaderCell>
-            )}
-          </DataGridRow>
-        </DataGridHeader>
-        <DataGridBody<File>>
-          {({ item }) => (
-            <DataGridRow<File>>
-              {({ renderCell, columnId }) => {
-                const isInteractive = ["actions"].includes(String(columnId));
+      <div className="cluster">
+        <SearchBox onSearch={setSearch} />
+        <PaginationItemsPerPageSelector
+          itemsPerPage={itemsPerPage}
+          setItemsPerPage={setItemsPerPage}
+        />
+      </div>
+      {pageData.length === 0 ? null : (
+        <>
+          <DataGrid
+            items={pageData[page]}
+            getRowId={(item) => item.id}
+            columns={columns}
+          >
+            <DataGridHeader>
+              <DataGridRow>
+                {({ renderHeaderCell, columnId }) => (
+                  <DataGridHeaderCell style={getNarrowColumnStyles(columnId)}>
+                    {renderHeaderCell()}
+                  </DataGridHeaderCell>
+                )}
+              </DataGridRow>
+            </DataGridHeader>
+            <DataGridBody<File>>
+              {({ item }) => (
+                <DataGridRow<File>>
+                  {({ renderCell, columnId }) => {
+                    const isInteractive = ["actions"].includes(
+                      String(columnId),
+                    );
 
-                return (
-                  <DataGridCell
-                    focusMode={getCellFocusMode(columnId, {
-                      group: ["actions"],
-                      none: noneColumns,
-                    })}
-                    style={getNarrowColumnStyles(columnId)}
-                  >
-                    {isInteractive ? (
-                      renderCell(item)
-                    ) : (
-                      <a
-                        href=""
-                        onClick={(e) => {
-                          e.preventDefault();
-
-                          // Navigate to new path if item is a directory
-                          if (item.dir) {
-                            const params = {
-                              path: `${path ?? ""}/${item.name}`,
-                            };
-
-                            setSearchParams(params);
-
-                            return;
-                          }
-
-                          if (path) {
-                            const filePath = `${path}/${item.name}`;
-                            location.href = urbackupServer.downloadFileURL(
-                              Number(clientId),
-                              Number(backupId),
-                              filePath,
-                            );
-                          }
-                        }}
+                    return (
+                      <DataGridCell
+                        focusMode={getCellFocusMode(columnId, {
+                          group: ["actions"],
+                          none: noneColumns,
+                        })}
+                        style={getNarrowColumnStyles(columnId)}
                       >
-                        {renderCell(item)}
-                      </a>
-                    )}
-                  </DataGridCell>
-                );
-              }}
-            </DataGridRow>
-          )}
-        </DataGridBody>
-      </DataGrid>
+                        {isInteractive ? (
+                          renderCell(item)
+                        ) : (
+                          <a
+                            href=""
+                            onClick={(e) => {
+                              e.preventDefault();
+
+                              // Navigate to new path if item is a directory
+                              if (item.dir) {
+                                const params = {
+                                  path: `${path ?? ""}/${item.name}`,
+                                };
+
+                                setSearchParams(params);
+
+                                return;
+                              }
+
+                              if (path) {
+                                const filePath = `${path}/${item.name}`;
+                                location.href = urbackupServer.downloadFileURL(
+                                  Number(clientId),
+                                  Number(backupId),
+                                  filePath,
+                                );
+                              }
+                            }}
+                          >
+                            {renderCell(item)}
+                          </a>
+                        )}
+                      </DataGridCell>
+                    );
+                  }}
+                </DataGridRow>
+              )}
+            </DataGridBody>
+          </DataGrid>
+          <Pagination
+            pageCount={pageData.length}
+            page={page}
+            itemsPerPage={itemsPerPage}
+            totalItemCount={filteredItems.length}
+            setPage={setPage}
+          />
+        </>
+      )}
     </TableWrapper>
   );
 }
@@ -280,4 +317,18 @@ function getNarrowColumnStyles(columnId: TableColumnId) {
     flexGrow: narrowColumnIds.includes(stringId) ? "0" : "1",
     flexBasis: narrowColumnIds.includes(stringId) ? "17ch" : "0",
   };
+}
+
+function filterData<T extends File>(item: T, search: string) {
+  const { name } = item;
+
+  const searchableFields = {
+    name,
+    size: formatter.size(item),
+    creat: formatter.creat(item),
+    mod: formatter.mod(item),
+    access: formatter.access(item),
+  } as Record<keyof T, string>;
+
+  return filterBySearch(search, searchableFields);
 }

@@ -6,13 +6,11 @@ import {
   DataGridCell,
   DataGridHeader,
   DataGridHeaderCell,
+  DataGridProps,
   DataGridRow,
-  Field,
   makeStyles,
   MenuButton,
   MenuItem,
-  SearchBox,
-  Select,
   Spinner,
   TableCellLayout,
   TableColumnDefinition,
@@ -22,16 +20,7 @@ import {
 import { StatusClientItem } from "../api/urbackupserver";
 import { Suspense, useState } from "react";
 import { useSuspenseQuery } from "@tanstack/react-query";
-import { Pagination } from "@fluentui/react-experiments";
 import { urbackupServer } from "../App";
-import { chunk } from "../utils/chunk";
-import { registerIcons } from "@fluentui/react-experiments/lib/Styling";
-import {
-  ArrowNext20Filled,
-  ArrowPrevious20Filled,
-  ChevronLeft20Filled,
-  ChevronRight20Filled,
-} from "@fluentui/react-icons";
 import {
   BackupResultProvider,
   DownloadClient,
@@ -41,19 +30,20 @@ import {
 } from "../features/status";
 import { useStatusClientActions } from "../features/status/useStatusClientActions";
 import { formatDatetime } from "../utils/format";
-
-// Register icons used in Pagination @fluentui/react-experiments. See https://github.com/microsoft/fluentui/wiki/Using-icons#registering-custom-icons.
-registerIcons({
-  icons: {
-    CaretSolidLeft: <ChevronLeft20Filled />,
-    CaretSolidRight: <ChevronRight20Filled />,
-    Next: <ArrowNext20Filled />,
-    Previous: <ArrowPrevious20Filled />,
-  },
-});
+import { TableWrapper } from "../components/TableWrapper";
+import {
+  Pagination,
+  PaginationItemsPerPageSelector,
+  usePagination,
+} from "../components/Pagination";
+import {
+  filterBySearch,
+  SearchBox,
+  useFilteredBySearch,
+} from "../components/SearchBox";
 
 const compareNum = (a: number, b: number) => {
-  return a == b ? 0 : a < b ? 1 : -1;
+  return a == b ? 0 : a < b ? -1 : 1;
 };
 
 const columns: TableColumnDefinition<StatusClientItem>[] = [
@@ -127,33 +117,6 @@ const columns: TableColumnDefinition<StatusClientItem>[] = [
 ];
 
 const useStyles = makeStyles({
-  root: {
-    display: "grid",
-    gap: tokens.spacingHorizontalL,
-  },
-  heading: {
-    marginBlockStart: 0,
-  },
-  topFilters: {
-    display: "flex",
-    gap: tokens.spacingHorizontalM,
-  },
-  search: {
-    display: "flex",
-    alignItems: "center",
-    gap: tokens.spacingHorizontalS,
-  },
-  searchBox: {
-    width: "28ch",
-  },
-  pageSize: {
-    display: "flex",
-    alignItems: "center",
-    gap: tokens.spacingHorizontalS,
-  },
-  pagination: {
-    marginInlineStart: "auto",
-  },
   gridActions: {
     display: "flex",
     gap: tokens.spacingHorizontalS,
@@ -161,19 +124,6 @@ const useStyles = makeStyles({
   },
 });
 
-const paginationStyles = {
-  root: {
-    alignItems: "end",
-    marginBlockStart: tokens.spacingHorizontalM,
-  },
-  pageNumber: {
-    verticalAlign: "top",
-    color: "currentColor",
-  },
-};
-
-const PAGE_SIZES = [10, 25, 50, 100];
-const DEFAULT_PAGE_SIZE = PAGE_SIZES[0];
 const REFETCH_INTERVAL = 5000;
 
 const Status = () => {
@@ -184,59 +134,49 @@ const Status = () => {
   });
   const { removeClients } = useStatusClientActions();
 
-  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
-  const [page, setPage] = useState(0);
   const [selectedRows, setSelectedRows] = useState<Set<TableRowId>>(new Set());
 
   const selectedRowsArray = transformSelectedRows(selectedRows);
 
   const classes = useStyles();
 
-  const [search, setSearch] = useState("");
+  const data = statusResult.data!.status;
 
-  const dataItems = statusResult.data!.status;
+  const [sortState, setSortState] =
+    useState<Parameters<NonNullable<DataGridProps["onSortChange"]>>[1]>();
 
-  const filteredItems = filterClientData(dataItems, search);
+  const onSortChange: DataGridProps["onSortChange"] = (e) => {
+    e.preventDefault();
+  };
 
-  const pageData = chunk(filteredItems, pageSize);
+  const [sortedData, setSortedData] = useState(data);
+
+  const { setSearch, filteredItems } = useFilteredBySearch<StatusClientItem>(
+    sortedData,
+    filterClientData,
+  );
+
+  const { itemsPerPage, setItemsPerPage, pageData, page, setPage } =
+    usePagination(filteredItems);
 
   return (
     <>
       <Suspense fallback={<Spinner />}>
-        <div className={classes.root}>
-          <div>
-            <h3 className={classes.heading}>Status page</h3>
-            <div className={classes.topFilters}>
-              <Field label="Search" className={classes.search}>
-                <SearchBox
-                  autoComplete="off"
-                  className={classes.searchBox}
-                  onChange={(_, data) => {
-                    const search = data.value.toLowerCase();
-
-                    setSearch(search);
-                  }}
-                />
-              </Field>
-              <label className={classes.pageSize}>
-                Show
-                <Select
-                  id="page-size"
-                  defaultValue={pageSize}
-                  onChange={(_, data) => setPageSize(+data.value)}
-                >
-                  {PAGE_SIZES.map((size, id) => (
-                    <option key={id}>{size}</option>
-                  ))}
-                </Select>
-                entries
-              </label>
-            </div>
+        <TableWrapper>
+          <h3>Status page</h3>
+          <div className="cluster">
+            <SearchBox onSearch={setSearch} />
+            <PaginationItemsPerPageSelector
+              itemsPerPage={itemsPerPage}
+              setItemsPerPage={setItemsPerPage}
+            />
           </div>
           {pageData.length === 0 ? null : (
             <>
               <DataGrid
+                key={`${sortState?.sortColumn}-${sortState?.sortDirection}`}
                 sortable
+                onSortChange={onSortChange}
                 selectionMode="multiselect"
                 items={pageData[page]}
                 getRowId={(item) => item.id}
@@ -250,8 +190,41 @@ const Status = () => {
                   <DataGridRow
                     selectionCell={{ "aria-label": "Select all rows" }}
                   >
-                    {({ renderHeaderCell }) => (
-                      <DataGridHeaderCell>
+                    {({ renderHeaderCell, columnId, compare }) => (
+                      <DataGridHeaderCell
+                        sortDirection={
+                          sortState?.sortColumn === columnId
+                            ? sortState.sortDirection
+                            : undefined
+                        }
+                        button={{
+                          onClick: () => {
+                            const newSortState: typeof sortState = {
+                              sortColumn: columnId,
+                              sortDirection:
+                                sortState?.sortDirection === "descending" ||
+                                sortState?.sortColumn !== columnId
+                                  ? "ascending"
+                                  : "descending",
+                            };
+
+                            if (newSortState.sortDirection === "ascending") {
+                              const newSortedData = sortedData.sort(compare);
+                              setSortedData(newSortedData);
+                            }
+
+                            if (newSortState.sortDirection === "descending") {
+                              const newSortedData = sortedData.sort((a, b) =>
+                                // Reverse compare function params for descending order
+                                compare(b, a),
+                              );
+                              setSortedData(newSortedData);
+                            }
+
+                            setSortState(newSortState);
+                          },
+                        }}
+                      >
                         {renderHeaderCell(selectedRowsArray)}
                       </DataGridHeaderCell>
                     )}
@@ -271,22 +244,14 @@ const Status = () => {
                 </DataGridBody>
               </DataGrid>
               <Pagination
-                selectedPageIndex={page}
                 pageCount={pageData.length}
-                itemsPerPage={pageSize}
+                page={page}
+                itemsPerPage={itemsPerPage}
                 totalItemCount={filteredItems.length}
-                format={"buttons"}
-                previousPageAriaLabel={"previous page"}
-                nextPageAriaLabel={"next page"}
-                firstPageAriaLabel={"first page"}
-                lastPageAriaLabel={"last page"}
-                pageAriaLabel={"page"}
-                selectedAriaLabel={"selected"}
-                onPageChange={(index) => setPage(index)}
-                styles={paginationStyles}
+                setPage={setPage}
               />
               <div className={classes.gridActions}>
-                <Button onClick={() => setPageSize(filteredItems.length)}>
+                <Button onClick={() => setItemsPerPage(filteredItems.length)}>
                   Show All Clients
                 </Button>
                 <div>
@@ -329,7 +294,7 @@ const Status = () => {
               </div>
             </>
           )}
-        </div>
+        </TableWrapper>
       </Suspense>
     </>
   );
@@ -348,33 +313,22 @@ function transformSelectedRows(selectedRows: Set<TableRowId>) {
   return clientIds;
 }
 
-function filterClientData(dataItems: StatusClientItem[], search: string) {
-  return dataItems.filter((d) => {
-    // Hide items scheduled for delete
-    if (d.delete_pending === "1") {
-      return false;
-    }
+function filterClientData(item: StatusClientItem, search: string) {
+  // Hide items scheduled for delete
+  if (item.delete_pending === "1") {
+    return false;
+  }
 
-    // If there's a search term, filter by search term within object values
-    if (search.length) {
-      const { id, name, lastbackup, lastbackup_image } = d;
+  const { id, name, lastbackup, lastbackup_image } = item;
 
-      // Search in fields as displayed in the table
-      const searchableFields = {
-        id,
-        name,
-        lastbackup: formatDatetime(lastbackup),
-        lastbackup_image: formatDatetime(lastbackup_image),
-      };
+  // Search in fields as displayed in the table
+  const searchableFields = {
+    id: String(id),
+    name,
+    lastbackup: lastbackup === 0 ? "Never" : formatDatetime(lastbackup),
+    lastbackup_image:
+      lastbackup === 0 ? "Never" : formatDatetime(lastbackup_image),
+  };
 
-      // Find matching search term in data values
-      const match = Object.values(searchableFields).some((v) =>
-        String(v).toLowerCase().includes(search),
-      );
-
-      return match;
-    }
-
-    return true;
-  });
+  return filterBySearch(search, searchableFields);
 }

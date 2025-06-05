@@ -709,6 +709,8 @@ void IndexThread::operator()(void)
 	if (os_get_file_type("urbctctl.exe") != 0)
 	{
 		add_cbt_path(Server->getServerWorkingDir() + os_file_sep() + "urbackup");
+
+		system("urbctctl.exe setup");
 	}
 #endif
 
@@ -8361,25 +8363,29 @@ void IndexThread::updateCbt()
 		}
 	}
 
-	if ((curr_settings.get() == NULL || volumes.empty())
-		&& backup_dirs.empty())
+	const bool enable_all = (curr_settings.get() == NULL || volumes.empty())
+		&& backup_dirs.empty();
+
+	volumes = get_all_volumes_list(true, volumes_cache);
+
+	std::vector<std::string> ret;
+	Tokenize(volumes, ret, ";,");
+	for (size_t i = 0; i<ret.size(); ++i)
 	{
-		volumes = get_all_volumes_list(true, volumes_cache);
+		std::string cvol = trim(ret[i]);
+		if (!normalizeVolume(cvol))
+			continue;
+		cvol = strlower(cvol);
 
-		std::vector<std::string> ret;
-		Tokenize(volumes, ret, ";,");
-		for (size_t i = 0; i<ret.size(); ++i)
+		if (vols.find(cvol) == vols.end())
 		{
-			std::string cvol = trim(ret[i]);
-			if (!normalizeVolume(cvol))
-				continue;
-			cvol = strlower(cvol);
+			const bool vol_enabled = cbtIsEnabled(std::string(), cvol);
 
-			if (vols.find(cvol) == vols.end())
-			{
-				enableCbtVol(cvol, cbtIsEnabled(std::string(), cvol), false);
-				vols.insert(cvol);
-			}
+			if (vol_enabled && !enable_all)
+				continue;
+
+			enableCbtVol(cvol, vol_enabled, false);
+			vols.insert(cvol);
 		}
 	}
 #endif
@@ -8480,7 +8486,7 @@ bool IndexThread::getAbsSymlinkTarget( const std::string& symlink, const std::st
 			target = orig_path + os_file_sep() + target;
 		}
 
-		target = os_get_final_path(target);
+		target = os_get_final_path_str(target);
 	}
 
 	std::string lower_target;

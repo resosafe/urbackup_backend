@@ -105,8 +105,8 @@ def replace_version_info():
 		version = f.read().strip()
 	
 	replace_in_file("../client/data/version_info.txt", "$version$", version)
-	replace_in_file("install_client_linux.sh", "$version$", version)
-	replace_in_file("osx_installer/update_install.sh", "$version$", version)
+	replace_in_file("../install_client_linux.sh", "$version$", version)
+	replace_in_file("../osx_installer/update_install.sh", "$version$", version)
 	
 
 
@@ -147,9 +147,9 @@ if os.path.exists("../client"):
 						  "../client/urbackup_notray.nsi",
 						  "../client/build_msi.bat",
 						  "../client/build_client.bat",
-						  "osx_installer/resources/welcome.html",
-						  "create_osx_installer.sh",
-						  "install_client_linux.sh"]
+						  "../osx_installer/resources/welcome.html",
+						  "../create_osx_installer.sh",
+						  "../install_client_linux.sh"]
 
 	for short_file in client_short_files:
 		replace_in_file(short_file, "$version_short$", version["client"]["short"])
@@ -158,11 +158,11 @@ if os.path.exists("../client"):
 	version_min = int(version["client"]["full_numeric"].split(".")[1])*1000+int(version["client"]["full_numeric"].split(".")[2])
 	
 	version_num_short = version["client"]["full_numeric"].split(".")[0] + "." + version["client"]["full_numeric"].split(".")[1] + "." + version["client"]["full_numeric"].split(".")[2]
-	replace_in_file("osx_installer/info.plist", "$version_num_short$", version_num_short)
-	replace_in_file("create_osx_installer.sh", "$version_num_short$", version_num_short)
+	replace_in_file("../osx_installer/info.plist", "$version_num_short$", version_num_short)
+	replace_in_file("../create_osx_installer.sh", "$version_num_short$", version_num_short)
 	
-	replace_in_file("osx_installer/info.plist", "$version_maj$", version_maj)
-	replace_in_file("osx_installer/info.plist", "$version_min$", str(version_min))
+	replace_in_file("../osx_installer/info.plist", "$version_maj$", version_maj)
+	replace_in_file("../osx_installer/info.plist", "$version_min$", str(version_min))
 
 	replace_in_file("../client/urbackup.wxs", "$version_full_numeric$", version["client"]["full_numeric"])
 	replace_in_file("../client/urbackup.wxi", "$product_id$", str(uuid.uuid1()))

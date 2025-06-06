@@ -2,7 +2,7 @@
 set -e
 
 GIT_SERVER_REPOSITORY="git@github.com:resosafe/urbackup_backend.git"
-BRANCH="2.5.x_resosafe"
+BRANCH="resosafe_2.5.x"
 
 
 cd "$(dirname "$0")"
@@ -18,7 +18,7 @@ git checkout $BRANCH
 
 ./switch_build.sh server
 cd resosafe
-python3 replace_versions.py ../version.json
+python3 replace_versions.py version.json
 ./download_cryptopp.sh
 
 cd ..

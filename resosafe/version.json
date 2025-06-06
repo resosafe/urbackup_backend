@@ -1,0 +1,15 @@
+{
+	"server":
+	{
+		"full_numeric": "2.5.33",
+		"full": "2.5.33",
+		"short": "2.5.33"
+	},
+	"client":
+	{
+		"full_numeric": "2.5.26.0",
+		"full": "2.5.26",
+		"short": "2.5.26"
+	}
+}
+

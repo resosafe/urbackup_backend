@@ -1,0 +1,173 @@
+import pbs
+import http.client as http
+from urllib.parse import urlparse
+import json
+import uuid
+import re
+import sys
+import os
+import hashlib
+# print the current working directory
+print("Current working directory:", os.getcwd())
+ 
+
+git = pbs.Command("git")
+
+def get_branch():
+    binfo = git("branch")
+    m = re.search("\*[ ]*([^ \r\n]*)", binfo.stdout, 0)
+    if m:
+        return m.group(1)
+    else:
+        return "master"
+    
+def get_head_rev():
+    head_rev = git("rev-parse", "HEAD")
+    return head_rev.stdout[:10]
+
+def get_version(filepath):     
+    try:
+        with open(filepath, 'r') as file:
+            return json.load(file)
+    except FileNotFoundError:
+        print("Error: The file "+filepath+" was not found.")
+    except json.JSONDecodeError:
+        print("Error: The file contains invalid JSON.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        
+
+def replace_in_file(fn, to_replace, new_str):
+    newlines = []
+    with open(fn,'r') as f:
+        for line in f.readlines():
+            newlines.append(line.replace(to_replace, new_str))
+            
+    with open(fn, 'w') as f:
+        for line in newlines:
+            f.write(line)
+         
+def get_content_hash(fn):
+    with open(fn, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()   
+            
+            
+content_hash_replacements = {}
+
+def replace_with_content_hashes_line(line, fn_prefix):
+    global content_hash_replacements
+    
+    regex = ""
+    if line.lower().find("<link rel=\"stylesheet\" type=\"text/css\"")!=-1:
+        regex = r"href=\"(.*?)\""
+        
+    if line.lower().find("<script language=\"javascript\" src=\"")!=-1:
+        regex = r"src=\"(.*?)\""
+    
+    if len(regex)>0:
+        m = re.search(regex, line)
+        if m:
+            fn = m.group(1)
+            
+            if not os.path.exists(fn_prefix + fn) and fn in content_hash_replacements:
+                new_fn = content_hash_replacements[fn]
+                return line.replace(fn, new_fn)
+            print("Replacing content hash in ", fn_prefix, fn)
+            h = get_content_hash(fn_prefix + fn)
+            if line.find(h)==-1:
+                l = fn.split(".")
+                l.insert(1, "chash-" + h)
+                new_fn = ".".join(l)
+                content_hash_replacements[fn] = new_fn
+                try:
+                    os.unlink(fn_prefix + new_fn)
+                except:
+                    pass
+                os.rename(fn_prefix + fn, fn_prefix + new_fn)
+                return line.replace(fn, new_fn)
+            
+    return line
+            
+
+def replace_with_content_hashes(fn, fn_prefix):
+    newlines = []
+    print("Replacing content hashes in", fn)
+    with open(fn, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f.readlines():
+            newlines.append(replace_with_content_hashes_line(line, fn_prefix))
+            
+    with open(fn, 'wb') as f:
+        for line in newlines:
+            f.write(line.encode("utf-8"))
+			
+def replace_version_info():
+	with open("../client/version.txt", "rt") as f:
+		version = f.read().strip()
+	
+	replace_in_file("../client/data/version_info.txt", "$version$", version)
+	replace_in_file("install_client_linux.sh", "$version$", version)
+	replace_in_file("osx_installer/update_install.sh", "$version$", version)
+	
+
+
+replace_with_content_hashes("../urbackupserver/www/index.htm", "../urbackupserver/www/")
+replace_with_content_hashes("../urbackupserver/www/help.htm", "../urbackupserver/www/")
+replace_with_content_hashes("../urbackupserver/www/license.htm", "../urbackupserver/www/")
+
+
+# retreive filepath from the command line argument
+if len(sys.argv) > 1:
+    filepath = sys.argv[1] 
+else:
+    exit("Error: No file path provided. Please provide the path to the version.json file.")
+
+
+version = get_version(filepath)
+
+if version == None:
+    exit(1)
+
+version["server"]["full_rev"] = version["server"]["full"] + " Rev. " + get_head_rev();
+
+server_short_files = ["../urbackupserver/www/index.htm",
+                      "../urbackupserver_installer_win/urbackup_server.nsi",
+					  "../urbackupserver_installer_win/generate_msi.bat"]
+
+for short_file in server_short_files:
+    replace_in_file(short_file, "$version_short$", version["server"]["short"])
+      
+    
+replace_in_file("../urbackupserver/www/index.htm", "$version_full$", version["server"]["full_rev"])
+replace_in_file("../urbackupserver_installer_win/urbackup_server.wxs", "$version_full_numeric$", version["server"]["full_numeric"])
+replace_in_file("../urbackupserver_installer_win/urbackup_server.wxi", "$product_id$", str(uuid.uuid1()))
+if os.path.exists("../client"):
+	client_short_files = ["../client_version.h",
+						  "../client/urbackup.nsi",
+						  "../client/urbackup_update.nsi",
+						  "../client/urbackup_notray.nsi",
+						  "../client/build_msi.bat",
+						  "../client/build_client.bat",
+						  "osx_installer/resources/welcome.html",
+						  "create_osx_installer.sh",
+						  "install_client_linux.sh"]
+
+	for short_file in client_short_files:
+		replace_in_file(short_file, "$version_short$", version["client"]["short"])
+
+	version_maj = version["client"]["full_numeric"].split(".")[0]
+	version_min = int(version["client"]["full_numeric"].split(".")[1])*1000+int(version["client"]["full_numeric"].split(".")[2])
+	
+	version_num_short = version["client"]["full_numeric"].split(".")[0] + "." + version["client"]["full_numeric"].split(".")[1] + "." + version["client"]["full_numeric"].split(".")[2]
+	replace_in_file("osx_installer/info.plist", "$version_num_short$", version_num_short)
+	replace_in_file("create_osx_installer.sh", "$version_num_short$", version_num_short)
+	
+	replace_in_file("osx_installer/info.plist", "$version_maj$", version_maj)
+	replace_in_file("osx_installer/info.plist", "$version_min$", str(version_min))
+
+	replace_in_file("../client/urbackup.wxs", "$version_full_numeric$", version["client"]["full_numeric"])
+	replace_in_file("../client/urbackup.wxi", "$product_id$", str(uuid.uuid1()))
+	replace_in_file("../clientctl/main.cpp", "$version_full_numeric$", version["client"]["full_numeric"])
+	
+	replace_version_info()
+
+exit(0)

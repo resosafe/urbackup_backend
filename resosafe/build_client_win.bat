@@ -1,0 +1,42 @@
+set STORE_SYMBOLS=true
+set SIGN=true
+
+
+set GIT_SERVER_REPOSITORY="git@github.com:resosafe/urbackup_backend.git"
+set BRANCH="resosafe_2.5.x"
+set DEST_DIR="$SCRIPT_DIR/urbackup_backend_build"
+
+
+call checkout_client.bat
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+cd %~dp0
+
+git reset --hard
+python build\replace_versions.py
+if %errorlevel% neq 0 exit /b %errorlevel% 
+
+call build_client_backend.bat
+if %errorlevel% neq 0 exit /b %errorlevel%
+cd %~dp0\client
+call build_client.bat
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+if NOT "%STORE_SYMBOLS%" == "true" GOTO skip_symbols
+
+echo|set /p="set build_revision=" > "build_revision.bat"
+git rev-parse HEAD >> "build_revision.bat"
+call build_revision.bat
+
+cd "%~dp0"
+
+
+copy /Y "Release\urbackupclient.dll" "Release\urbackup.dll"
+copy /Y "x64\Release\urbackupclient.dll" "x64\Release\urbackup.dll"
+
+
+FOR /F "tokens=*" %%G IN (pdb_dirs_client.txt) DO symstore add /compress /r /f "%~dp0%%G" /s "C:\symstore" /t "UrBackup Client /v "%build_revision%" /c "Release"
+
+:skip_symbols
+
+exit 0

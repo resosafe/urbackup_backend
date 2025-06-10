@@ -2,16 +2,13 @@
 set -e
 
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-
 GIT_SERVER_REPOSITORY="git@github.com:resosafe/urbackup_backend.git"
 GIT_CLIENT_REPOSITORY="git@github.com:resosafe/urbackup_frontend_wx.git"
-
 BRANCH="resosafe_2.5.x"
 DEST_DIR="$SCRIPT_DIR/urbackup_backend_build"
 
-cd $SCRIPT_DIR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 rm -rf $DEST_DIR
 

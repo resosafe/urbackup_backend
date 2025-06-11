@@ -3,22 +3,48 @@ set SIGN=true
 
 
 set GIT_SERVER_REPOSITORY="git@github.com:resosafe/urbackup_backend.git"
+set GIT_CLIENT_REPOSITORY="git@github.com:resosafe/urbackup_frontend_wx.git"
+
 set BRANCH="resosafe_2.5.x"
-set DEST_DIR="$SCRIPT_DIR/urbackup_backend_build"
+set DEST_DIR="%~dp0/urbackup_backend_build"
+set VISUAL_STUDIO_PATH="C:\Program Files\Microsoft Visual Studio\2022"
 
 
-call checkout_client.bat
-if %errorlevel% neq 0 exit /b %errorlevel%
+rmdir /s /q %DEST_DIR%
+echo Cloning repository %GIT_SERVER_REPOSITORY% to %DEST_DIR%
+git clone %GIT_SERVER_REPOSITORY% %DEST_DIR%
+cd %DEST_DIR%
+git checkout %BRANCH%
+git clone %GIT_CLIENT_REPOSITORY% client
+cd client
+git checkout %BRANCH%
+cd ..
 
-cd %~dp0
 
-git reset --hard
-python build\replace_versions.py
+./switch_build.sh client
+cd resosafe
+python3 replace_versions.py version.json
+cd ..
+
+
+call %VISUAL_STUDIO_PATH%"\Community\VC\Auxiliary\Build\vcvarsamd64_x86.bat"
+
+msbuild UrBackupBackend.sln /p:Configuration=Release /p:Platform="win32"  /p:vcpkgTriplet="x86-windows-static-md"
 if %errorlevel% neq 0 exit /b %errorlevel% 
 
-call build_client_backend.bat
+msbuild UrBackupBackend.sln /p:Configuration=Release /p:Platform="x64"  /p:vcpkgTriplet="x64-windows-static-md"
 if %errorlevel% neq 0 exit /b %errorlevel%
-cd %~dp0\client
+
+msbuild CompiledServer.vcxproj /p:Configuration="Release Service" /p:Platform="x64"  /p:vcpkgTriplet="x64-windows-static-md"
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+msbuild CompiledServer.vcxproj /p:Configuration="Release Service" /p:Platform="win32"  /p:vcpkgTriplet="x86-windows-static-md"
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+
+
+
+cd client
 call build_client.bat
 if %errorlevel% neq 0 exit /b %errorlevel%
 

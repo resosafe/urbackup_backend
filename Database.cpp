@@ -598,7 +598,8 @@ bool CDatabase::Dump(const std::string &pFile)
 
 	ShellState cd = {};
 	cd.openMode = 1;
-	cd.zDbFilename = db_fn;
+	cd.pAuxDb = &cd.aAuxDb[0];
+	cd.pAuxDb->zDbFilename = db_fn;
 	cd.out=fopen(pFile.c_str(), "wb");
 	if(cd.out==0)
 	{
@@ -624,7 +625,8 @@ bool CDatabase::Recover(const std::string & pFile)
 
 	ShellState cd = {};
 	cd.openMode = 1;
-	cd.zDbFilename = db_fn;
+	cd.pAuxDb = &cd.aAuxDb[0];
+	cd.pAuxDb->zDbFilename = db_fn;
 	cd.out = fopen(pFile.c_str(), "wb");
 	if (cd.out == 0)
 	{

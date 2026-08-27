@@ -28616,5 +28616,8 @@ void fiddle_exec(const char * zSql){
 
 int do_meta_command_r(char* zLine, struct ShellState* p)
 {
+    if( p->pAuxDb==0 ){
+        p->pAuxDb = &p->aAuxDb[0];
+    }
     return do_meta_command(zLine, p);
 }

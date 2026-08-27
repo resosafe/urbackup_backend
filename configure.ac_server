@@ -2,11 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.61)
-<<<<<<< HEAD
-AC_INIT([urbackup-server], [2.5.34.0], [martin@urbackup.org])
-=======
 AC_INIT([urbackup-server], [2.5.37.0], [martin@urbackup.org])
->>>>>>> upstream/2.5.x
 AC_CONFIG_SRCDIR([AcceptThread.cpp])
 AC_CONFIG_HEADER([config.h])
 AC_CONFIG_MACRO_DIR([m4])

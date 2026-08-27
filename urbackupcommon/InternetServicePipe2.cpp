@@ -190,6 +190,7 @@ bool InternetServicePipe2::Write( const char *buffer, size_t bsize, int timeoutm
 		enc->flush();
 		curr_write_chunk_size=0;
 		last_flush_time=Server->getTimeMS();
+		flush = true;
 	}
 
 	std::string tosend = enc->get();
@@ -337,5 +338,10 @@ void InternetServicePipe2::setUsageString(const std::string& str)
 bool InternetServicePipe2::setCompressionSettings(const SCompressionSettings& params)
 {
 	return false;
+}
+
+bool InternetServicePipe2::setOption(const SocketOption opt)
+{
+	return cs->setOption(opt);
 }
 

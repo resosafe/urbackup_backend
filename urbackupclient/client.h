@@ -450,7 +450,8 @@ private:
 	{
 		IndexErrorInfo_Ok = 0,
 		IndexErrorInfo_Error = 1,
-		IndexErrorInfo_NoBackupPaths = 2
+		IndexErrorInfo_NoBackupPaths = 2,
+		IndexErrorInfo_FilelistWriteError = 3
 	};
 
 	IndexErrorInfo indexDirs(bool full_backup, bool simultaneous_other);
@@ -477,7 +478,7 @@ private:
 #ifdef _WIN32
 	bool start_shadowcopy_components(VSS_ID& ssetid, bool* has_active_transaction);
 	bool start_shadowcopy_win( SCDirs * dir, std::string &wpath, bool for_imagebackup, bool with_components, bool * &onlyref, bool* has_active_transaction);
-	bool wait_for(IVssAsync *vsasync, const std::string& error_prefix);
+	bool wait_for(IVssAsync *vsasync, const std::string& error_prefix, const int timeoutms = -1);
 	std::string GetErrorHResErrStr(HRESULT res);
 	void printProviderInfo(HRESULT res);
 	bool check_writer_status(IVssBackupComponents *backupcom, std::string& errmsg, 
@@ -889,6 +890,8 @@ private:
 	int64 phash_queue_write_pos;
 	std::vector<char> phash_queue_buffer;
 	int64 file_id;
+
+	bool dataless_warning_logged;
 
 	struct SResult
 	{

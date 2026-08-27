@@ -1,7 +1,9 @@
-typedef unsigned char u8;
+#include <stdio.h>
 
-typedef struct sqlite3expert sqlite3expert;
+struct ShellState;
+ShellState* shell_state_init(const char* db_fn, FILE* out);
 
+<<<<<<< HEAD
 typedef struct ExpertInfo ExpertInfo;
 struct ExpertInfo {
     sqlite3expert* pExpert;
@@ -41,6 +43,9 @@ struct ColModeOpts {
     u8 bQuote;
     u8 bWordWrap;
 };
+=======
+void shell_state_free(ShellState* state);
+>>>>>>> upstream/2.5.x
 
 typedef struct ShellState ShellState;
 struct ShellState {
